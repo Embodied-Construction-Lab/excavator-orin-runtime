@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "orin_csv_replay.py"
@@ -51,6 +52,42 @@ class OrinCsvReplayTest(unittest.TestCase):
         self.assertEqual(len(samples), 2)
         self.assertEqual(samples[0].action, (12.5, -9.25, 3.75, -7.5))
         self.assertEqual(samples[1].action, (0.0, 0.0, 0.0, 0.0))
+
+    def test_load_replay_supports_legacy_zip_without_keyword_arguments(self):
+        csv_path = self.write_csv(
+            [
+                "0,0.0,0.01,0,0,0\n",
+                "1,0.05,0,0,0,0\n",
+            ]
+        )
+        native_zip = zip
+
+        def legacy_zip(*iterables, **kwargs):
+            if kwargs:
+                raise TypeError("zip() takes no keyword arguments")
+            return native_zip(*iterables)
+
+        with patch("builtins.zip", legacy_zip):
+            samples = replay.load_replay(csv_path, max_duration_s=10.0)
+
+        self.assertEqual(len(samples), 2)
+
+    def test_summary_supports_legacy_zip_without_keyword_arguments(self):
+        samples = (
+            replay.ReplaySample(0.0, (0.01, 0.0, 0.0, 0.0)),
+            replay.ReplaySample(0.05, (0.0, 0.0, 0.0, 0.0)),
+        )
+        native_zip = zip
+
+        def legacy_zip(*iterables, **kwargs):
+            if kwargs:
+                raise TypeError("zip() takes no keyword arguments")
+            return native_zip(*iterables)
+
+        with patch("builtins.zip", legacy_zip):
+            summary = replay._summary(samples)
+
+        self.assertIn("boom_peak=0.01", summary)
 
     def test_policy_packet_preserves_physical_velocity_and_order(self):
         packet = replay.make_policy_action(

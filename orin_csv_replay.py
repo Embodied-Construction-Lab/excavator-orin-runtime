@@ -83,7 +83,7 @@ def load_replay(
         raise ReplayValidationError(f"invalid CSV: {exc}") from exc
     if not samples:
         raise ReplayValidationError("CSV contains no samples")
-    for previous, current in zip(samples, samples[1:], strict=False):
+    for previous, current in zip(samples, samples[1:]):
         if current.timestamp_s < previous.timestamp_s:
             raise ReplayValidationError("CSV timestamps must not decrease")
     duration_s = samples[-1].timestamp_s - samples[0].timestamp_s
@@ -224,7 +224,7 @@ def _summary(samples: Sequence[ReplaySample]) -> str:
     return (
         f"samples={len(samples)} duration_s={duration_s:.3f} "
         + " ".join(
-            f"{name}_peak={peak:.9g}" for name, peak in zip(ACTION_ORDER, peaks, strict=True)
+            f"{name}_peak={peak:.9g}" for name, peak in zip(ACTION_ORDER, peaks)
         )
     )
 
