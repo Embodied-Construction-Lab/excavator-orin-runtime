@@ -23,7 +23,6 @@ VELOCITY_COLUMNS = (
     "swing_v_ref_radps",
 )
 REQUIRED_AUTHORIZATION = "ALLOW_CSV_REPLAY"
-DEFAULT_MACHINE_PROFILE = Path(__file__).with_name("machine_profile.json")
 
 
 class ReplayValidationError(ValueError):
@@ -40,44 +39,14 @@ def is_execution_authorized(value: str | None) -> bool:
     return value == REQUIRED_AUTHORIZATION
 
 
-def _load_limits(machine_profile_path: Path) -> tuple[tuple[float, float], ...]:
-    try:
-        profile = json.loads(machine_profile_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ReplayValidationError(f"cannot read machine profile: {exc}") from exc
-    if tuple(profile.get("action_order", ())) != ACTION_ORDER:
-        raise ReplayValidationError(
-            f"machine profile action_order must be {list(ACTION_ORDER)}"
-        )
-    try:
-        limits = tuple(
-            (
-                float(profile["actuators"][name]["max_speed_positive"]),
-                float(profile["actuators"][name]["max_speed_negative"]),
-            )
-            for name in ACTION_ORDER
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ReplayValidationError("machine profile velocity limits are invalid") from exc
-    if any(
-        not math.isfinite(value) or value <= 0.0
-        for pair in limits
-        for value in pair
-    ):
-        raise ReplayValidationError("machine profile velocity limits must be positive and finite")
-    return limits
-
-
 def load_replay(
     csv_path: Path,
-    machine_profile_path: Path,
     *,
     max_duration_s: float,
 ) -> tuple[ReplaySample, ...]:
-    """Load physical commands and reject incompatible, unbounded or partial CSVs."""
+    """Load CSV commands verbatim after format and timing validation."""
     if not math.isfinite(max_duration_s) or max_duration_s <= 0.0:
         raise ReplayValidationError("max_duration_s must be positive and finite")
-    limits = _load_limits(machine_profile_path)
     try:
         text = csv_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
@@ -109,17 +78,6 @@ def load_replay(
                 raise ReplayValidationError(f"CSV row {row_number} has invalid timestamp")
             if not all(math.isfinite(value) for value in action):
                 raise ReplayValidationError(f"CSV row {row_number} has non-finite velocity")
-            for name, value, (positive, negative) in zip(
-                ACTION_ORDER, action, limits, strict=True
-            ):
-                limit = positive if value >= 0.0 else negative
-                magnitude = abs(value)
-                if magnitude > limit and not math.isclose(
-                    magnitude, limit, rel_tol=1e-6, abs_tol=1e-9
-                ):
-                    raise ReplayValidationError(
-                        f"CSV row {row_number} {name} velocity {value} exceeds {limit}"
-                    )
             samples.append(ReplaySample(timestamp_s, action))
     except csv.Error as exc:
         raise ReplayValidationError(f"invalid CSV: {exc}") from exc
@@ -234,9 +192,6 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("csv_path", type=Path)
-    parser.add_argument(
-        "--machine-profile", type=Path, default=DEFAULT_MACHINE_PROFILE
-    )
     parser.add_argument("--target-host", default="127.0.0.1")
     parser.add_argument("--target-port", type=int, default=18082)
     parser.add_argument("--valid-for-ms", type=int, default=100)
@@ -279,14 +234,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     _validate_cli(args)
     samples = load_replay(
         args.csv_path,
-        args.machine_profile,
         max_duration_s=args.max_duration_s,
     )
     csv_sha256 = hashlib.sha256(args.csv_path.read_bytes()).hexdigest()
-    profile_sha256 = hashlib.sha256(args.machine_profile.read_bytes()).hexdigest()
     print(_summary(samples))
     print(f"csv_sha256={csv_sha256}")
-    print(f"machine_profile_sha256={profile_sha256}")
     print("action_order=boom,stick,bucket,swing values=physical_velocity")
     if not is_execution_authorized(args.motion_authorization):
         print("PREVIEW ONLY: no UDP packets sent")

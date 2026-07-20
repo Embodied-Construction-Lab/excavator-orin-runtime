@@ -93,6 +93,30 @@ class ActionRelayTest(unittest.TestCase):
         finally:
             relay.close()
 
+    def test_relays_finite_action_values_without_orin_range_check(self):
+        packet = json.loads(action_packet(1, [12.5, -9.25, 3.75, -7.5]))
+
+        command, reject_reasons = orin.policy_action_to_data_command(
+            packet,
+            command_time_s=1.0,
+            receive_wall_ms=packet["stamp_ms"],
+            control_enabled=True,
+            estop=False,
+            sensor_valid=True,
+            stm32_alive=True,
+        )
+
+        self.assertEqual(reject_reasons, [])
+        self.assertEqual(
+            (
+                command.boom_v_ref_mps,
+                command.stick_v_ref_mps,
+                command.bucket_v_ref_mps,
+                command.swing_v_ref_radps,
+            ),
+            (12.5, -9.25, 3.75, -7.5),
+        )
+
     def test_discards_older_queued_actions_and_applies_only_latest(self):
         destination = self.receiver.getsockname()
         self.sender.sendto(action_packet(1, [0.00351, 0.0, 0.0, 0.0]), destination)

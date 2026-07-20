@@ -428,12 +428,7 @@ def policy_action_to_data_command(
                 reject_reasons.append(f"bad_action_value_{name}")
                 continue
 
-            command_value = float(value)
-            if command_value < -1.0 or command_value > 1.0:
-                reject_reasons.append(f"action_out_of_range_{name}")
-                continue
-
-            action_by_name[name] = command_value
+            action_by_name[name] = float(value)
 
     if reject_reasons:
         return zero_data_command(command_time_s), reject_reasons

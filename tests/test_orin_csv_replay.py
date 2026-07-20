@@ -19,21 +19,6 @@ class OrinCsvReplayTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.profile = self.root / "machine_profile.json"
-        self.profile.write_text(
-            json.dumps(
-                {
-                    "action_order": ["boom", "stick", "bucket", "swing"],
-                    "actuators": {
-                        "boom": {"max_speed_positive": 0.0351, "max_speed_negative": 0.0185},
-                        "stick": {"max_speed_positive": 0.0444, "max_speed_negative": 0.0357},
-                        "bucket": {"max_speed_positive": 0.0342, "max_speed_negative": 0.0419},
-                        "swing": {"max_speed_positive": 0.6, "max_speed_negative": 0.6},
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -53,42 +38,19 @@ class OrinCsvReplayTest(unittest.TestCase):
         )
         return path
 
-    def test_loads_physical_velocity_columns_without_rescaling(self):
+    def test_loads_csv_velocity_columns_verbatim_without_machine_profile(self):
         csv_path = self.write_csv(
             [
-                "0,0.0,0.01755,-0.01785,0.01,-0.3\n",
+                "0,0.0,12.5,-9.25,3.75,-7.5\n",
                 "1,0.05,0,0,0,0\n",
             ]
         )
 
-        samples = replay.load_replay(csv_path, self.profile, max_duration_s=10.0)
+        samples = replay.load_replay(csv_path, max_duration_s=10.0)
 
         self.assertEqual(len(samples), 2)
-        self.assertEqual(samples[0].action, (0.01755, -0.01785, 0.01, -0.3))
+        self.assertEqual(samples[0].action, (12.5, -9.25, 3.75, -7.5))
         self.assertEqual(samples[1].action, (0.0, 0.0, 0.0, 0.0))
-
-    def test_rejects_velocity_outside_machine_profile(self):
-        csv_path = self.write_csv(
-            [
-                "0,0.0,0.0352,0,0,0\n",
-                "1,0.05,0,0,0,0\n",
-            ]
-        )
-
-        with self.assertRaisesRegex(replay.ReplayValidationError, "boom velocity"):
-            replay.load_replay(csv_path, self.profile, max_duration_s=10.0)
-
-    def test_accepts_float32_rounding_at_machine_speed_limit(self):
-        csv_path = self.write_csv(
-            [
-                "0,0.0,0,0,0.0342000015,0\n",
-                "1,0.05,0,0,0,0\n",
-            ]
-        )
-
-        samples = replay.load_replay(csv_path, self.profile, max_duration_s=10.0)
-
-        self.assertEqual(samples[0].action[2], 0.0342000015)
 
     def test_policy_packet_preserves_physical_velocity_and_order(self):
         packet = replay.make_policy_action(
@@ -172,7 +134,7 @@ class OrinCsvReplayTest(unittest.TestCase):
         csv_path = self.write_csv(["0,0.0,0.01,0,0,0\n"])
 
         with self.assertRaisesRegex(replay.ReplayValidationError, "explicit zero"):
-            replay.load_replay(csv_path, self.profile, max_duration_s=10.0)
+            replay.load_replay(csv_path, max_duration_s=10.0)
 
     def test_rejects_timestamp_regression(self):
         csv_path = self.write_csv(
@@ -183,7 +145,7 @@ class OrinCsvReplayTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(replay.ReplayValidationError, "must not decrease"):
-            replay.load_replay(csv_path, self.profile, max_duration_s=10.0)
+            replay.load_replay(csv_path, max_duration_s=10.0)
 
     def test_authorized_cli_sends_csv_rows_and_zero_tail_over_loopback(self):
         csv_path = self.write_csv(
@@ -200,8 +162,6 @@ class OrinCsvReplayTest(unittest.TestCase):
         result = replay.main(
             [
                 str(csv_path),
-                "--machine-profile",
-                str(self.profile),
                 "--target-port",
                 str(receiver.getsockname()[1]),
                 "--zero-tail-count",

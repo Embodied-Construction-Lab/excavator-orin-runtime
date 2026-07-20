@@ -32,7 +32,7 @@ The compatibility protocol currently retains
 
 ## Files
 
-- `orin_state_sender.py`: reads STM32 state, publishes `machine_state_v1`, validates incoming actions and relays accepted physical velocity commands to STM32.
+- `orin_state_sender.py`: reads STM32 state, publishes `machine_state_v1`, validates action structure/timing/safety state and relays finite physical velocity commands to STM32 without magnitude checks.
 - `orin_csv_replay.py`: validates and replays an exported physical-velocity CSV through the local Action Relay.
 - `tests/`: host-side protocol, relay, timeout, ordering and replay tests.
 
@@ -49,15 +49,6 @@ source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 python3 -m unittest discover -s tests -v
 ```
-
-Deploy the authoritative machine contract separately:
-
-```bash
-scp shared/machine_profile.json \
-  <orin>:~/excavator-orin-runtime/machine_profile.json
-```
-
-`machine_profile.json` is ignored by Git so field deployment cannot create a second editable source of truth.
 
 ## Normal PC-controlled operation
 
@@ -92,7 +83,6 @@ Preflight a CSV without sending motion:
 
 ```bash
 python3 orin_csv_replay.py replays/execute_dump.pc_to_orin.csv \
-  --machine-profile machine_profile.json \
   --max-duration-s 30
 ```
 
@@ -102,14 +92,18 @@ Expected output includes:
 PREVIEW ONLY: no UDP packets sent
 ```
 
-After checking the file SHA, limits and machine area, explicitly authorize replay:
+After checking the file SHA and machine area, explicitly authorize replay:
 
 ```bash
 python3 orin_csv_replay.py replays/execute_dump.pc_to_orin.csv \
-  --machine-profile machine_profile.json \
   --max-duration-s 30 \
   --motion-authorization ALLOW_CSV_REPLAY
 ```
+
+CSV action values are forwarded verbatim. Neither the replay tool nor the Orin Action Relay reads
+a machine profile or applies physical range checks, speed limits, scaling or sign changes. The
+relay maps values by the declared action names into the fixed STM32 field order; STM32 owns the
+physical limits.
 
 Ctrl+C, scheduler lag, normal completion and Action Relay shutdown all lead to zero commands.
 PC live actions and local CSV replay must not be enabled at the same time.
@@ -125,4 +119,4 @@ source .venv/bin/activate
 python3 -m unittest discover -s tests -v
 ```
 
-Restart the bridge only after the tests pass and the deployed `machine_profile.json` SHA matches the intended PC artifact.
+Restart the bridge only after the tests pass.

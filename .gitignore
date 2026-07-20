@@ -6,7 +6,7 @@ htmlcov/
 .venv/
 venv/
 
-# Machine/field configuration is deployed separately from source code.
+# Legacy local deployment artifact; the runtime no longer reads it.
 machine_profile.json
 .env
 *.local
