@@ -78,6 +78,18 @@ class OrinCsvReplayTest(unittest.TestCase):
         with self.assertRaisesRegex(replay.ReplayValidationError, "boom velocity"):
             replay.load_replay(csv_path, self.profile, max_duration_s=10.0)
 
+    def test_accepts_float32_rounding_at_machine_speed_limit(self):
+        csv_path = self.write_csv(
+            [
+                "0,0.0,0,0,0.0342000015,0\n",
+                "1,0.05,0,0,0,0\n",
+            ]
+        )
+
+        samples = replay.load_replay(csv_path, self.profile, max_duration_s=10.0)
+
+        self.assertEqual(samples[0].action[2], 0.0342000015)
+
     def test_policy_packet_preserves_physical_velocity_and_order(self):
         packet = replay.make_policy_action(
             sequence=42,

@@ -113,7 +113,10 @@ def load_replay(
                 ACTION_ORDER, action, limits, strict=True
             ):
                 limit = positive if value >= 0.0 else negative
-                if abs(value) > limit + 1e-9:
+                magnitude = abs(value)
+                if magnitude > limit and not math.isclose(
+                    magnitude, limit, rel_tol=1e-6, abs_tol=1e-9
+                ):
                     raise ReplayValidationError(
                         f"CSV row {row_number} {name} velocity {value} exceeds {limit}"
                     )
