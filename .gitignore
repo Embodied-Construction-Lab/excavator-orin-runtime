@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Machine/field configuration is deployed separately from source code.
+machine_profile.json
+.env
+*.local
+
+# Runtime captures and replay inputs are experiment artifacts, not source.
+replays/
+logs/
+captures/
