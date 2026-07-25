@@ -1,0 +1,10 @@
+{
+  "schema_version": "orin_edge_runtime.v1",
+  "mode": "shadow",
+  "machine_profile_path": "assets/machine_profile.json",
+  "urdf_path": "assets/waji.urdf",
+  "onnx_path": "assets/policy.onnx",
+  "trajectory_path": "assets/trajectory_command.json",
+  "audit_path": "logs/edge_runtime.jsonl",
+  "action_valid_for_ms": 300
+}

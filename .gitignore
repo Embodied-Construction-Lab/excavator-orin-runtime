@@ -15,3 +15,5 @@ machine_profile.json
 replays/
 logs/
 captures/
+deploy/assets/
+deploy/logs/

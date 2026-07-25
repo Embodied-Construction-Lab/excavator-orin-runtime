@@ -36,6 +36,7 @@ import struct
 import threading
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 
@@ -55,6 +56,7 @@ STM32_TIMEOUT_S = 0.3
 MM_TO_M = 0.001
 POLICY_ACTION_NAMES = ("boom", "stick", "bucket", "swing")
 ACTION_FUTURE_SKEW_MS = 50
+EDGE_MOTION_AUTHORIZATION = "ALLOW_EDGE_MACHINE_MOTION"
 
 
 @dataclass(frozen=True)
@@ -769,6 +771,10 @@ def parse_bool_arg(value: str) -> bool:
     raise argparse.ArgumentTypeError("must be true or false")
 
 
+def edge_control_authorized(value: str) -> bool:
+    return value == EDGE_MOTION_AUTHORIZATION
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bridge STM32 /dev/ttyTHS0 state to PC machine_state_v1 UDP JSON.",
@@ -850,6 +856,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=10,
         help="Print one status line every N sent frames. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--edge-config",
+        type=Path,
+        help=(
+            "Run local FK/38D/ONNX Follow using one orin_edge_runtime.v1 "
+            "shadow or control config."
+        ),
+    )
+    parser.add_argument(
+        "--edge-motion-authorization",
+        default="",
+        help=(
+            "Exact token required when edge config mode=control: "
+            + EDGE_MOTION_AUTHORIZATION
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -860,6 +882,27 @@ def main() -> None:
     )
     args = parse_args()
     allowed_action_host = args.allowed_action_host or args.pc_host
+    edge_config = None
+    edge_runtime = None
+    if args.edge_config is not None:
+        from edge_runtime.shadow import (
+            build_edge_follow_runtime,
+            load_edge_runtime_config,
+        )
+
+        edge_config = load_edge_runtime_config(args.edge_config)
+        if edge_config.mode == "control":
+            if not args.control_enabled:
+                raise RuntimeError("edge control requires --control-enabled")
+            if not edge_control_authorized(args.edge_motion_authorization):
+                raise RuntimeError(
+                    "edge control requires --edge-motion-authorization "
+                    + EDGE_MOTION_AUTHORIZATION
+                )
+            args.action_bind_host = "127.0.0.1"
+            allowed_action_host = "127.0.0.1"
+        # Validate every copied artifact and load ONNX before taking serial ownership.
+        edge_runtime = build_edge_follow_runtime(edge_config)
 
     LOGGER.info(
         "opening serial %s @ %d, sending UDP JSON to %s:%d, listening policy_action on %s:%d from %s",
@@ -883,6 +926,35 @@ def main() -> None:
         estop=args.estop,
     )
     action_relay.start()
+    edge_runner = None
+    edge_action_sender = None
+    if edge_config is not None:
+        from edge_runtime.shadow import EdgeShadowObserver
+
+        if edge_config.mode == "shadow":
+            edge_runner = EdgeShadowObserver(
+                runtime=edge_runtime,
+                audit_path=edge_config.audit_path,
+            )
+            LOGGER.info(
+                "edge inference shadow enabled: config=%s (audit only, no STM32 action sink)",
+                args.edge_config,
+            )
+        else:
+            from edge_runtime.control import EdgeControlRunner
+
+            edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            edge_action_sender.connect(("127.0.0.1", args.action_bind_port))
+            edge_runner = EdgeControlRunner(
+                runtime=edge_runtime,
+                action_sink=edge_action_sender,
+                audit_path=edge_config.audit_path,
+                valid_for_ms=edge_config.action_valid_for_ms,
+            )
+            LOGGER.warning(
+                "EDGE CONTROL ARMED: local inference owns loopback action source on 127.0.0.1:%d",
+                args.action_bind_port,
+            )
 
     seq = 0
     last_receive_monotonic_s: Optional[float] = None
@@ -935,6 +1007,15 @@ def main() -> None:
                 stm32_alive=packet["safety"]["stm32_alive"],
             )
             send_udp_json(sock, packet, args.pc_host, args.pc_port)
+            if edge_runner is not None:
+                if edge_config.mode == "shadow":
+                    edge_runner.observe(packet)
+                else:
+                    edge_runner.observe(
+                        packet,
+                        now_s=time.monotonic(),
+                        action_stamp_ms=now_ms(),
+                    )
 
             if args.print_every and seq % args.print_every == 0:
                 LOGGER.info(
@@ -954,8 +1035,14 @@ def main() -> None:
         LOGGER.info("stopped by user")
     finally:
         try:
+            if edge_config is not None and edge_config.mode == "control":
+                edge_runner.close(action_stamp_ms=now_ms())
+            elif edge_runner is not None:
+                edge_runner.close()
             action_relay.close()
         finally:
+            if edge_action_sender is not None:
+                edge_action_sender.close()
             action_sock.close()
             sock.close()
             ser.close()
