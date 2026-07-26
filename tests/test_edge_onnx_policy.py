@@ -53,6 +53,7 @@ class OnnxPolicyTest(unittest.TestCase):
         )
         self.assertEqual(feed["obs_0"].shape, (1, 38))
         self.assertTrue(np.all(feed["recurrent_in"] == 0.0))
+        self.assertGreaterEqual(policy.last_inference_ms, 0.0)
 
 
 if __name__ == "__main__":

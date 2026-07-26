@@ -95,10 +95,12 @@ cp RLExcavator/Assets/AIModels/ScaleModelDeploy05_cale_v3_deadzone_reward_03_p00
   /tmp/excavator-edge-assets/policy.onnx
 cp AiryLidar/localmap/exports/live_latest/trajectory_command.simple_rrt.json \
   /tmp/excavator-edge-assets/trajectory_command.json
+cp AiryLidar/mission/config/excavation_cycle.json \
+  /tmp/excavator-edge-assets/excavation_cycle.json
 sha256sum /tmp/excavator-edge-assets/*
 ```
 
-Copy those four files to `<ORIN_REPO>/deploy/assets/`, then on Orin:
+Copy those five files to `<ORIN_REPO>/deploy/assets/`, then on Orin:
 
 ```bash
 cd ~/excavator-orin-runtime
@@ -111,6 +113,19 @@ python3 -m unittest discover -s tests -v
 The trajectory snapshot must use `frame_id=machine_root_ros`. The URDF FK root
 is `fk_root`; the current deployed frame adapter is the explicit identity
 `machine_root_ros -> fk_root`.
+
+The execution waypoint tolerance and Follow deadline have one authoritative
+source:
+
+```text
+excavation_cycle.json limits.waypoint_tolerance_m
+excavation_cycle.json limits.tracking_timeout_s
+```
+
+`trajectory_command.json target_threshold` remains planner metadata and is not
+the execution waypoint tolerance. Startup rejects a trajectory whose Mission
+ID, SHA, phase, execution scope or eligibility does not match the deployed
+Mission asset.
 
 ## Edge shadow verification
 
@@ -133,6 +148,20 @@ action, physical action and inference time:
 ```bash
 tail -n 3 deploy/logs/edge_runtime.jsonl | python3 -m json.tool --json-lines
 ```
+
+Summarize a Shadow log without sending any action:
+
+```bash
+python3 -m edge_runtime.audit deploy/logs/edge_runtime.jsonl
+```
+
+The summary reports input and inference-loop frequency, pure ONNX and full-loop
+latency distributions, sequence gaps/regressions, progress monotonicity,
+consecutive rejected states, terminal status and whether the final computed
+physical action is zero. A rejected state is fail-safe for that frame but does
+not terminate the process: control sends zero, records the reason and can resume
+on a later valid state. A sequence gap is accepted; a duplicate or older
+sequence is rejected. `COMPLETED` and `TIMEOUT` are sticky terminal states.
 
 Run shadow before enabling edge motion. Compare its actions with the current PC
 log for the same state/trajectory snapshot.

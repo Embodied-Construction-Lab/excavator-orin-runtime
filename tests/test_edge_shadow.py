@@ -40,6 +40,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
         audit_path = self.root / "logs" / "edge.jsonl"
         runtime = StubRuntime()
         observer = EdgeShadowObserver(runtime=runtime, audit_path=audit_path)
+        self.addCleanup(observer.close)
         state = {"seq": 7, "stamp_ms": 1234}
 
         step = observer.observe(state, now_s=2.5)
@@ -52,9 +53,10 @@ class EdgeShadowObserverTest(unittest.TestCase):
         self.assertEqual(record["waypoint_index"], 2)
         self.assertEqual(record["normalized_action"], [0.1, -0.2, 0.3, -0.4])
         self.assertEqual(record["physical_action"], [0.01, -0.02, 0.03, -0.04])
+        self.assertEqual(record["runtime_monotonic_s"], 2.5)
+        self.assertIn("loop_elapsed_ms", record)
         self.assertNotIn("serial", record)
         self.assertNotIn("policy_action", record)
-        observer.close()
 
     def test_runtime_error_is_audited_and_does_not_escape_state_loop(self):
         class FailingRuntime:
@@ -66,6 +68,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
             runtime=FailingRuntime(),
             audit_path=audit_path,
         )
+        self.addCleanup(observer.close)
 
         result = observer.observe({"seq": 8, "stamp_ms": 1300}, now_s=2.6)
 
@@ -73,7 +76,8 @@ class EdgeShadowObserverTest(unittest.TestCase):
         record = json.loads(audit_path.read_text(encoding="utf-8"))
         self.assertEqual(record["status"], "rejected")
         self.assertEqual(record["reason"], "sensor_invalid")
-        observer.close()
+        self.assertEqual(record["exception_type"], "ValueError")
+        self.assertEqual(record["consecutive_rejections"], 1)
 
     def test_config_paths_are_resolved_relative_to_config_file(self):
         config_path = self.root / "deploy" / "edge_shadow.json"
@@ -87,6 +91,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
                     "urdf_path": "waji.urdf",
                     "onnx_path": "policy.onnx",
                     "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
                     "audit_path": "../logs/edge.jsonl",
                     "action_valid_for_ms": 300,
                 }
@@ -113,6 +118,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
                     "urdf_path": "waji.urdf",
                     "onnx_path": "policy.onnx",
                     "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
                     "audit_path": "edge.jsonl",
                     "action_valid_for_ms": 300,
                 }
@@ -123,6 +129,32 @@ class EdgeShadowObserverTest(unittest.TestCase):
         config = load_edge_runtime_config(config_path)
 
         self.assertEqual(config.mode, "control")
+
+    def test_config_loads_one_authoritative_mission_path(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "shadow",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "onnx_path": "policy.onnx",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_edge_runtime_config(config_path)
+
+        self.assertEqual(
+            config.mission_path,
+            self.root / "excavation_cycle.json",
+        )
 
     def test_state_sender_accepts_one_optional_edge_shadow_config(self):
         args = orin_state_sender.parse_args(

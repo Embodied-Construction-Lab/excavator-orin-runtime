@@ -11,6 +11,37 @@ Point3 = Tuple[float, float, float]
 
 
 @dataclass(frozen=True)
+class MissionFollowLimits:
+    waypoint_tolerance_m: float
+    waypoint_dwell_s: float
+    tracking_timeout_s: float
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "MissionFollowLimits":
+        if value.get("schema_version") != "excavation_mission.v1":
+            raise ValueError("mission schema_version must be excavation_mission.v1")
+        if value.get("frame_id") != "machine_root_ros":
+            raise ValueError("mission frame_id must be machine_root_ros")
+        limits = value.get("limits")
+        if not isinstance(limits, Mapping):
+            raise ValueError("mission limits are missing")
+        return cls(
+            waypoint_tolerance_m=_positive(
+                "mission limits.waypoint_tolerance_m",
+                limits.get("waypoint_tolerance_m"),
+            ),
+            waypoint_dwell_s=_nonnegative(
+                "mission limits.waypoint_dwell_s",
+                limits.get("waypoint_dwell_s"),
+            ),
+            tracking_timeout_s=_positive(
+                "mission limits.tracking_timeout_s",
+                limits.get("tracking_timeout_s"),
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class TrajectorySnapshot:
     frame_id: str
     task_mode: str
@@ -47,15 +78,19 @@ class TrajectorySnapshot:
 @dataclass(frozen=True)
 class WaypointTracker:
     snapshot: TrajectorySnapshot
+    waypoint_tolerance_m: float
     current_index: int = 0
     completed: bool = False
+
+    def __post_init__(self) -> None:
+        _positive("waypoint_tolerance_m", self.waypoint_tolerance_m)
 
     def advance(self, bucket_tip_ros_m: Sequence[float]) -> "WaypointTracker":
         point = _point(bucket_tip_ros_m)
         if self.completed:
             return self
         target = self.snapshot.waypoints[self.current_index]
-        if math.dist(point, target) > self.snapshot.target_threshold_m:
+        if math.dist(point, target) > self.waypoint_tolerance_m:
             return self
         if self.current_index == len(self.snapshot.waypoints) - 1:
             return replace(self, completed=True)
@@ -131,6 +166,31 @@ def _point_to_segment_distance(point: Point3, start: Point3, end: Point3) -> flo
     return math.dist(point, projection)
 
 
+def validate_trajectory_mission(
+    trajectory: Mapping[str, Any],
+    mission: Mapping[str, Any],
+    *,
+    mission_sha256: str,
+) -> None:
+    if trajectory.get("planning_scope") != "execution_strict":
+        raise ValueError("trajectory planning_scope must be execution_strict")
+    if trajectory.get("execution_eligible") is not True:
+        raise ValueError("trajectory execution_eligible must be true")
+    provenance = trajectory.get("mission")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("trajectory mission provenance is missing")
+    if provenance.get("id") != mission.get("mission_id"):
+        raise ValueError("trajectory mission id does not match mission asset")
+    if provenance.get("sha256") != mission_sha256:
+        raise ValueError("trajectory mission sha256 does not match mission asset")
+    expected_phase = {
+        "MoveToDig": "dig",
+        "CarryMaterial": "dump",
+    }.get(trajectory.get("task_mode"))
+    if provenance.get("phase") != expected_phase:
+        raise ValueError("trajectory mission phase does not match task_mode")
+
+
 def _point(values: Sequence[float]) -> Point3:
     if len(values) != 3:
         raise ValueError("point must contain exactly three values")
@@ -148,4 +208,15 @@ def _positive(name: str, value: Any) -> float:
         or value <= 0.0
     ):
         raise ValueError("%s must be positive and finite" % name)
+    return float(value)
+
+
+def _nonnegative(name: str, value: Any) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0.0
+    ):
+        raise ValueError("%s must be nonnegative and finite" % name)
     return float(value)

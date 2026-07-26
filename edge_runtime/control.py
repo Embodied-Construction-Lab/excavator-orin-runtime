@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol
 
@@ -42,6 +43,7 @@ class EdgeControlRunner:
         )
         self._valid_for_ms = int(valid_for_ms)
         self._action_seq = 0
+        self._consecutive_rejections = 0
 
     def observe(
         self,
@@ -50,9 +52,12 @@ class EdgeControlRunner:
         now_s: float,
         action_stamp_ms: int,
     ) -> Optional[EdgeFollowStep]:
+        started = time.perf_counter()
         try:
             step = self._runtime.step(machine_state, now_s=now_s)
         except Exception as exc:
+            self._consecutive_rejections += 1
+            loop_elapsed_ms = (time.perf_counter() - started) * 1000.0
             self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
             self._append(
                 {
@@ -62,6 +67,10 @@ class EdgeControlRunner:
                     "source_seq": machine_state.get("seq"),
                     "source_stamp_ms": machine_state.get("stamp_ms"),
                     "reason": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "consecutive_rejections": self._consecutive_rejections,
+                    "runtime_monotonic_s": float(now_s),
+                    "loop_elapsed_ms": loop_elapsed_ms,
                 }
             )
             LOGGER.warning(
@@ -71,20 +80,40 @@ class EdgeControlRunner:
             )
             return None
 
+        self._consecutive_rejections = 0
+        loop_elapsed_ms = (time.perf_counter() - started) * 1000.0
+        result_status = getattr(
+            step,
+            "result",
+            "COMPLETED" if step.completed else "ACTIVE",
+        )
         action = (
-            (0.0, 0.0, 0.0, 0.0)
-            if step.completed
-            else step.physical_action
+            step.physical_action
+            if result_status == "ACTIVE" and not step.completed
+            else (0.0, 0.0, 0.0, 0.0)
         )
         self._send(action, action_stamp_ms)
         self._append(
             {
                 "schema_version": "orin_edge_control_audit.v1",
                 "mode": "control",
-                "status": "completed" if step.completed else "active",
+                "status": (
+                    result_status
+                    if result_status == "TIMEOUT"
+                    else ("completed" if step.completed else "active")
+                ),
                 "source_seq": step.source_seq,
                 "source_stamp_ms": step.source_stamp_ms,
                 "waypoint_index": step.waypoint_index,
+                "waypoint_distance_m": getattr(step, "waypoint_distance_m", None),
+                "episode_progress": getattr(step, "episode_progress", None),
+                "follow_elapsed_s": getattr(step, "follow_elapsed_s", None),
+                "tracking_timeout_s": getattr(step, "tracking_timeout_s", None),
+                "waypoint_tolerance_m": getattr(step, "waypoint_tolerance_m", None),
+                "inference_ms": getattr(step, "inference_ms", None),
+                "consecutive_rejections": self._consecutive_rejections,
+                "runtime_monotonic_s": float(now_s),
+                "loop_elapsed_ms": loop_elapsed_ms,
                 "bucket_tip_ros_m": list(step.bucket_tip_ros_m),
                 "normalized_action": list(step.normalized_action),
                 "physical_action": list(action),

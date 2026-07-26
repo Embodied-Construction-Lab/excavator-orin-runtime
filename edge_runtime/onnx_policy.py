@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -55,6 +56,11 @@ class OnnxPolicy:
             self.ACTION_OUTPUT,
             final_dimension=4,
         )
+        self._last_inference_ms = 0.0
+
+    @property
+    def last_inference_ms(self) -> float:
+        return self._last_inference_ms
 
     def run(self, observation: Sequence[float]) -> Sequence[float]:
         values = [float(value) for value in observation]
@@ -67,7 +73,11 @@ class OnnxPolicy:
                 feed[item.name] = array
             else:
                 feed[item.name] = self._zero_input(item)
-        output = self._session.run([self._action_output.name], feed)[0]
+        started = time.perf_counter()
+        try:
+            output = self._session.run([self._action_output.name], feed)[0]
+        finally:
+            self._last_inference_ms = (time.perf_counter() - started) * 1000.0
         action = self._numpy.asarray(output, dtype=self._numpy.float32).reshape(-1)
         if action.size < 4:
             raise OnnxPolicyLoadError("ONNX action output has fewer than four values")
