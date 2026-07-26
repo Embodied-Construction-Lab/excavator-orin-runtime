@@ -3,12 +3,14 @@
 
 Default STM32 serial input is CSV text:
 
-    t,s_boom,s_stick,s_bucket,v_boom,v_stick,v_bucket,a_boom,a_stick,a_bucket,yaw,yaw_rate
-    288,0,0,0,0,0,0,38.6,0,132.7,0,0
+    t,x1,x2,y1,y2,s_boom,s_stick,s_bucket,v_boom,v_stick,v_bucket,
+    a_boom,a_stick,a_bucket,yaw,yaw_rate,rs485_ok,adc_ok,imu_ok
 
 Linear positions and velocities are sent by STM32 in mm and mm/s.
 Angles and angular velocity are sent in deg and deg/s. This script converts
-them to m, m/s, rad, and rad/s before sending UDP JSON.
+them to m, m/s, rad, and rad/s before sending UDP JSON. A zero hardware status
+flag makes sensor_valid false. Legacy 12-field and 16-field CSV rows remain
+supported without explicit hardware flags.
 
 Legacy binary frame mode is still available with --input-format binary:
 
@@ -77,6 +79,9 @@ class Stm32State:
     a_bucket: float
     yaw: float
     yaw_rate: float
+    rs485_ok: bool = True
+    adc_ok: bool = True
+    imu_ok: bool = True
 
 
 @dataclass(frozen=True)
@@ -150,6 +155,9 @@ def parse_stm32_csv_line(line: str) -> Optional[Stm32State]:
     except ValueError as exc:
         raise ValueError(f"bad STM32 CSV numeric field: {line!r}") from exc
 
+    rs485_ok = True
+    adc_ok = True
+    imu_ok = True
     if len(values) >= 16:
         (
             t_ms,
@@ -169,7 +177,15 @@ def parse_stm32_csv_line(line: str) -> Optional[Stm32State]:
             yaw_deg,
             yaw_rate_deg_s,
         ) = values[:16]
-    elif len(values) >= 12:
+        if len(values) in (17, 18):
+            raise ValueError(
+                "bad STM32 CSV hardware validity field count: %d" % len(values)
+            )
+        if len(values) >= 19:
+            rs485_ok = _parse_hardware_status("rs485_ok", values[16])
+            adc_ok = _parse_hardware_status("adc_ok", values[17])
+            imu_ok = _parse_hardware_status("imu_ok", values[18])
+    elif len(values) == 12:
         (
             t_ms,
             s_boom_mm,
@@ -205,7 +221,16 @@ def parse_stm32_csv_line(line: str) -> Optional[Stm32State]:
         a_bucket=math.radians(a_bucket_deg),
         yaw=math.radians(yaw_deg),
         yaw_rate=math.radians(yaw_rate_deg_s),
+        rs485_ok=rs485_ok,
+        adc_ok=adc_ok,
+        imu_ok=imu_ok,
     )
+
+
+def _parse_hardware_status(name: str, value: float) -> bool:
+    if not math.isfinite(value) or value not in (0.0, 1.0):
+        raise ValueError("%s must be 0 or 1" % name)
+    return value == 1.0
 
 
 def validate_state(
@@ -243,6 +268,12 @@ def validate_state(
     ]
     if not all(math.isfinite(value) for value in float_values):
         fault_flags.append("sensor_invalid")
+    if not state.rs485_ok:
+        fault_flags.append("rs485_invalid")
+    if not state.adc_ok:
+        fault_flags.append("adc_invalid")
+    if not state.imu_ok:
+        fault_flags.append("imu_invalid")
 
     stm32_alive = (
         last_receive_monotonic_s is not None

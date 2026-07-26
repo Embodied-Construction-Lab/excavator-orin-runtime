@@ -162,10 +162,8 @@ leaving about 98 ms of measured margin. A real Shadow run of at least two
 minutes is required to measure the tail distribution before any control
 decision.
 
-Current CSV rows contain three additional trailing fields whose meaning is not
-defined by the local protocol documents. They were consistently `1,1,1` during
-preflight. The deployed parser intentionally consumes the documented first 16
-fields. The trailing-field meaning must be confirmed before edge control.
+F407 source later confirmed that the three trailing fields are `rs485_ok`,
+`adc_ok` and `imu_ok`. See the real Shadow result below.
 
 ## Verification commands
 
@@ -175,7 +173,8 @@ python -m py_compile orin_state_sender.py orin_csv_replay.py edge_runtime/*.py
 git diff --check
 ```
 
-Result: 50 tests passed; compile and diff checks passed.
+Result after STM32 status-field integration: 54 tests passed; compile and diff
+checks passed.
 
 Shadow logs can be summarized with:
 
@@ -183,7 +182,68 @@ Shadow logs can be summarized with:
 python -m edge_runtime.audit deploy/logs/edge_runtime.jsonl
 ```
 
-## Real Shadow entry conditions
+## First real Shadow result
+
+The supervised real Shadow run on 2026-07-26 completed and released
+`/dev/ttyTHS1` cleanly:
+
+```text
+records: 7158
+state input: 8.000957 Hz
+inference loop: 8.000957 Hz
+sequence missing: 0
+sequence non-increasing: 0
+max consecutive rejections: 0
+progress monotonic violations: 0
+ACTIVE: 481
+TIMEOUT: 6677
+final physical action zero: true
+
+pure CPU ONNX:
+  count: 481
+  mean: 0.346895 ms
+  median: 0.335189 ms
+  p95: 0.392473 ms
+  p99: 0.419636 ms
+  max: 4.427764 ms
+
+full loop:
+  mean: 1.609509 ms
+  p95: 2.135045 ms
+  p99: 2.742975 ms
+  max: 6.380994 ms
+```
+
+PC `/joint_states` independently measured about 8 Hz. PC and Orin Bucket Tip
+at the identical source timestamp `1785040980420 ms` agreed to floating-point
+precision; maximum absolute position difference was approximately
+`3.3e-16 m`.
+
+The PC Mission runtime-status message reported `action_datagrams=0`,
+`motion_authorized=false`, `motion_backend=none` and
+`motion_gate_reason=shadow_no_motion`. No ONNX motion action was sent to STM32.
+
+The same Mission status reported stale/invalid state while `/joint_states` and
+Bucket Tip were current. This PC status-wiring discrepancy does not invalidate
+the local Orin Shadow result, but it must be explained before control.
+
+## STM32 hardware status fields
+
+F407 commit `89f146ab3e28e9bf3d1433fff887e3480d6081e6` defines the three trailing
+telemetry fields as:
+
+```text
+rs485_ok: pull-wire encoder RS485 status
+adc_ok: boom/bucket angle ADC status
+imu_ok: swing IMU sample status
+```
+
+The Orin parser now consumes these fields. Any zero flag makes
+`sensor_valid=false` and records a specific `rs485_invalid`, `adc_invalid` or
+`imu_invalid` fault. A post-change passive hardware check accepted 41 frames;
+all were `1,1,1` and all produced `sensor_valid=true`.
+
+## Future real Shadow entry conditions
 
 Before starting:
 
