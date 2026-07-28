@@ -32,13 +32,17 @@ class FixedActionController:
 class FixedActionStep:
     step_id: str
     label: str
-    delta_normalized_qpos: Tuple[float, float, float, float]
+    target_normalized_qpos: Tuple[
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+    ]
 
 
 @dataclass(frozen=True)
 class FixedActionEnvelope:
     normalized_actuator_position: Mapping[str, Tuple[float, float]]
-    bucket_pitch_deg: Tuple[float, float]
     swing_rad: Tuple[float, float]
 
 
@@ -75,7 +79,7 @@ class FixedActionProfile:
             "actions",
         }
         _require_fields("fixed action profile", value, required)
-        if value["schema_version"] != "fixed_action_profile.v1":
+        if value["schema_version"] != "fixed_action_profile.v2":
             raise ValueError("fixed action profile schema_version is invalid")
         if tuple(value["action_order"]) != ACTION_ORDER:
             raise ValueError("fixed action action_order is invalid")
@@ -156,7 +160,7 @@ class FixedActionRuntimeStep:
 
 
 class FixedActionRuntime:
-    """Track a relative normalized actuator sequence from local Machine State."""
+    """Track an absolute normalized actuator sequence from local Machine State."""
 
     def __init__(
         self,
@@ -177,7 +181,6 @@ class FixedActionRuntime:
         self._steps = profile.actions[phase]
         self._step_index = 0
         self._step_started_at_s: float | None = None
-        self._step_start_qpos: Tuple[float, float, float, float] | None = None
         self._hold_until_s: float | None = None
         self._terminal_result = ""
         self._terminal_reason = ""
@@ -205,17 +208,11 @@ class FixedActionRuntime:
 
         if self._step_started_at_s is None:
             self._step_started_at_s = float(now_s)
-            self._step_start_qpos = current
         step = self._steps[self._step_index]
-        start = self._step_start_qpos or current
-        target = tuple(
-            _clamp(start[index] + step.delta_normalized_qpos[index])
-            for index in range(4)
-        )
         error = tuple(
             0.0
-            if abs(step.delta_normalized_qpos[index]) <= 1e-4
-            else target[index] - current[index]
+            if step.target_normalized_qpos[index] is None
+            else float(step.target_normalized_qpos[index]) - current[index]
             for index in range(4)
         )
         max_error = max(abs(value) for value in error)
@@ -283,7 +280,6 @@ class FixedActionRuntime:
     def _advance(self) -> None:
         self._step_index += 1
         self._step_started_at_s = None
-        self._step_start_qpos = None
         self._hold_until_s = None
 
     def _active(
@@ -384,7 +380,7 @@ def _controller(value: Any) -> FixedActionController:
 
 def _envelope(phase: str, value: Any) -> FixedActionEnvelope:
     mapping = _mapping("start_envelopes.%s" % phase, value)
-    fields = {"normalized_actuator_position", "bucket_pitch_deg", "swing_rad"}
+    fields = {"normalized_actuator_position", "swing_rad"}
     _require_fields("start_envelopes.%s" % phase, mapping, fields)
     normalized = _mapping(
         "start_envelopes.%s.normalized_actuator_position" % phase,
@@ -397,12 +393,6 @@ def _envelope(phase: str, value: Any) -> FixedActionEnvelope:
                 name: _range("%s.%s" % (phase, name), normalized[name], -1.0, 1.0)
                 for name in ("boom", "stick", "bucket")
             }
-        ),
-        bucket_pitch_deg=_range(
-            "%s.bucket_pitch_deg" % phase,
-            mapping["bucket_pitch_deg"],
-            -180.0,
-            180.0,
         ),
         swing_rad=_range(
             "%s.swing_rad" % phase,
@@ -423,28 +413,31 @@ def _steps(phase: str, value: Any) -> Tuple[FixedActionStep, ...]:
         _require_fields(
             "fixed action step",
             mapping,
-            {"step_id", "label", "delta_by_actuator"},
+            {"step_id", "label", "target_normalized_position"},
         )
         step_id = _text("step_id", mapping["step_id"])
         if step_id in identifiers:
             raise ValueError("fixed action step_id must be unique")
         identifiers.add(step_id)
-        deltas = _mapping("delta_by_actuator", mapping["delta_by_actuator"])
-        _require_fields("delta_by_actuator", deltas, set(ACTION_ORDER))
-        converted = tuple(
-            _finite("%s delta" % name, deltas[name]) for name in ACTION_ORDER
+        targets = _mapping(
+            "target_normalized_position",
+            mapping["target_normalized_position"],
         )
-        if any(abs(value) > 2.0 for value in converted):
-            raise ValueError("fixed action delta must be within [-2, 2]")
-        if not any(abs(value) > 1e-9 for value in converted):
-            raise ValueError("fixed action step must not be all zero")
-        if abs(converted[3]) > 1e-9:
-            raise ValueError("fixed action profile does not support swing deltas")
+        if not targets or not set(targets).issubset(set(ACTION_ORDER)):
+            raise ValueError("fixed action target actuators are invalid")
+        if "swing" in targets:
+            raise ValueError("fixed action profile does not support swing targets")
+        converted = tuple(
+            _finite("%s target" % name, targets[name]) if name in targets else None
+            for name in ACTION_ORDER
+        )
+        if any(value is not None and abs(value) > 1.0 for value in converted):
+            raise ValueError("fixed action target must be within [-1, 1]")
         result.append(
             FixedActionStep(
                 step_id=step_id,
                 label=_text("label", mapping["label"]),
-                delta_normalized_qpos=converted,
+                target_normalized_qpos=converted,
             )
         )
     return tuple(result)

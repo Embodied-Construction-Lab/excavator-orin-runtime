@@ -199,6 +199,9 @@ Remote behavior control starts Idle. It accepts immutable Follow Trajectory
 Snapshots and the named `ExecuteDig`/`ExecuteDump` fixed actions over a low-rate
 TCP behavior connection. It does not execute
 `deploy/assets/trajectory_command.json` at startup.
+The fixed-action asset uses `fixed_action_profile.v2`: each stage declares
+absolute normalized actuator targets, so execution does not inherit the final
+pose error of the preceding Follow behavior.
 
 Copy and edit the remote example, including the PC allowlisted address:
 
