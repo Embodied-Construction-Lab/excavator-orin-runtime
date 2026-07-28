@@ -208,6 +208,20 @@ class FollowTrajectorySnapshotTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sha256"):
             FollowTrajectorySnapshot.from_mapping(tampered, now_s=101.0)
 
+    def test_execution_validation_allows_only_bounded_clock_skew(self):
+        snapshot = FollowTrajectorySnapshot.from_mapping(
+            trajectory_snapshot(),
+            now_s=99.8,
+        )
+
+        self.assertEqual(snapshot.trajectory_id, "trajectory-1")
+
+        with self.assertRaisesRegex(ValueError, "from the future"):
+            FollowTrajectorySnapshot.from_mapping(
+                trajectory_snapshot(),
+                now_s=99.4,
+            )
+
 
 class EdgeFollowRuntimeFactoryTest(unittest.TestCase):
     def test_builds_each_runtime_from_preloaded_assets_and_profile_normalizers(self):

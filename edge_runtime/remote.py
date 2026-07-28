@@ -63,6 +63,7 @@ _SNAPSHOT_FIELDS = {
     "tracking_timeout_s",
 }
 _DIGEST_FIELDS = _SNAPSHOT_FIELDS - {"trajectory_id", "trajectory_sha256"}
+_MAX_CLOCK_SKEW_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -204,7 +205,7 @@ class FollowTrajectorySnapshot:
                 raise ValueError("%s is stale when planning inputs were frozen" % name)
         if current > self.valid_until_s:
             raise ValueError("trajectory snapshot expired")
-        if current + 1e-6 < self.created_at_s:
+        if current + _MAX_CLOCK_SKEW_S < self.created_at_s:
             raise ValueError("trajectory snapshot is from the future")
 
 
