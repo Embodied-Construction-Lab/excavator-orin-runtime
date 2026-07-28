@@ -185,6 +185,7 @@ class FixedActionRuntime:
         self._terminal_result = ""
         self._terminal_reason = ""
         self._start_checked = False
+        self._latched_axes = (False, False, False, False)
 
     def step(
         self,
@@ -209,18 +210,34 @@ class FixedActionRuntime:
         if self._step_started_at_s is None:
             self._step_started_at_s = float(now_s)
         step = self._steps[self._step_index]
-        error = tuple(
+        raw_error = tuple(
             0.0
             if step.target_normalized_qpos[index] is None
             else float(step.target_normalized_qpos[index]) - current[index]
             for index in range(4)
         )
-        max_error = max(abs(value) for value in error)
         controller = self._profile.controller
         if float(now_s) - self._step_started_at_s >= controller.step_timeout_s:
             self._terminal_result = "TIMEOUT"
             self._terminal_reason = "STEP_TIMEOUT"
-            return self._terminal("TIMEOUT", "STEP_TIMEOUT", max_error=max_error)
+            return self._terminal(
+                "TIMEOUT",
+                "STEP_TIMEOUT",
+                max_error=max(abs(value) for value in raw_error),
+            )
+        self._latched_axes = tuple(
+            was_latched
+            or (
+                step.target_normalized_qpos[index] is not None
+                and abs(raw_error[index]) <= controller.tolerance
+            )
+            for index, was_latched in enumerate(self._latched_axes)
+        )
+        error = tuple(
+            0.0 if self._latched_axes[index] else raw_error[index]
+            for index in range(4)
+        )
+        max_error = max(abs(value) for value in error)
         if max_error <= controller.tolerance:
             self._hold_until_s = float(now_s) + controller.hold_s
             return self._active("hold", max_error, _ZERO_ACTION, _ZERO_ACTION)
@@ -281,6 +298,7 @@ class FixedActionRuntime:
         self._step_index += 1
         self._step_started_at_s = None
         self._hold_until_s = None
+        self._latched_axes = (False, False, False, False)
 
     def _active(
         self,

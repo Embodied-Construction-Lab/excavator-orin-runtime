@@ -137,7 +137,7 @@ def absolute_dig_profile():
                         "label": "curl",
                         "target_normalized_position": {
                             "stick": 0.15,
-                            "bucket": -1.0,
+                            "bucket": -0.85,
                         },
                     },
                     {
@@ -178,6 +178,33 @@ def state(*, boom_position=0.5, stick_position=0.5, bucket_position=0.5):
 
 
 class FixedActionRuntimeTest(unittest.TestCase):
+    def test_axis_stays_stopped_after_reaching_current_step_target(self):
+        runtime = FixedActionRuntime(
+            profile=absolute_dig_profile(),
+            machine_profile=machine_profile(),
+            phase="dig",
+        )
+
+        first = runtime.step(
+            state(
+                boom_position=0.325,
+                stick_position=0.5,
+                bucket_position=0.5,
+            ),
+            now_s=0.0,
+        )
+        drifted = runtime.step(
+            state(
+                boom_position=0.4,
+                stick_position=0.5,
+                bucket_position=0.5,
+            ),
+            now_s=0.1,
+        )
+
+        self.assertEqual(first.normalized_action, (0.0, -0.6, 0.6, 0.0))
+        self.assertEqual(drifted.normalized_action, (0.0, -0.6, 0.6, 0.0))
+
     def test_absolute_dig_targets_do_not_depend_on_start_pose(self):
         for bucket_position in (0.75, 0.25):
             with self.subTest(bucket_position=bucket_position):
@@ -220,7 +247,9 @@ class FixedActionRuntimeTest(unittest.TestCase):
         curled = state(
             boom_position=0.325,
             stick_position=0.425,
-            bucket_position=1.0,
+            # Field capture: the bucket cable stops near normalized -0.86
+            # before the machine-profile endpoint at -1.0.
+            bucket_position=0.93,
         )
         hold_curl = runtime.step(curled, now_s=0.3)
         self.assertEqual(hold_curl.phase, "hold")
