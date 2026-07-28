@@ -228,7 +228,10 @@ UTF-8 JSON, with a maximum payload of 1 MiB and
 `cancel_follow`, `start_fixed_action` and `cancel_fixed_action`; it emits
 `status`, `accepted`, `rejected`, `feedback` and `result`. It recomputes the
 canonical Trajectory Snapshot SHA-256 before
-acceptance. Snapshot waypoint limits must match the preloaded Mission, while
+acceptance. For remote Follow, the accepted snapshot is authoritative for the
+Mission identity, waypoint tolerance, dwell and tracking timeout; this permits
+PC-planned multi-point demonstrations without copying each dynamic Mission to
+Orin. The preloaded Mission still establishes the deployment frame, while
 `target_threshold` and `tube_radius` come only from the preloaded machine
 profile.
 

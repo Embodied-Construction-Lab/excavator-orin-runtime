@@ -248,7 +248,7 @@ class EdgeFollowRuntimeFactory:
         self._kinematics = kinematics
         self._policy = policy
         self._mission = mission
-        self._mission_sha256 = _sha256("mission_sha256", mission_sha256)
+        _sha256("mission_sha256", mission_sha256)
         self._runtime_type = runtime_type
 
     @classmethod
@@ -287,12 +287,22 @@ class EdgeFollowRuntimeFactory:
                 normalizers.get("tube_radius"),
             ),
         }
+        runtime_mission = {
+            "schema_version": "excavation_mission.v1",
+            "mission_id": snapshot.mission_id,
+            "frame_id": snapshot.frame_id,
+            "limits": {
+                "waypoint_tolerance_m": snapshot.waypoint_tolerance_m,
+                "waypoint_dwell_s": snapshot.waypoint_dwell_s,
+                "tracking_timeout_s": snapshot.tracking_timeout_s,
+            },
+        }
         return self._runtime_type(
             machine_profile=self._machine_profile,
             kinematics=self._kinematics,
             policy=self._policy,
             trajectory=trajectory,
-            mission=self._mission,
+            mission=runtime_mission,
         )
 
     def _validate_mission(self, snapshot: FollowTrajectorySnapshot) -> None:
@@ -300,21 +310,6 @@ class EdgeFollowRuntimeFactory:
             raise ValueError("mission schema_version must be excavation_mission.v1")
         if self._mission.get("frame_id") != snapshot.frame_id:
             raise ValueError("trajectory frame does not match mission")
-        if self._mission.get("mission_id") != snapshot.mission_id:
-            raise ValueError("trajectory mission id does not match mission asset")
-        if self._mission_sha256 != snapshot.mission_sha256:
-            raise ValueError("trajectory mission sha256 does not match mission asset")
-        limits = self._mission.get("limits")
-        if not isinstance(limits, Mapping):
-            raise ValueError("mission limits are missing")
-        expected = {
-            "waypoint_tolerance_m": snapshot.waypoint_tolerance_m,
-            "waypoint_dwell_s": snapshot.waypoint_dwell_s,
-            "tracking_timeout_s": snapshot.tracking_timeout_s,
-        }
-        for name, value in expected.items():
-            if limits.get(name) != value:
-                raise ValueError("trajectory %s does not match mission asset" % name)
 
 
 @dataclass(frozen=True)

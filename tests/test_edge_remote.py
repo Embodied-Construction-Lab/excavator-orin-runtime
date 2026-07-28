@@ -275,6 +275,76 @@ class EdgeFollowRuntimeFactoryTest(unittest.TestCase):
         self.assertNotIn("target_threshold", trajectory_snapshot())
         self.assertNotIn("tube_radius", trajectory_snapshot())
 
+    def test_remote_demo_trajectory_uses_snapshot_identity_and_limits(self):
+        calls = []
+
+        class RecordingRuntime:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        profile = {
+            "machine_id": "scale_excavator_v1",
+            "observation_schema": {
+                "normalizers": {
+                    "target_threshold": 0.03,
+                    "tube_radius": 0.04,
+                }
+            },
+        }
+        deployment_mission = {
+            "schema_version": "excavation_mission.v1",
+            "mission_id": "field_cycle_001",
+            "frame_id": "machine_root_ros",
+            "limits": {
+                "waypoint_tolerance_m": 0.03,
+                "waypoint_dwell_s": 0.0,
+                "tracking_timeout_s": 30.0,
+            },
+        }
+        factory = EdgeFollowRuntimeFactory(
+            machine_profile=profile,
+            kinematics=object(),
+            policy=object(),
+            mission=deployment_mission,
+            mission_sha256="f" * 64,
+            runtime_type=RecordingRuntime,
+        )
+        values = trajectory_snapshot()
+        values.update(
+            {
+                "mission_id": "field_demo_001",
+                "mission_sha256": "d" * 64,
+                "waypoint_tolerance_m": 0.25,
+                "tracking_timeout_s": 60.0,
+            }
+        )
+        values["trajectory_sha256"] = FollowTrajectorySnapshot(
+            **{
+                name: (
+                    tuple(tuple(point) for point in value)
+                    if name == "waypoints"
+                    else value
+                )
+                for name, value in values.items()
+                if name not in {"trajectory_sha256"}
+            },
+            trajectory_sha256="0" * 64,
+        ).computed_sha256()
+        snapshot = FollowTrajectorySnapshot.from_mapping(values, now_s=101.0)
+
+        factory.create(snapshot)
+
+        runtime_mission = calls[0]["mission"]
+        self.assertEqual(runtime_mission["mission_id"], "field_demo_001")
+        self.assertEqual(
+            runtime_mission["limits"],
+            {
+                "waypoint_tolerance_m": 0.25,
+                "waypoint_dwell_s": 0.0,
+                "tracking_timeout_s": 60.0,
+            },
+        )
+
 
 def start_request(session_id="session-1", request_id="start-1", seq=0):
     return {
