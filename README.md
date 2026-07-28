@@ -38,8 +38,10 @@ The compatibility protocol currently retains
 - `orin_csv_replay.py`: validates and replays an exported physical-velocity CSV through the local Action Relay.
 - `edge_runtime/`: dependency-light URDF FK, Unity-compatible 38D observation,
   ONNX inference, waypoint tracking, normalized-to-physical conversion, shadow
-  auditing and loopback edge control.
-- `deploy/edge_runtime.example.json`: the single edge deployment configuration.
+  auditing, loopback edge control and remote Follow RPC.
+- `deploy/edge_runtime.example.json`: static Shadow/control deployment configuration.
+- `deploy/edge_runtime.remote.example.json`: remote Follow server configuration;
+  it intentionally contains no static trajectory.
 - `tests/`: host-side protocol, relay, timeout, ordering and replay tests.
 
 Historical joystick and `[swing, boom, stick, bucket]` rollout tools are intentionally excluded.
@@ -187,11 +189,61 @@ longer crosses the PC network. The PC link carries monitoring and future
 low-rate trajectory/mission updates only. Ctrl+C, invalid sensor state, action
 lease expiry, trajectory completion and shutdown all produce a zero command.
 
-The first implementation loads one immutable trajectory snapshot at startup.
-To test a newly planned trajectory, stop the process, replace
-`deploy/assets/trajectory_command.json`, then restart. Live trajectory update is
-the next migration slice; it must not reintroduce the high-rate state/action
-round trip.
+This static control mode remains available for the existing staged rollout.
+
+## Remote edge Follow
+
+Remote Follow starts Idle and accepts immutable Trajectory Snapshots over a
+low-rate TCP behavior connection. It does not execute
+`deploy/assets/trajectory_command.json` at startup.
+
+Copy and edit the remote example, including the PC allowlisted address:
+
+```bash
+cp deploy/edge_runtime.remote.example.json deploy/edge_runtime.remote.json
+python3 -m json.tool deploy/edge_runtime.remote.json >/dev/null
+
+python3 orin_state_sender.py \
+  --control-enabled \
+  --pc-host <PC_IP> \
+  --edge-config deploy/edge_runtime.remote.json \
+  --edge-motion-authorization ALLOW_EDGE_MACHINE_MOTION \
+  --print-every 100
+```
+
+Motion remains gated by both `--control-enabled` and the exact authorization
+token. In `remote_control`, the Action Relay bind and allowlist are forcibly
+set to `127.0.0.1`; behavior RPC never writes serial, scales actions or changes
+signs.
+
+Each TCP JSON message uses a four-byte big-endian payload length followed by
+UTF-8 JSON, with a maximum payload of 1 MiB and
+`schema_version="orin_behavior_rpc.v1"`. The server accepts only `start_follow`
+and `cancel_follow`; it emits `status`, `accepted`, `rejected`, `feedback` and
+`result`. It recomputes the canonical Trajectory Snapshot SHA-256 before
+acceptance. Snapshot waypoint limits must match the preloaded Mission, while
+`target_threshold` and `tube_radius` come only from the preloaded machine
+profile.
+
+The server sends status immediately on each allowed TCP connection and then at
+the configured rate, including while Idle. A client disconnect, cancellation,
+completion, timeout, rejected machine state, exception or shutdown closes the
+active `EdgeControlRunner`, which submits a zero through the existing loopback
+Action Relay before the terminal result reports quiescence.
+
+Before accepting each Goal, Orin rechecks its own latest Machine State and
+rejects stale or unsafe state with `MOTION_NOT_READY`; PC readiness is not
+trusted as the final authority. While Follow is active, a local watchdog checks
+the same gate on every status tick. If Machine State stops or the gate closes,
+the runner submits terminal zero and returns `MOTION_GATE_CLOSED` instead of
+remaining active indefinitely.
+
+Network status/feedback/result writes use a bounded writer queue. Serial
+ingestion, FK, observation construction, ONNX inference and loopback action
+delivery never call TCP `sendall` directly. A stalled client therefore cannot
+block the local control loop; sustained backpressure closes that client, which
+then triggers the same terminal-zero disconnect path. Event sequence assignment
+is serialized across concurrent status and feedback producers.
 
 ## Local CSV replay
 

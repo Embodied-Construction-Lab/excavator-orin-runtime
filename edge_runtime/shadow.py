@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,15 +21,25 @@ LOGGER = logging.getLogger("orin_edge_shadow")
 
 
 @dataclass(frozen=True)
+class RemoteBehaviorConfig:
+    bind_host: str
+    bind_port: int
+    allowed_client_host: str
+    status_hz: float
+    status_timeout_s: float
+
+
+@dataclass(frozen=True)
 class EdgeRuntimeConfig:
     mode: str
     machine_profile_path: Path
     urdf_path: Path
     onnx_path: Path
-    trajectory_path: Path
+    trajectory_path: Optional[Path]
     mission_path: Path
     audit_path: Path
     action_valid_for_ms: int
+    remote_behavior: Optional[RemoteBehaviorConfig] = None
 
 
 def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
@@ -37,23 +48,37 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         value = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("cannot read edge shadow config %s: %s" % (path, exc)) from exc
-    required = {
+    common = {
         "schema_version",
         "mode",
         "machine_profile_path",
         "urdf_path",
         "onnx_path",
-        "trajectory_path",
         "mission_path",
         "audit_path",
         "action_valid_for_ms",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    if (
+        not isinstance(value, dict)
+        or "schema_version" not in value
+        or "mode" not in value
+    ):
         raise ValueError("edge shadow config fields are invalid")
     if value["schema_version"] != "orin_edge_runtime.v1":
         raise ValueError("edge shadow schema_version is invalid")
-    if value["mode"] not in ("shadow", "control"):
-        raise ValueError("edge runtime mode must be shadow or control")
+    mode = value["mode"]
+    if mode in ("shadow", "control"):
+        if set(value) != common | {"trajectory_path"}:
+            raise ValueError("edge shadow config fields are invalid")
+        remote_behavior = None
+    elif mode == "remote_control":
+        if set(value) != common | {"remote_behavior"}:
+            raise ValueError("remote edge config fields are invalid")
+        remote_behavior = _remote_behavior_config(value["remote_behavior"])
+    else:
+        raise ValueError(
+            "edge runtime mode must be shadow, control, or remote_control"
+        )
     action_valid_for_ms = value["action_valid_for_ms"]
     if (
         isinstance(action_valid_for_ms, bool)
@@ -63,18 +88,25 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         raise ValueError("edge action_valid_for_ms must be a positive integer")
     root = config_path.parent
     return EdgeRuntimeConfig(
-        mode=value["mode"],
+        mode=mode,
         machine_profile_path=_relative_path(root, value["machine_profile_path"]),
         urdf_path=_relative_path(root, value["urdf_path"]),
         onnx_path=_relative_path(root, value["onnx_path"]),
-        trajectory_path=_relative_path(root, value["trajectory_path"]),
+        trajectory_path=(
+            _relative_path(root, value["trajectory_path"])
+            if mode != "remote_control"
+            else None
+        ),
         mission_path=_relative_path(root, value["mission_path"]),
         audit_path=_relative_path(root, value["audit_path"]),
         action_valid_for_ms=action_valid_for_ms,
+        remote_behavior=remote_behavior,
     )
 
 
 def build_edge_follow_runtime(config: EdgeRuntimeConfig) -> EdgeFollowRuntime:
+    if config.trajectory_path is None:
+        raise ValueError("static edge runtime requires trajectory_path")
     try:
         machine_profile = json.loads(
             config.machine_profile_path.read_text(encoding="utf-8")
@@ -188,3 +220,44 @@ def _relative_path(root: Path, value: Any) -> Path:
         raise ValueError("edge shadow path must be a non-empty string")
     path = Path(value)
     return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def _remote_behavior_config(value: Any) -> RemoteBehaviorConfig:
+    required = {
+        "bind_host",
+        "bind_port",
+        "allowed_client_host",
+        "status_hz",
+        "status_timeout_s",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("remote_behavior fields are invalid")
+    for name in ("bind_host", "allowed_client_host"):
+        if not isinstance(value[name], str) or not value[name].strip():
+            raise ValueError("remote_behavior.%s must be non-empty" % name)
+    bind_port = value["bind_port"]
+    if (
+        isinstance(bind_port, bool)
+        or not isinstance(bind_port, int)
+        or bind_port <= 0
+        or bind_port > 65535
+    ):
+        raise ValueError("remote_behavior.bind_port is invalid")
+    numeric = {}
+    for name in ("status_hz", "status_timeout_s"):
+        item = value[name]
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or float(item) <= 0.0
+        ):
+            raise ValueError("remote_behavior.%s must be positive" % name)
+        numeric[name] = float(item)
+    return RemoteBehaviorConfig(
+        bind_host=value["bind_host"],
+        bind_port=bind_port,
+        allowed_client_host=value["allowed_client_host"],
+        status_hz=numeric["status_hz"],
+        status_timeout_s=numeric["status_timeout_s"],
+    )

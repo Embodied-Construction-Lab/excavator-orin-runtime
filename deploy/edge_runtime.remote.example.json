@@ -1,0 +1,17 @@
+{
+  "schema_version": "orin_edge_runtime.v1",
+  "mode": "remote_control",
+  "machine_profile_path": "assets/machine_profile.json",
+  "urdf_path": "assets/waji.urdf",
+  "onnx_path": "assets/policy.onnx",
+  "mission_path": "assets/excavation_cycle.json",
+  "audit_path": "logs/edge_runtime.jsonl",
+  "action_valid_for_ms": 300,
+  "remote_behavior": {
+    "bind_host": "0.0.0.0",
+    "bind_port": 18083,
+    "allowed_client_host": "192.168.0.220",
+    "status_hz": 5.0,
+    "status_timeout_s": 0.3
+  }
+}

@@ -86,7 +86,9 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertEqual(packet["action"], [0.01, -0.02, 0.03, -0.04])
         self.assertEqual(packet["stamp_ms"], 5000)
         self.assertEqual(packet["valid_for_ms"], 300)
+        self.assertEqual(runner.action_datagrams, 1)
         runner.close(action_stamp_ms=5001)
+        self.assertEqual(runner.action_datagrams, 2)
 
     def test_completed_trajectory_sends_zero_instead_of_last_policy_action(self):
         sink = RecordingSink()

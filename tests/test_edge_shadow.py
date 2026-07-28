@@ -130,6 +130,38 @@ class EdgeShadowObserverTest(unittest.TestCase):
 
         self.assertEqual(config.mode, "control")
 
+    def test_remote_control_config_has_no_static_trajectory_and_loads_server(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "remote_control",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "onnx_path": "policy.onnx",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                    "remote_behavior": {
+                        "bind_host": "0.0.0.0",
+                        "bind_port": 18083,
+                        "allowed_client_host": "192.168.2.127",
+                        "status_hz": 5.0,
+                        "status_timeout_s": 0.3,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_edge_runtime_config(config_path)
+
+        self.assertEqual(config.mode, "remote_control")
+        self.assertIsNone(config.trajectory_path)
+        self.assertEqual(config.remote_behavior.bind_port, 18083)
+        self.assertEqual(config.remote_behavior.status_hz, 5.0)
+
     def test_config_loads_one_authoritative_mission_path(self):
         config_path = self.root / "edge.json"
         config_path.write_text(
@@ -174,6 +206,11 @@ class EdgeShadowObserverTest(unittest.TestCase):
                 "ALLOW_EDGE_MACHINE_MOTION"
             )
         )
+        self.assertTrue(orin_state_sender.edge_mode_controls_motion("control"))
+        self.assertTrue(
+            orin_state_sender.edge_mode_controls_motion("remote_control")
+        )
+        self.assertFalse(orin_state_sender.edge_mode_controls_motion("shadow"))
 
 
 if __name__ == "__main__":

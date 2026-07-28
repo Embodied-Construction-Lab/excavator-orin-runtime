@@ -45,6 +45,10 @@ class EdgeControlRunner:
         self._action_seq = 0
         self._consecutive_rejections = 0
 
+    @property
+    def action_datagrams(self) -> int:
+        return self._action_seq
+
     def observe(
         self,
         machine_state: Mapping[str, Any],

@@ -806,6 +806,10 @@ def edge_control_authorized(value: str) -> bool:
     return value == EDGE_MOTION_AUTHORIZATION
 
 
+def edge_mode_controls_motion(mode: str) -> bool:
+    return mode in ("control", "remote_control")
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bridge STM32 /dev/ttyTHS0 state to PC machine_state_v1 UDP JSON.",
@@ -892,7 +896,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=Path,
         help=(
             "Run local FK/38D/ONNX Follow using one orin_edge_runtime.v1 "
-            "shadow or control config."
+            "shadow, static control, or remote_control config."
         ),
     )
     parser.add_argument(
@@ -915,6 +919,7 @@ def main() -> None:
     allowed_action_host = args.allowed_action_host or args.pc_host
     edge_config = None
     edge_runtime = None
+    remote_runtime_factory = None
     if args.edge_config is not None:
         from edge_runtime.shadow import (
             build_edge_follow_runtime,
@@ -922,7 +927,7 @@ def main() -> None:
         )
 
         edge_config = load_edge_runtime_config(args.edge_config)
-        if edge_config.mode == "control":
+        if edge_mode_controls_motion(edge_config.mode):
             if not args.control_enabled:
                 raise RuntimeError("edge control requires --control-enabled")
             if not edge_control_authorized(args.edge_motion_authorization):
@@ -932,8 +937,15 @@ def main() -> None:
                 )
             args.action_bind_host = "127.0.0.1"
             allowed_action_host = "127.0.0.1"
-        # Validate every copied artifact and load ONNX before taking serial ownership.
-        edge_runtime = build_edge_follow_runtime(edge_config)
+        # Validate copied assets and load ONNX before taking serial ownership.
+        if edge_config.mode == "remote_control":
+            from edge_runtime.remote import EdgeFollowRuntimeFactory
+
+            remote_runtime_factory = EdgeFollowRuntimeFactory.from_config(
+                edge_config
+            )
+        else:
+            edge_runtime = build_edge_follow_runtime(edge_config)
 
     LOGGER.info(
         "opening serial %s @ %d, sending UDP JSON to %s:%d, listening policy_action on %s:%d from %s",
@@ -959,6 +971,8 @@ def main() -> None:
     action_relay.start()
     edge_runner = None
     edge_action_sender = None
+    remote_executor = None
+    remote_server = None
     if edge_config is not None:
         from edge_runtime.shadow import EdgeShadowObserver
 
@@ -971,7 +985,7 @@ def main() -> None:
                 "edge inference shadow enabled: config=%s (audit only, no STM32 action sink)",
                 args.edge_config,
             )
-        else:
+        elif edge_config.mode == "control":
             from edge_runtime.control import EdgeControlRunner
 
             edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -984,6 +998,52 @@ def main() -> None:
             )
             LOGGER.warning(
                 "EDGE CONTROL ARMED: local inference owns loopback action source on 127.0.0.1:%d",
+                args.action_bind_port,
+            )
+        else:
+            from edge_runtime.control import EdgeControlRunner
+            from edge_runtime.remote import EdgeBehaviorExecutor, RemoteBehaviorServer
+
+            edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            edge_action_sender.connect(("127.0.0.1", args.action_bind_port))
+
+            def build_remote_runner(runtime):
+                return EdgeControlRunner(
+                    runtime=runtime,
+                    action_sink=edge_action_sender,
+                    audit_path=edge_config.audit_path,
+                    valid_for_ms=edge_config.action_valid_for_ms,
+                )
+
+            remote = edge_config.remote_behavior
+            remote_executor = EdgeBehaviorExecutor(
+                runtime_factory=remote_runtime_factory,
+                runner_factory=build_remote_runner,
+                sender_constructed=True,
+                state_timeout_s=remote.status_timeout_s,
+            )
+            remote_server = RemoteBehaviorServer(
+                bind_host=remote.bind_host,
+                bind_port=remote.bind_port,
+                allowed_client_host=remote.allowed_client_host,
+                executor=remote_executor,
+                status_interval_s=1.0 / remote.status_hz,
+            )
+            try:
+                remote_server.start()
+            except Exception:
+                edge_action_sender.close()
+                action_relay.close()
+                action_sock.close()
+                sock.close()
+                ser.close()
+                raise
+            LOGGER.warning(
+                "REMOTE EDGE CONTROL ARMED IDLE: behavior RPC %s:%d from %s; "
+                "actions remain loopback-only on 127.0.0.1:%d",
+                remote.bind_host,
+                remote.bind_port,
+                remote.allowed_client_host,
                 args.action_bind_port,
             )
 
@@ -1047,6 +1107,8 @@ def main() -> None:
                         now_s=time.monotonic(),
                         action_stamp_ms=now_ms(),
                     )
+            if remote_executor is not None:
+                remote_executor.observe(packet)
 
             if args.print_every and seq % args.print_every == 0:
                 LOGGER.info(
@@ -1066,11 +1128,17 @@ def main() -> None:
         LOGGER.info("stopped by user")
     finally:
         try:
-            if edge_config is not None and edge_config.mode == "control":
-                edge_runner.close(action_stamp_ms=now_ms())
-            elif edge_runner is not None:
-                edge_runner.close()
-            action_relay.close()
+            try:
+                if remote_server is not None:
+                    remote_server.close()
+            finally:
+                try:
+                    if edge_config is not None and edge_config.mode == "control":
+                        edge_runner.close(action_stamp_ms=now_ms())
+                    elif edge_runner is not None:
+                        edge_runner.close()
+                finally:
+                    action_relay.close()
         finally:
             if edge_action_sender is not None:
                 edge_action_sender.close()
