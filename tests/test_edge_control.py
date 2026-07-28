@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import orin_state_sender
 
+from edge_runtime import control
 from edge_runtime.control import EdgeControlRunner
 from edge_runtime.follow import EdgeFollowStep
 
@@ -89,6 +90,42 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertEqual(runner.action_datagrams, 1)
         runner.close(action_stamp_ms=5001)
         self.assertEqual(runner.action_datagrams, 2)
+
+    def test_consecutive_remote_follow_runners_share_one_action_sequence(self):
+        sink = RecordingSink()
+        sequence = control.ActionSequence()
+        first = EdgeControlRunner(
+            runtime=StubRuntime(),
+            action_sink=sink,
+            audit_path=self.audit_path,
+            valid_for_ms=300,
+            action_sequence=sequence,
+        )
+        first.observe(
+            {"seq": 4, "stamp_ms": 1200},
+            now_s=2.0,
+            action_stamp_ms=5000,
+        )
+        first.close(action_stamp_ms=5001)
+
+        second = EdgeControlRunner(
+            runtime=StubRuntime(),
+            action_sink=sink,
+            audit_path=self.audit_path,
+            valid_for_ms=300,
+            action_sequence=sequence,
+        )
+        second.observe(
+            {"seq": 5, "stamp_ms": 1300},
+            now_s=2.1,
+            action_stamp_ms=5100,
+        )
+        second.close(action_stamp_ms=5101)
+
+        self.assertEqual(
+            [packet["seq"] for packet in sink.payloads],
+            [0, 1, 2, 3],
+        )
 
     def test_completed_trajectory_sends_zero_instead_of_last_policy_action(self):
         sink = RecordingSink()

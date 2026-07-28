@@ -135,12 +135,13 @@ def build_observation(
     target_pitch_deg = float(
         machine_profile["task_profile"]["bucket_pitch_targets_deg"][task_mode]
     )
+    pitch_error_deg = (pitch_deg - target_pitch_deg + 180.0) % 360.0 - 180.0
     pitch_norm_deg = max(float(normalizers["pitch_norm_deg"]), 1.0)
     observation.extend(
         (
             pitch_deg / pitch_norm_deg,
             target_pitch_deg / pitch_norm_deg,
-            (pitch_deg - target_pitch_deg) / pitch_norm_deg,
+            pitch_error_deg / pitch_norm_deg,
             _pitch_velocity(previous_tip, bucket_tip, pitch_deg),
         )
     )

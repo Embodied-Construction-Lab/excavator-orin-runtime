@@ -1,3 +1,4 @@
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -191,6 +192,41 @@ class EdgeFollowRuntimeTest(unittest.TestCase):
         for actual, expected in zip(step.observation[9:12], expected_unity_tip):
             self.assertAlmostEqual(actual, expected / 1.13, places=12)
         self.assertEqual(step.observation[30:34], (0.0, 0.0, 0.0, 0.0))
+
+    def test_bucket_pitch_error_matches_unity_delta_angle_for_each_task_mode(self):
+        observations = {}
+        for task_mode in ("MoveToDig", "CarryMaterial"):
+            configured_trajectory = dict(trajectory(), task_mode=task_mode)
+            runtime = EdgeFollowRuntime(
+                machine_profile=machine_profile(),
+                kinematics=self.kinematics,
+                policy=RecordingPolicy([0.0, 0.0, 0.0, 0.0]),
+                trajectory=configured_trajectory,
+                mission=mission(),
+            )
+
+            step = runtime.step(machine_state(), now_s=1.0)
+            observations[task_mode] = step.observation
+
+            current_pitch_deg = math.degrees(step.bucket_pitch_rad)
+            target_pitch_deg = machine_profile()["task_profile"][
+                "bucket_pitch_targets_deg"
+            ][task_mode]
+            unity_delta_deg = (
+                (current_pitch_deg - target_pitch_deg + 180.0) % 360.0
+            ) - 180.0
+            self.assertAlmostEqual(
+                step.observation[36],
+                unity_delta_deg / 180.0,
+                places=12,
+            )
+
+        self.assertEqual(observations["MoveToDig"][27:29], (1.0, 0.0))
+        self.assertEqual(observations["CarryMaterial"][27:29], (0.0, 1.0))
+        self.assertNotEqual(
+            observations["MoveToDig"][36],
+            observations["CarryMaterial"][36],
+        )
 
     def test_next_step_uses_previous_policy_action_and_source_timestamp(self):
         policy = RecordingPolicy([0.25, -0.25, 0.5, -0.5])

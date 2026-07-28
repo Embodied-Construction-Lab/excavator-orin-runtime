@@ -1001,11 +1001,12 @@ def main() -> None:
                 args.action_bind_port,
             )
         else:
-            from edge_runtime.control import EdgeControlRunner
+            from edge_runtime.control import ActionSequence, EdgeControlRunner
             from edge_runtime.remote import EdgeBehaviorExecutor, RemoteBehaviorServer
 
             edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             edge_action_sender.connect(("127.0.0.1", args.action_bind_port))
+            edge_action_sequence = ActionSequence()
 
             def build_remote_runner(runtime):
                 return EdgeControlRunner(
@@ -1013,6 +1014,7 @@ def main() -> None:
                     action_sink=edge_action_sender,
                     audit_path=edge_config.audit_path,
                     valid_for_ms=edge_config.action_valid_for_ms,
+                    action_sequence=edge_action_sequence,
                 )
 
             remote = edge_config.remote_behavior

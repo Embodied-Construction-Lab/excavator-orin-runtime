@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol
@@ -19,6 +20,22 @@ class ActionSink(Protocol):
         ...
 
 
+class ActionSequence:
+    """Process-scoped monotonic sequence shared by consecutive Follow runners."""
+
+    def __init__(self, start: int = 0) -> None:
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("action sequence start must be a nonnegative integer")
+        self._next_value = start
+        self._lock = threading.Lock()
+
+    def next(self) -> int:
+        with self._lock:
+            value = self._next_value
+            self._next_value += 1
+            return value
+
+
 class EdgeControlRunner:
     """Convert each local inference result into one loopback policy_action."""
 
@@ -29,6 +46,7 @@ class EdgeControlRunner:
         action_sink: ActionSink,
         audit_path: Path,
         valid_for_ms: int,
+        action_sequence: Optional[ActionSequence] = None,
     ) -> None:
         if valid_for_ms <= 0:
             raise ValueError("edge action valid_for_ms must be positive")
@@ -42,12 +60,13 @@ class EdgeControlRunner:
             buffering=1,
         )
         self._valid_for_ms = int(valid_for_ms)
-        self._action_seq = 0
+        self._action_sequence = action_sequence or ActionSequence()
+        self._action_datagrams = 0
         self._consecutive_rejections = 0
 
     @property
     def action_datagrams(self) -> int:
-        return self._action_seq
+        return self._action_datagrams
 
     def observe(
         self,
@@ -132,10 +151,11 @@ class EdgeControlRunner:
             self._audit_handle.close()
 
     def _send(self, action: tuple, action_stamp_ms: int) -> None:
+        sequence = self._action_sequence.next()
         packet = {
             "type": "policy_action",
             "schema_version": "1.0",
-            "seq": self._action_seq,
+            "seq": sequence,
             "stamp_ms": int(action_stamp_ms),
             "action_order": ["boom", "stick", "bucket", "swing"],
             "action": [float(value) for value in action],
@@ -145,7 +165,7 @@ class EdgeControlRunner:
         }
         payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
         self._action_sink.send(payload)
-        self._action_seq += 1
+        self._action_datagrams += 1
 
     def _append(self, record: Mapping[str, Any]) -> None:
         self._audit_handle.write(json.dumps(record, separators=(",", ":")) + "\n")
