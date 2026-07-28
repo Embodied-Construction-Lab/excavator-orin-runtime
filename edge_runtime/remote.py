@@ -330,6 +330,19 @@ class _ActiveFollow:
 
 
 @dataclass(frozen=True)
+class _ActiveFixedAction:
+    session_id: str
+    request_id: str
+    request_seq: int
+    behavior: str
+    runner: Any
+    event_sink: Callable[[Mapping[str, Any]], None]
+    final_step_index: int = 0
+    final_step_label: str = ""
+    final_max_error: float = 0.0
+
+
+@dataclass(frozen=True)
 class _SafetySnapshot:
     control_enabled: bool
     sensor_valid: bool
@@ -340,13 +353,15 @@ class _SafetySnapshot:
 
 
 class EdgeBehaviorExecutor:
-    """Serialize the only active remote Follow and its local state observations."""
+    """Serialize the one active Orin-local behavior and its state observations."""
 
     def __init__(
         self,
         *,
         runtime_factory: EdgeFollowRuntimeFactory,
         runner_factory: Callable[[EdgeFollowRuntime], Any],
+        fixed_action_factory: Any = None,
+        fixed_runner_factory: Optional[Callable[[Any, str], Any]] = None,
         wall_clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
         action_stamp_clock: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
@@ -355,11 +370,13 @@ class EdgeBehaviorExecutor:
     ) -> None:
         self._runtime_factory = runtime_factory
         self._runner_factory = runner_factory
+        self._fixed_action_factory = fixed_action_factory
+        self._fixed_runner_factory = fixed_runner_factory
         self._wall_clock = wall_clock
         self._monotonic_clock = monotonic_clock
         self._action_stamp_clock = action_stamp_clock
         self._lock = threading.RLock()
-        self._active: Optional[_ActiveFollow] = None
+        self._active: Optional[Any] = None
         self._event_sequence = 0
         self._last_request_sequences: dict[str, int] = {}
         self._latest_safety: Optional[_SafetySnapshot] = None
@@ -392,7 +409,7 @@ class EdgeBehaviorExecutor:
             if not self._accept_request_sequence(identity, event_sink):
                 return
             if self._active is not None:
-                self._reject(identity, event_sink, "BUSY", "another Follow is active")
+                self._reject(identity, event_sink, "BUSY", "another behavior is active")
                 return
             gate_reason = self._motion_gate_reason_locked(active=None)
             if gate_reason != "ready":
@@ -441,28 +458,152 @@ class EdgeBehaviorExecutor:
         if request_type == "cancel_follow":
             self.cancel(request, event_sink)
             return
+        if request_type == "start_fixed_action":
+            self._start_fixed_action(request, event_sink)
+            return
+        if request_type == "cancel_fixed_action":
+            self._cancel_fixed_action(request, event_sink)
+            return
         identity = _request_identity(request)
         with self._lock:
             self._reject(
                 identity,
                 event_sink,
                 "BAD_REQUEST",
-                "only start_follow and cancel_follow are supported",
+                "unsupported behavior request type",
             )
+
+    def _start_fixed_action(
+        self,
+        request: Mapping[str, Any],
+        event_sink: Callable[[Mapping[str, Any]], None],
+    ) -> None:
+        with self._lock:
+            identity = _request_identity(
+                request,
+                expected_type="start_fixed_action",
+            )
+            if set(request) != {
+                "schema_version",
+                "type",
+                "session_id",
+                "seq",
+                "request_id",
+                "behavior",
+            }:
+                self._reject(
+                    identity,
+                    event_sink,
+                    "BAD_REQUEST",
+                    "start_fixed_action fields are invalid",
+                )
+                return
+            if not self._accept_request_sequence(identity, event_sink):
+                return
+            if self._active is not None:
+                self._reject(
+                    identity,
+                    event_sink,
+                    "BUSY",
+                    "another behavior is active",
+                )
+                return
+            gate_reason = self._motion_gate_reason_locked(active=None)
+            if gate_reason != "ready":
+                self._reject(
+                    identity,
+                    event_sink,
+                    "MOTION_NOT_READY",
+                    gate_reason,
+                )
+                return
+            behavior = request.get("behavior")
+            if behavior not in {"ExecuteDig", "ExecuteDump"}:
+                self._reject(
+                    identity,
+                    event_sink,
+                    "INVALID_FIXED_ACTION",
+                    "behavior must be ExecuteDig or ExecuteDump",
+                )
+                return
+            if self._fixed_action_factory is None or self._fixed_runner_factory is None:
+                self._reject(
+                    identity,
+                    event_sink,
+                    "FIXED_ACTION_UNAVAILABLE",
+                    "Orin fixed action runtime is unavailable",
+                )
+                return
+            try:
+                runtime = self._fixed_action_factory.create(behavior)
+                runner = self._fixed_runner_factory(runtime, behavior)
+            except Exception as exc:
+                self._reject(
+                    identity,
+                    event_sink,
+                    "INVALID_FIXED_ACTION",
+                    str(exc),
+                )
+                return
+            self._active = _ActiveFixedAction(
+                session_id=identity[0],
+                request_id=identity[2],
+                request_seq=identity[1],
+                behavior=behavior,
+                runner=runner,
+                event_sink=event_sink,
+            )
+            self._emit(
+                event_sink,
+                "accepted",
+                session_id=identity[0],
+                request_id=identity[2],
+                behavior=behavior,
+            )
+
+    def _cancel_fixed_action(
+        self,
+        request: Mapping[str, Any],
+        event_sink: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    ) -> None:
+        self._cancel_behavior(
+            request,
+            expected_type="cancel_fixed_action",
+            expected_active_type=_ActiveFixedAction,
+            event_sink=event_sink,
+            message="fixed action cancelled by client",
+        )
 
     def cancel(
         self,
         request: Mapping[str, Any],
         event_sink: Optional[Callable[[Mapping[str, Any]], None]] = None,
     ) -> None:
+        self._cancel_behavior(
+            request,
+            expected_type="cancel_follow",
+            expected_active_type=_ActiveFollow,
+            event_sink=event_sink,
+            message="Follow cancelled by client",
+        )
+
+    def _cancel_behavior(
+        self,
+        request: Mapping[str, Any],
+        *,
+        expected_type: str,
+        expected_active_type: type,
+        event_sink: Optional[Callable[[Mapping[str, Any]], None]],
+        message: str,
+    ) -> None:
         with self._lock:
-            identity = _request_identity(request, expected_type="cancel_follow")
+            identity = _request_identity(request, expected_type=expected_type)
             active = self._active
             sink = event_sink or (
                 active.event_sink if active is not None else None
             )
             if sink is None:
-                raise ValueError("event_sink is required when no Follow is active")
+                raise ValueError("event_sink is required when no behavior is active")
             if set(request) != {
                 "schema_version",
                 "type",
@@ -470,19 +611,32 @@ class EdgeBehaviorExecutor:
                 "seq",
                 "request_id",
             }:
-                self._reject(identity, sink, "BAD_REQUEST", "cancel_follow fields are invalid")
+                self._reject(
+                    identity,
+                    sink,
+                    "BAD_REQUEST",
+                    "%s fields are invalid" % expected_type,
+                )
                 return
             if not self._accept_request_sequence(identity, sink):
                 return
             if active is None:
-                self._reject(identity, sink, "NOT_ACTIVE", "no Follow is active")
+                self._reject(identity, sink, "NOT_ACTIVE", "no behavior is active")
+                return
+            if not isinstance(active, expected_active_type):
+                self._reject(
+                    identity,
+                    sink,
+                    "BEHAVIOR_MISMATCH",
+                    "cancel request does not match the active behavior",
+                )
                 return
             if event_sink is not None and event_sink is not active.event_sink:
                 self._reject(
                     identity,
                     sink,
                     "SESSION_MISMATCH",
-                    "cancel_follow connection does not own the active Follow",
+                    "cancel connection does not own the active behavior",
                 )
                 return
             if identity[0] != active.session_id:
@@ -494,7 +648,7 @@ class EdgeBehaviorExecutor:
             self._finish(
                 outcome="CANCELLED",
                 reason_code="CANCELLED",
-                message="Follow cancelled by client",
+                message=message,
             )
 
     def observe(self, machine_state: Mapping[str, Any]) -> None:
@@ -521,8 +675,11 @@ class EdgeBehaviorExecutor:
                 self._finish(
                     outcome="FAILED",
                     reason_code="STATE_REJECTED",
-                    message="Follow rejected the machine state",
+                    message="active behavior rejected the machine state",
                 )
+                return
+            if isinstance(active, _ActiveFixedAction):
+                self._observe_fixed_action(active, step)
                 return
             self._active = replace(
                 active,
@@ -569,6 +726,50 @@ class EdgeBehaviorExecutor:
                     reason_code="EXECUTION_ERROR",
                     message="Follow returned invalid terminal state",
                 )
+
+    def _observe_fixed_action(
+        self,
+        active: _ActiveFixedAction,
+        step: Any,
+    ) -> None:
+        self._active = replace(
+            active,
+            final_step_index=step.step_index,
+            final_step_label=step.step_label,
+            final_max_error=step.max_error,
+        )
+        if step.result == "ACTIVE":
+            self._emit(
+                active.event_sink,
+                "feedback",
+                session_id=active.session_id,
+                request_id=active.request_id,
+                behavior=active.behavior,
+                step_index=step.step_index,
+                step_label=step.step_label,
+                phase=step.phase,
+                max_error=step.max_error,
+                action_datagrams=_action_datagrams(active.runner),
+            )
+            return
+        if step.result == "COMPLETED":
+            self._finish(
+                outcome="SUCCEEDED",
+                reason_code=step.reason_code or "SEQUENCE_COMPLETED",
+                message="%s completed" % active.behavior,
+            )
+        elif step.result == "TIMEOUT":
+            self._finish(
+                outcome="FAILED",
+                reason_code=step.reason_code or "STEP_TIMEOUT",
+                message="%s step timeout" % active.behavior,
+            )
+        else:
+            self._finish(
+                outcome="FAILED",
+                reason_code=step.reason_code or "EXECUTION_ERROR",
+                message="%s returned invalid terminal state" % active.behavior,
+            )
 
     def close(self, *, emit_result: bool = True) -> None:
         with self._lock:
@@ -636,7 +837,25 @@ class EdgeBehaviorExecutor:
                 estop=estop,
                 fault_free=fault_free,
                 quiescent=active is None,
-                active_behavior="Follow" if active is not None else "",
+                active_behavior=(
+                    "Follow"
+                    if isinstance(active, _ActiveFollow)
+                    else (
+                        active.behavior
+                        if isinstance(active, _ActiveFixedAction)
+                        else ""
+                    )
+                ),
+                fixed_actions_available=self._fixed_action_factory is not None,
+                fixed_actions_validated=bool(
+                    self._fixed_action_factory is not None
+                    and getattr(
+                        getattr(self._fixed_action_factory, "profile", None),
+                        "validation_status",
+                        "",
+                    )
+                    == "field_validated"
+                ),
                 action_datagrams=(
                     _action_datagrams(active.runner)
                     if active is not None
@@ -649,7 +868,7 @@ class EdgeBehaviorExecutor:
     def _motion_gate_reason_locked(
         self,
         *,
-        active: Optional[_ActiveFollow],
+        active: Optional[Any],
     ) -> str:
         safety = self._latest_safety
         if safety is None:
@@ -697,20 +916,33 @@ class EdgeBehaviorExecutor:
             self._last_action_datagrams = _action_datagrams(active.runner)
             self._active = None
         if emit_result:
-            self._emit(
-                active.event_sink,
-                "result",
-                session_id=active.session_id,
-                request_id=active.request_id,
-                trajectory_id=active.snapshot.trajectory_id,
-                outcome=outcome,
-                reason_code=reason_code,
-                message=message,
-                final_waypoint_index=active.final_waypoint_index,
-                final_distance_m=active.final_distance_m,
-                quiescence_confirmed=quiescent,
-                action_datagrams=_action_datagrams(active.runner),
-            )
+            fields = {
+                "session_id": active.session_id,
+                "request_id": active.request_id,
+                "outcome": outcome,
+                "reason_code": reason_code,
+                "message": message,
+                "quiescence_confirmed": quiescent,
+                "action_datagrams": _action_datagrams(active.runner),
+            }
+            if isinstance(active, _ActiveFollow):
+                fields.update(
+                    {
+                        "trajectory_id": active.snapshot.trajectory_id,
+                        "final_waypoint_index": active.final_waypoint_index,
+                        "final_distance_m": active.final_distance_m,
+                    }
+                )
+            else:
+                fields.update(
+                    {
+                        "behavior": active.behavior,
+                        "final_step_index": active.final_step_index,
+                        "final_step_label": active.final_step_label,
+                        "final_max_error": active.final_max_error,
+                    }
+                )
+            self._emit(active.event_sink, "result", **fields)
 
     def _reject(
         self,

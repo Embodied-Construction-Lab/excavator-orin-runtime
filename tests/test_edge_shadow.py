@@ -141,6 +141,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
                     "urdf_path": "waji.urdf",
                     "onnx_path": "policy.onnx",
                     "mission_path": "excavation_cycle.json",
+                    "fixed_action_profile_path": "fixed_actions.json",
                     "audit_path": "edge.jsonl",
                     "action_valid_for_ms": 300,
                     "remote_behavior": {
@@ -159,6 +160,10 @@ class EdgeShadowObserverTest(unittest.TestCase):
 
         self.assertEqual(config.mode, "remote_control")
         self.assertIsNone(config.trajectory_path)
+        self.assertEqual(
+            config.fixed_action_profile_path,
+            self.root / "fixed_actions.json",
+        )
         self.assertEqual(config.remote_behavior.bind_port, 18083)
         self.assertEqual(config.remote_behavior.status_hz, 5.0)
 

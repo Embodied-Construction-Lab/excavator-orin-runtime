@@ -37,6 +37,7 @@ class EdgeRuntimeConfig:
     onnx_path: Path
     trajectory_path: Optional[Path]
     mission_path: Path
+    fixed_action_profile_path: Optional[Path]
     audit_path: Path
     action_valid_for_ms: int
     remote_behavior: Optional[RemoteBehaviorConfig] = None
@@ -72,7 +73,7 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
             raise ValueError("edge shadow config fields are invalid")
         remote_behavior = None
     elif mode == "remote_control":
-        if set(value) != common | {"remote_behavior"}:
+        if set(value) != common | {"remote_behavior", "fixed_action_profile_path"}:
             raise ValueError("remote edge config fields are invalid")
         remote_behavior = _remote_behavior_config(value["remote_behavior"])
     else:
@@ -98,6 +99,11 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
             else None
         ),
         mission_path=_relative_path(root, value["mission_path"]),
+        fixed_action_profile_path=(
+            _relative_path(root, value["fixed_action_profile_path"])
+            if mode == "remote_control"
+            else None
+        ),
         audit_path=_relative_path(root, value["audit_path"]),
         action_valid_for_ms=action_valid_for_ms,
         remote_behavior=remote_behavior,

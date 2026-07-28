@@ -939,9 +939,13 @@ def main() -> None:
             allowed_action_host = "127.0.0.1"
         # Validate copied assets and load ONNX before taking serial ownership.
         if edge_config.mode == "remote_control":
+            from edge_runtime.fixed_actions import FixedActionRuntimeFactory
             from edge_runtime.remote import EdgeFollowRuntimeFactory
 
             remote_runtime_factory = EdgeFollowRuntimeFactory.from_config(
+                edge_config
+            )
+            fixed_action_runtime_factory = FixedActionRuntimeFactory.from_config(
                 edge_config
             )
         else:
@@ -1001,7 +1005,11 @@ def main() -> None:
                 args.action_bind_port,
             )
         else:
-            from edge_runtime.control import ActionSequence, EdgeControlRunner
+            from edge_runtime.control import (
+                ActionSequence,
+                EdgeControlRunner,
+                FixedActionControlRunner,
+            )
             from edge_runtime.remote import EdgeBehaviorExecutor, RemoteBehaviorServer
 
             edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1017,10 +1025,22 @@ def main() -> None:
                     action_sequence=edge_action_sequence,
                 )
 
+            def build_fixed_action_runner(runtime, behavior):
+                return FixedActionControlRunner(
+                    runtime=runtime,
+                    behavior=behavior,
+                    action_sink=edge_action_sender,
+                    audit_path=edge_config.audit_path,
+                    valid_for_ms=edge_config.action_valid_for_ms,
+                    action_sequence=edge_action_sequence,
+                )
+
             remote = edge_config.remote_behavior
             remote_executor = EdgeBehaviorExecutor(
                 runtime_factory=remote_runtime_factory,
                 runner_factory=build_remote_runner,
+                fixed_action_factory=fixed_action_runtime_factory,
+                fixed_runner_factory=build_fixed_action_runner,
                 sender_constructed=True,
                 state_timeout_s=remote.status_timeout_s,
             )

@@ -5,6 +5,7 @@
   "urdf_path": "assets/waji.urdf",
   "onnx_path": "assets/policy.onnx",
   "mission_path": "assets/excavation_cycle.json",
+  "fixed_action_profile_path": "assets/fixed_actions.json",
   "audit_path": "logs/edge_runtime.jsonl",
   "action_valid_for_ms": 300,
   "remote_behavior": {

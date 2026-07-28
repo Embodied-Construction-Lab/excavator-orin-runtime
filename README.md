@@ -99,10 +99,12 @@ cp AiryLidar/localmap/exports/live_latest/trajectory_command.simple_rrt.json \
   /tmp/excavator-edge-assets/trajectory_command.json
 cp AiryLidar/mission/config/excavation_cycle.json \
   /tmp/excavator-edge-assets/excavation_cycle.json
+cp AiryLidar/runtime_bridge/config/fixed_actions.json \
+  /tmp/excavator-edge-assets/fixed_actions.json
 sha256sum /tmp/excavator-edge-assets/*
 ```
 
-Copy those five files to `<ORIN_REPO>/deploy/assets/`, then on Orin:
+Copy those six files to `<ORIN_REPO>/deploy/assets/`, then on Orin:
 
 ```bash
 cd ~/excavator-orin-runtime
@@ -193,8 +195,9 @@ This static control mode remains available for the existing staged rollout.
 
 ## Remote edge Follow
 
-Remote Follow starts Idle and accepts immutable Trajectory Snapshots over a
-low-rate TCP behavior connection. It does not execute
+Remote behavior control starts Idle. It accepts immutable Follow Trajectory
+Snapshots and the named `ExecuteDig`/`ExecuteDump` fixed actions over a low-rate
+TCP behavior connection. It does not execute
 `deploy/assets/trajectory_command.json` at startup.
 
 Copy and edit the remote example, including the PC allowlisted address:
@@ -218,12 +221,18 @@ signs.
 
 Each TCP JSON message uses a four-byte big-endian payload length followed by
 UTF-8 JSON, with a maximum payload of 1 MiB and
-`schema_version="orin_behavior_rpc.v1"`. The server accepts only `start_follow`
-and `cancel_follow`; it emits `status`, `accepted`, `rejected`, `feedback` and
-`result`. It recomputes the canonical Trajectory Snapshot SHA-256 before
+`schema_version="orin_behavior_rpc.v1"`. The server accepts `start_follow`,
+`cancel_follow`, `start_fixed_action` and `cancel_fixed_action`; it emits
+`status`, `accepted`, `rejected`, `feedback` and `result`. It recomputes the
+canonical Trajectory Snapshot SHA-256 before
 acceptance. Snapshot waypoint limits must match the preloaded Mission, while
 `target_threshold` and `tube_radius` come only from the preloaded machine
 profile.
+
+The fixed-action asset is loaded once before the serial port is opened. Its
+machine-profile and URDF SHA-256 bindings must match the deployed assets.
+Fixed-action feedback is closed locally from the same high-rate Machine State
+stream; PC sends only the behavior name and never streams actuator velocity.
 
 The server sends status immediately on each allowed TCP connection and then at
 the configured rate, including while Idle. A client disconnect, cancellation,

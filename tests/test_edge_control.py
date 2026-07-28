@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import orin_state_sender
 
 from edge_runtime import control
-from edge_runtime.control import EdgeControlRunner
+from edge_runtime.control import EdgeControlRunner, FixedActionControlRunner
 from edge_runtime.follow import EdgeFollowStep
 
 
@@ -125,6 +125,70 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertEqual(
             [packet["seq"] for packet in sink.payloads],
             [0, 1, 2, 3],
+        )
+
+    def test_fixed_action_runner_uses_shared_sequence_and_terminal_zero(self):
+        class FixedRuntime:
+            def __init__(self):
+                self.calls = 0
+
+            def step(self, machine_state, *, now_s):
+                self.calls += 1
+                return SimpleNamespace(
+                    phase="running" if self.calls == 1 else "done",
+                    step_index=0,
+                    step_label="open_bucket",
+                    max_error=0.5 if self.calls == 1 else 0.0,
+                    normalized_action=(
+                        (0.0, 0.0, 0.6, 0.0)
+                        if self.calls == 1
+                        else (0.0, 0.0, 0.0, 0.0)
+                    ),
+                    physical_action=(
+                        (0.0, 0.0, 0.02, 0.0)
+                        if self.calls == 1
+                        else (0.0, 0.0, 0.0, 0.0)
+                    ),
+                    result="ACTIVE" if self.calls == 1 else "COMPLETED",
+                    reason_code="" if self.calls == 1 else "SEQUENCE_COMPLETED",
+                )
+
+        sink = RecordingSink()
+        sequence = control.ActionSequence(start=20)
+        runner = FixedActionControlRunner(
+            runtime=FixedRuntime(),
+            behavior="ExecuteDump",
+            action_sink=sink,
+            audit_path=self.audit_path,
+            valid_for_ms=300,
+            action_sequence=sequence,
+        )
+
+        active = runner.observe(
+            {"seq": 1, "stamp_ms": 1000},
+            now_s=1.0,
+            action_stamp_ms=2000,
+        )
+        completed = runner.observe(
+            {"seq": 2, "stamp_ms": 1100},
+            now_s=1.1,
+            action_stamp_ms=2100,
+        )
+        runner.close(action_stamp_ms=2200)
+
+        self.assertEqual(active.result, "ACTIVE")
+        self.assertEqual(completed.result, "COMPLETED")
+        self.assertEqual(
+            [packet["seq"] for packet in sink.payloads],
+            [20, 21, 22],
+        )
+        self.assertEqual(
+            [packet["action"] for packet in sink.payloads],
+            [
+                [0.0, 0.0, 0.02, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
         )
 
     def test_completed_trajectory_sends_zero_instead_of_last_policy_action(self):

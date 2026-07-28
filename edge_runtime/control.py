@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol
 
 from .follow import EdgeFollowRuntime, EdgeFollowStep
+from .fixed_actions import FixedActionRuntime, FixedActionRuntimeStep
 
 
 LOGGER = logging.getLogger("orin_edge_control")
@@ -165,6 +166,127 @@ class EdgeControlRunner:
         }
         payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
         self._action_sink.send(payload)
+        self._action_datagrams += 1
+
+    def _append(self, record: Mapping[str, Any]) -> None:
+        self._audit_handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+class FixedActionControlRunner:
+    """Send one Orin-local fixed-action control step through the Action Relay."""
+
+    def __init__(
+        self,
+        *,
+        runtime: FixedActionRuntime,
+        behavior: str,
+        action_sink: ActionSink,
+        audit_path: Path,
+        valid_for_ms: int,
+        action_sequence: Optional[ActionSequence] = None,
+    ) -> None:
+        if behavior not in {"ExecuteDig", "ExecuteDump"}:
+            raise ValueError("fixed action behavior is invalid")
+        if valid_for_ms <= 0:
+            raise ValueError("edge action valid_for_ms must be positive")
+        self._runtime = runtime
+        self._behavior = behavior
+        self._action_sink = action_sink
+        self._audit_path = Path(audit_path)
+        self._audit_path.parent.mkdir(parents=True, exist_ok=True)
+        self._audit_handle = self._audit_path.open(
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
+        self._valid_for_ms = int(valid_for_ms)
+        self._action_sequence = action_sequence or ActionSequence()
+        self._action_datagrams = 0
+        self._closed = False
+
+    @property
+    def action_datagrams(self) -> int:
+        return self._action_datagrams
+
+    def observe(
+        self,
+        machine_state: Mapping[str, Any],
+        *,
+        now_s: float,
+        action_stamp_ms: int,
+    ) -> Optional[FixedActionRuntimeStep]:
+        started = time.perf_counter()
+        try:
+            step = self._runtime.step(machine_state, now_s=now_s)
+        except Exception as exc:
+            self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+            self._append(
+                {
+                    "schema_version": "orin_fixed_action_control_audit.v1",
+                    "mode": "control",
+                    "behavior": self._behavior,
+                    "status": "rejected",
+                    "source_seq": machine_state.get("seq"),
+                    "source_stamp_ms": machine_state.get("stamp_ms"),
+                    "reason": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "runtime_monotonic_s": float(now_s),
+                    "loop_elapsed_ms": (time.perf_counter() - started) * 1000.0,
+                }
+            )
+            LOGGER.warning(
+                "%s rejected state seq=%s: %s",
+                self._behavior,
+                machine_state.get("seq"),
+                exc,
+            )
+            return None
+        action = step.physical_action if step.result == "ACTIVE" else (0.0, 0.0, 0.0, 0.0)
+        self._send(action, action_stamp_ms)
+        self._append(
+            {
+                "schema_version": "orin_fixed_action_control_audit.v1",
+                "mode": "control",
+                "behavior": self._behavior,
+                "status": step.result,
+                "reason_code": step.reason_code,
+                "source_seq": machine_state.get("seq"),
+                "source_stamp_ms": machine_state.get("stamp_ms"),
+                "step_index": step.step_index,
+                "step_label": step.step_label,
+                "phase": step.phase,
+                "max_error": step.max_error,
+                "normalized_action": list(step.normalized_action),
+                "physical_action": list(action),
+                "runtime_monotonic_s": float(now_s),
+                "loop_elapsed_ms": (time.perf_counter() - started) * 1000.0,
+            }
+        )
+        return step
+
+    def close(self, *, action_stamp_ms: int) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+        finally:
+            self._audit_handle.close()
+
+    def _send(self, action: tuple, action_stamp_ms: int) -> None:
+        packet = {
+            "type": "policy_action",
+            "schema_version": "1.0",
+            "seq": self._action_sequence.next(),
+            "stamp_ms": int(action_stamp_ms),
+            "action_order": ["boom", "stick", "bucket", "swing"],
+            "action": [float(value) for value in action],
+            "action_type": "normalized_velocity_command",
+            "valid_for_ms": self._valid_for_ms,
+        }
+        self._action_sink.send(
+            json.dumps(packet, separators=(",", ":")).encode("utf-8")
+        )
         self._action_datagrams += 1
 
     def _append(self, record: Mapping[str, Any]) -> None:

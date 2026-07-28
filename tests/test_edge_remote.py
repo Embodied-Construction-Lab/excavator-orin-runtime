@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
 from edge_runtime.follow import EdgeFollowStep
 from edge_runtime.remote_transport import ConnectionEventStream
@@ -286,6 +287,22 @@ def start_request(session_id="session-1", request_id="start-1", seq=0):
     }
 
 
+def fixed_action_request(
+    behavior="ExecuteDump",
+    session_id="fixed-session-1",
+    request_id="fixed-start-1",
+    seq=0,
+):
+    return {
+        "schema_version": "orin_behavior_rpc.v1",
+        "type": "start_fixed_action",
+        "session_id": session_id,
+        "seq": seq,
+        "request_id": request_id,
+        "behavior": behavior,
+    }
+
+
 def follow_step(*, result="ACTIVE"):
     return EdgeFollowStep(
         source_seq=4,
@@ -530,6 +547,82 @@ class EdgeBehaviorExecutorTest(unittest.TestCase):
         self.assertEqual(call_order[-2:], ["close", "result"])
         self.assertEqual(events[-1]["outcome"], "CANCELLED")
         self.assertTrue(events[-1]["quiescence_confirmed"])
+
+    def test_fixed_action_feedback_completion_and_mutual_exclusion_use_same_executor(self):
+        created = []
+        closed = []
+
+        class FixedFactory:
+            profile = SimpleNamespace(validation_status="candidate")
+
+            def create(self, behavior):
+                created.append(behavior)
+                return object()
+
+        class FixedRunner:
+            action_datagrams = 2
+
+            def __init__(self):
+                self.steps = [
+                    SimpleNamespace(
+                        phase="running",
+                        step_index=0,
+                        step_label="open_bucket",
+                        max_error=0.4,
+                        result="ACTIVE",
+                        reason_code="",
+                    ),
+                    SimpleNamespace(
+                        phase="done",
+                        step_index=1,
+                        step_label="recover_bucket",
+                        max_error=0.0,
+                        result="COMPLETED",
+                        reason_code="SEQUENCE_COMPLETED",
+                    ),
+                ]
+
+            def observe(self, state, *, now_s, action_stamp_ms):
+                return self.steps.pop(0)
+
+            def close(self, *, action_stamp_ms):
+                closed.append(action_stamp_ms)
+
+        events = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=object(),
+            runner_factory=lambda runtime: object(),
+            fixed_action_factory=FixedFactory(),
+            fixed_runner_factory=lambda runtime, behavior: FixedRunner(),
+            monotonic_clock=lambda: 7.0,
+            action_stamp_clock=lambda: 101000,
+            sender_constructed=True,
+        )
+        executor.observe(safe_machine_state())
+
+        executor.handle(fixed_action_request(), events.append)
+        active_status = executor.status_event()
+        executor.handle(
+            start_request(session_id="follow-session", request_id="follow-start"),
+            events.append,
+        )
+        executor.observe(safe_machine_state(seq=2))
+        executor.observe(safe_machine_state(seq=3))
+
+        self.assertEqual(created, ["ExecuteDump"])
+        self.assertEqual(active_status["active_behavior"], "ExecuteDump")
+        self.assertTrue(active_status["fixed_actions_available"])
+        self.assertFalse(active_status["fixed_actions_validated"])
+        self.assertEqual(events[0]["type"], "accepted")
+        self.assertEqual(events[0]["behavior"], "ExecuteDump")
+        self.assertEqual(events[1]["reason_code"], "BUSY")
+        self.assertEqual(events[2]["type"], "feedback")
+        self.assertEqual(events[2]["step_label"], "open_bucket")
+        self.assertEqual(events[3]["type"], "result")
+        self.assertEqual(events[3]["outcome"], "SUCCEEDED")
+        self.assertEqual(events[3]["reason_code"], "SEQUENCE_COMPLETED")
+        self.assertTrue(events[3]["quiescence_confirmed"])
+        self.assertEqual(closed, [101000])
 
 
 class RemoteBehaviorServerTest(unittest.TestCase):
