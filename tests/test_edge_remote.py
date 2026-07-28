@@ -694,6 +694,43 @@ class EdgeBehaviorExecutorTest(unittest.TestCase):
         self.assertTrue(events[3]["quiescence_confirmed"])
         self.assertEqual(closed, [101000])
 
+    def test_fixed_action_watchdog_before_first_observation_reports_not_started(self):
+        now = [1.0]
+
+        class FixedFactory:
+            profile = SimpleNamespace(validation_status="candidate")
+
+            def create(self, behavior):
+                return object()
+
+        class FixedRunner:
+            action_datagrams = 0
+
+            def close(self, *, action_stamp_ms):
+                return None
+
+        events = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=object(),
+            runner_factory=lambda runtime: object(),
+            fixed_action_factory=FixedFactory(),
+            fixed_runner_factory=lambda runtime, behavior: FixedRunner(),
+            monotonic_clock=lambda: now[0],
+            action_stamp_clock=lambda: 101000,
+            sender_constructed=True,
+            state_timeout_s=0.3,
+        )
+        executor.observe(safe_machine_state())
+        executor.handle(fixed_action_request(), events.append)
+        now[0] = 2.0
+
+        executor.watchdog()
+
+        self.assertEqual(events[-1]["type"], "result")
+        self.assertEqual(events[-1]["outcome"], "FAILED")
+        self.assertEqual(events[-1]["reason_code"], "MOTION_GATE_CLOSED")
+        self.assertEqual(events[-1]["final_step_label"], "not_started")
+
 
 class RemoteBehaviorServerTest(unittest.TestCase):
     def test_fragmented_start_and_cancel_before_observe_return_finite_result(self):

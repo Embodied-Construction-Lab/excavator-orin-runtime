@@ -29,6 +29,8 @@ def machine_profile():
             "bucket": dict(actuator),
             "swing": {
                 **actuator,
+                "range": [None, None],
+                "range_enabled_required": False,
                 "max_speed_positive": 0.6,
                 "max_speed_negative": 0.6,
             },
@@ -165,14 +167,20 @@ def absolute_dig_profile():
     )
 
 
-def state(*, boom_position=0.5, stick_position=0.5, bucket_position=0.5):
+def state(
+    *,
+    boom_position=0.5,
+    stick_position=0.5,
+    bucket_position=0.5,
+    swing_position=0.0,
+):
     return {
         "seq": 1,
         "actuator_state": {
             "boom": {"position_m": boom_position},
             "stick": {"position_m": stick_position},
             "bucket": {"position_m": bucket_position},
-            "swing": {"position_rad": 0.0},
+            "swing": {"position_rad": swing_position},
         },
     }
 
@@ -286,6 +294,21 @@ class FixedActionRuntimeTest(unittest.TestCase):
         completed = runtime.step(state(bucket_position=0.5), now_s=0.6)
         self.assertEqual(completed.result, "COMPLETED")
         self.assertEqual(completed.physical_action, (0.0, 0.0, 0.0, 0.0))
+
+    def test_dump_start_ignores_envelope_for_continuous_swing(self):
+        runtime = FixedActionRuntime(
+            profile=profile(),
+            machine_profile=machine_profile(),
+            phase="dump",
+        )
+
+        opening = runtime.step(
+            state(bucket_position=0.5, swing_position=2.4),
+            now_s=0.0,
+        )
+
+        self.assertEqual(opening.result, "ACTIVE")
+        self.assertEqual(opening.step_label, "open")
 
     def test_step_timeout_is_terminal_and_zero(self):
         runtime = FixedActionRuntime(

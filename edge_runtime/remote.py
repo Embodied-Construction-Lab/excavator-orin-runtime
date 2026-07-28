@@ -333,7 +333,7 @@ class _ActiveFixedAction:
     runner: Any
     event_sink: Callable[[Mapping[str, Any]], None]
     final_step_index: int = 0
-    final_step_label: str = ""
+    final_step_label: str = "not_started"
     final_max_error: float = 0.0
 
 

@@ -280,7 +280,10 @@ class FixedActionRuntime:
             _mapping("actuator_state", machine_state.get("actuator_state")).get("swing"),
         )
         swing = _finite("swing.position_rad", swing_state.get("position_rad"))
-        if not envelope.swing_rad[0] <= swing <= envelope.swing_rad[1]:
+        if _position_range_is_bounded(
+            self._machine_profile,
+            "swing",
+        ) and not envelope.swing_rad[0] <= swing <= envelope.swing_rad[1]:
             raise ValueError("swing outside fixed action start envelope")
 
     def _servo_axis(self, error: float) -> float:
@@ -496,6 +499,32 @@ def _finite(name: str, value: Any) -> float:
     if not math.isfinite(converted):
         raise ValueError("%s must be finite" % name)
     return converted
+
+
+def _position_range_is_bounded(
+    machine_profile: Mapping[str, Any],
+    actuator: str,
+) -> bool:
+    actuator_profile = _mapping(
+        "%s actuator profile" % actuator,
+        _mapping("machine profile actuators", machine_profile.get("actuators")).get(
+            actuator
+        ),
+    )
+    required = actuator_profile.get("range_enabled_required")
+    if isinstance(required, bool):
+        return required
+    configured_range = actuator_profile.get("range")
+    return (
+        isinstance(configured_range, (list, tuple))
+        and len(configured_range) == 2
+        and all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            for value in configured_range
+        )
+    )
 
 
 def _range(
