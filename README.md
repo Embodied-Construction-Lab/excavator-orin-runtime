@@ -147,7 +147,7 @@ python3 orin_state_sender.py \
 
 Shadow mode still publishes Machine State to the PC, but the edge runtime has no
 action sink. It records each local Bucket Tip, 38D observation, normalized ONNX
-action, physical action and inference time:
+action, slew-limited normalized command, physical action and inference time:
 
 ```bash
 tail -n 3 deploy/logs/edge_runtime.jsonl | python3 -m json.tool --json-lines
@@ -191,6 +191,15 @@ longer crosses the PC network. The PC link carries monitoring and future
 low-rate trajectory/mission updates only. Ctrl+C, invalid sensor state, action
 lease expiry, trajectory completion and shutdown all produce a zero command.
 
+`follow_action_slew_rate_per_s` limits only how quickly the command sent to the
+actuator can approach a new ONNX target. It does not scale, negate or clip the
+steady-state ONNX target. With the deployed value `2.0`, a 10 Hz state stream
+allows at most about `0.2` normalized command change per update. Direction
+reversals therefore pass through zero instead of jumping directly from `+1` to
+`-1`. The first Follow sample is zero so a new behavior ramps from rest.
+Terminal, cancellation, rejected-state and shutdown zeros bypass the limiter
+and remain immediate.
+
 This static control mode remains available for the existing staged rollout.
 
 ## Remote edge Follow
@@ -220,7 +229,9 @@ python3 orin_state_sender.py \
 Motion remains gated by both `--control-enabled` and the exact authorization
 token. In `remote_control`, the Action Relay bind and allowlist are forcibly
 set to `127.0.0.1`; behavior RPC never writes serial, scales actions or changes
-signs.
+signs. Follow command slew limiting is an explicit Orin execution-runtime stage
+after ONNX inference; the audit keeps both `normalized_action` (raw ONNX output)
+and `commanded_normalized_action` (the value converted to physical velocity).
 
 Each TCP JSON message uses a four-byte big-endian payload length followed by
 UTF-8 JSON, with a maximum payload of 1 MiB and

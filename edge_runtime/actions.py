@@ -9,6 +9,37 @@ from typing import Any, Mapping, Sequence, Tuple
 ACTION_ORDER = ("boom", "stick", "bucket", "swing")
 
 
+def slew_limited_normalized_action(
+    target: Sequence[float],
+    previous: Sequence[float],
+    *,
+    elapsed_s: float,
+    max_rate_per_s: float,
+) -> Tuple[float, float, float, float]:
+    """Approach a normalized policy target without an instantaneous reversal."""
+    if len(target) != 4 or len(previous) != 4:
+        raise ValueError("slew-limited actions must contain four values")
+    elapsed = float(elapsed_s)
+    rate = float(max_rate_per_s)
+    if not math.isfinite(elapsed) or elapsed < 0.0:
+        raise ValueError("elapsed_s must be finite and nonnegative")
+    if not math.isfinite(rate) or rate <= 0.0:
+        raise ValueError("max_rate_per_s must be finite and positive")
+    target_values = tuple(float(value) for value in target)
+    previous_values = tuple(float(value) for value in previous)
+    if not all(
+        math.isfinite(value) for value in target_values + previous_values
+    ):
+        raise ValueError("slew-limited actions must be finite")
+    max_delta = rate * elapsed
+    result = tuple(
+        current
+        + max(-max_delta, min(max_delta, desired - current))
+        for desired, current in zip(target_values, previous_values)
+    )
+    return result  # type: ignore[return-value]
+
+
 def physical_velocity_from_normalized(
     action: Sequence[float],
     machine_profile: Mapping[str, Any],

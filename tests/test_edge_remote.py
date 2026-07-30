@@ -258,6 +258,7 @@ class EdgeFollowRuntimeFactoryTest(unittest.TestCase):
             mission=mission,
             mission_sha256="a" * 64,
             runtime_type=RecordingRuntime,
+            action_slew_rate_per_s=2.0,
         )
         snapshot = FollowTrajectorySnapshot.from_mapping(
             trajectory_snapshot(),
@@ -272,6 +273,7 @@ class EdgeFollowRuntimeFactoryTest(unittest.TestCase):
         self.assertIs(calls[0]["machine_profile"], profile)
         self.assertEqual(calls[0]["trajectory"]["target_threshold"], 0.03)
         self.assertEqual(calls[0]["trajectory"]["tube_radius"], 0.04)
+        self.assertEqual(calls[0]["action_slew_rate_per_s"], 2.0)
         self.assertNotIn("target_threshold", trajectory_snapshot())
         self.assertNotIn("tube_radius", trajectory_snapshot())
 

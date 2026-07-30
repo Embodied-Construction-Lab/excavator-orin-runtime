@@ -140,6 +140,13 @@ class EdgeControlRunner:
                 "loop_elapsed_ms": loop_elapsed_ms,
                 "bucket_tip_ros_m": list(step.bucket_tip_ros_m),
                 "normalized_action": list(step.normalized_action),
+                "commanded_normalized_action": list(
+                    getattr(
+                        step,
+                        "commanded_normalized_action",
+                        step.normalized_action,
+                    )
+                ),
                 "physical_action": list(action),
             }
         )
