@@ -72,7 +72,7 @@ The default action source is `--pc-host`:
 ```bash
 python3 orin_state_sender.py \
   --control-enabled \
-  --pc-host 192.168.2.127 \
+  --pc-host 192.168.0.220 \
   --print-every 100
 ```
 
