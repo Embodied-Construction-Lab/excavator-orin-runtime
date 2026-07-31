@@ -84,6 +84,40 @@ class FramedJsonProtocolTest(unittest.TestCase):
 
 
 class ConnectionEventStreamTest(unittest.TestCase):
+    def test_writer_failure_logs_connection_and_last_event_context(self):
+        class FailingSocket:
+            def __init__(self):
+                self.shutdown_called = threading.Event()
+
+            def sendall(self, _payload):
+                raise OSError("simulated-link-loss")
+
+            def shutdown(self, _how):
+                self.shutdown_called.set()
+
+        connection = FailingSocket()
+        with self.assertLogs("orin_edge_remote", level="ERROR") as captured:
+            stream = ConnectionEventStream(
+                connection,
+                connection_id="rpc-test-001",
+            )
+            stream.start()
+            stream.emit(
+                {
+                    "schema_version": "orin_behavior_rpc.v1",
+                    "type": "feedback",
+                }
+            )
+            self.assertTrue(connection.shutdown_called.wait(0.5))
+            stream.close()
+
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("connection_id=rpc-test-001", diagnostic)
+        self.assertIn("reason=send_error", diagnostic)
+        self.assertIn("event_type=feedback", diagnostic)
+        self.assertIn("event_seq=0", diagnostic)
+        self.assertIn("simulated-link-loss", diagnostic)
+
     def test_slow_network_writer_does_not_block_control_thread_emit(self):
         class SlowSocket:
             def __init__(self):
@@ -735,6 +769,85 @@ class EdgeBehaviorExecutorTest(unittest.TestCase):
 
 
 class RemoteBehaviorServerTest(unittest.TestCase):
+    def test_connection_lifecycle_logs_peer_and_event_summary(self):
+        class Executor:
+            def status_event(self):
+                return {
+                    "schema_version": "orin_behavior_rpc.v1",
+                    "type": "status",
+                }
+
+            def watchdog(self):
+                return None
+
+            def handle(self, _request, _emit):
+                return None
+
+            def disconnect(self, _emit):
+                return None
+
+            def close(self, *, emit_result=False):
+                return None
+
+        server = RemoteBehaviorServer(
+            bind_host="127.0.0.1",
+            bind_port=0,
+            allowed_client_host="127.0.0.1",
+            executor=Executor(),
+            status_interval_s=0.01,
+        )
+        client, server_side = socket.socketpair()
+        client.settimeout(0.5)
+        with self.assertLogs("orin_edge_remote", level="INFO") as captured:
+            thread = threading.Thread(
+                target=server.serve_connection,
+                args=(server_side,),
+                kwargs={
+                    "connection_id": "rpc-test-002",
+                    "peer": "127.0.0.1:43210",
+                },
+            )
+            thread.start()
+            try:
+                self.assertEqual(receive_message(client)["type"], "status")
+                send_message(
+                    client,
+                    {
+                        "schema_version": "orin_behavior_rpc.v1",
+                        "type": "diagnostic_probe",
+                        "session_id": "session-test-002",
+                        "seq": 7,
+                        "request_id": "request-test-002",
+                    },
+                )
+            finally:
+                client.close()
+                thread.join(timeout=1.0)
+                server_side.close()
+
+        self.assertFalse(thread.is_alive())
+        diagnostic = "\n".join(captured.output)
+        self.assertIn(
+            "opened: connection_id=rpc-test-002 peer=127.0.0.1:43210",
+            diagnostic,
+        )
+        self.assertIn(
+            "closed: connection_id=rpc-test-002 peer=127.0.0.1:43210",
+            diagnostic,
+        )
+        self.assertIn("reason=peer_eof", diagnostic)
+        self.assertIn("events_sent=1", diagnostic)
+        self.assertIn("last_event_type=status", diagnostic)
+        self.assertIn("last_event_seq=0", diagnostic)
+        self.assertIn(
+            "request received: connection_id=rpc-test-002",
+            diagnostic,
+        )
+        self.assertIn("type=diagnostic_probe", diagnostic)
+        self.assertIn("session_id=session-test-002", diagnostic)
+        self.assertIn("request_id=request-test-002", diagnostic)
+        self.assertIn("request_seq=7", diagnostic)
+
     def test_fragmented_start_and_cancel_before_observe_return_finite_result(self):
         class Factory:
             def create(self, snapshot):
