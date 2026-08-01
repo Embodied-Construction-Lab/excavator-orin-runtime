@@ -235,8 +235,10 @@ and `commanded_normalized_action` (the value converted to physical velocity).
 
 Each TCP JSON message uses a four-byte big-endian payload length followed by
 UTF-8 JSON, with a maximum payload of 1 MiB and
-`schema_version="orin_behavior_rpc.v1"`. The server accepts `start_follow`,
-`cancel_follow`, `start_fixed_action` and `cancel_fixed_action`; it emits
+`schema_version="orin_behavior_rpc.v1"`. The server accepts the commissioning
+requests `start_follow`, `cancel_follow`, `start_fixed_action` and
+`cancel_fixed_action`. The Mission path uses `start_cycle`,
+`provide_dump_trajectory` and `cancel_cycle`; it emits
 `status`, `accepted`, `rejected`, `feedback` and `result`. It recomputes the
 canonical Trajectory Snapshot SHA-256 before
 acceptance. For remote Follow, the accepted snapshot is authoritative for the
@@ -245,6 +247,14 @@ PC-planned multi-point demonstrations without copying each dynamic Mission to
 Orin. The preloaded Mission still establishes the deployment frame, while
 `target_threshold` and `tube_radius` come only from the preloaded machine
 profile.
+
+`start_cycle` makes Orin execute `FollowDig → ExecuteDig` locally and return
+`DIG_LEG_COMPLETED` only after terminal zero is confirmed. The PC then replans
+from the new state and sends `provide_dump_trajectory`; Orin executes
+`FollowDump → ExecuteDump` locally and returns `SEQUENCE_COMPLETED`. This keeps
+environment-dependent planning on PC while removing the network round trip
+between Follow and its fixed action. An active-leg connection loss remains
+fail-closed and stops that local behavior.
 
 The fixed-action asset is loaded once before the serial port is opened. Its
 machine-profile and URDF SHA-256 bindings must match the deployed assets.

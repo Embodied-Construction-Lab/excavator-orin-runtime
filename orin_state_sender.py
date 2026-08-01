@@ -1010,6 +1010,7 @@ def main() -> None:
                 EdgeControlRunner,
                 FixedActionControlRunner,
             )
+            from edge_runtime.cycle import EdgeCycleCoordinator
             from edge_runtime.remote import EdgeBehaviorExecutor, RemoteBehaviorServer
 
             edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1036,7 +1037,7 @@ def main() -> None:
                 )
 
             remote = edge_config.remote_behavior
-            remote_executor = EdgeBehaviorExecutor(
+            behavior_executor = EdgeBehaviorExecutor(
                 runtime_factory=remote_runtime_factory,
                 runner_factory=build_remote_runner,
                 fixed_action_factory=fixed_action_runtime_factory,
@@ -1044,6 +1045,7 @@ def main() -> None:
                 sender_constructed=True,
                 state_timeout_s=remote.status_timeout_s,
             )
+            remote_executor = EdgeCycleCoordinator(behavior_executor)
             remote_server = RemoteBehaviorServer(
                 bind_host=remote.bind_host,
                 bind_port=remote.bind_port,
