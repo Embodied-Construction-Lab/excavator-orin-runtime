@@ -358,6 +358,17 @@ def format_float(value: float) -> str:
     return f"{value:.9g}"
 
 
+def format_policy_action_tx_log(sequence: object, command: DataCommand) -> str:
+    command_time_ms = int(round(command.t_s * 1000.0))
+    return (
+        f"STM32 TX policy_action seq={sequence} t_ms:{command_time_ms} "
+        f"boom:{format_float(command.boom_v_ref_mps)}m/s "
+        f"stick:{format_float(command.stick_v_ref_mps)}m/s "
+        f"bucket:{format_float(command.bucket_v_ref_mps)}m/s "
+        f"swing:{format_float(command.swing_v_ref_radps)}rad/s"
+    )
+
+
 def encode_data_command(command: DataCommand) -> bytes:
     t_ms = int(round(command.t_s * 1000.0))
     fields = (
@@ -529,11 +540,7 @@ def handle_policy_action_payload(
         )
     else:
         seq = packet.get("seq") if isinstance(packet, dict) else None
-        LOGGER.info(
-            "STM32 TX policy_action seq=%s: %s",
-            seq,
-            encoded.decode("ascii").strip(),
-        )
+        LOGGER.info("%s", format_policy_action_tx_log(seq, command))
 
     return True
 
@@ -753,11 +760,7 @@ class ActionRelay:
             if any(float(value) != 0.0 for value in action)
             else None
         )
-        LOGGER.info(
-            "STM32 TX policy_action seq=%s: %s",
-            sequence,
-            encoded.decode("ascii").strip(),
-        )
+        LOGGER.info("%s", format_policy_action_tx_log(sequence, command))
 
     def _active_command_must_stop(self) -> bool:
         if self._active_deadline_monotonic_s is None:

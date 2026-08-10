@@ -48,6 +48,39 @@ Historical joystick and `[swing, boom, stick, bucket]` rollout tools are intenti
 The old workspace-root `urdf/` project is also excluded. The deployed URDF is
 copied from `AiryLidar/kinematics/waji_description/urdf/waji.urdf`.
 
+## Current field RL Follow command
+
+The current field setup uses PC `192.168.0.220`, Orin `192.168.0.55`, STM32
+serial `/dev/ttyTHS1` and behavior RPC TCP `18083`. After STM32 Homing, start
+the Orin side first:
+
+```bash
+cd ~/workspace_/excavator-orin-runtime
+conda activate excavator-orin
+
+mkdir -p deploy/logs
+test -f deploy/edge_runtime.remote.json || \
+  cp deploy/edge_runtime.remote.example.json deploy/edge_runtime.remote.json
+python -m json.tool deploy/edge_runtime.remote.json >/dev/null
+
+run_tag=$(date +%Y%m%d_%H%M%S)
+
+python orin_state_sender.py \
+  --serial-port /dev/ttyTHS1 \
+  --control-enabled \
+  --pc-host 192.168.0.220 \
+  --edge-config deploy/edge_runtime.remote.json \
+  --edge-motion-authorization ALLOW_EDGE_MACHINE_MOTION \
+  --print-every 100 \
+  2>&1 | tee "deploy/logs/rl_follow_${run_tag}_stdout.log"
+```
+
+`deploy/edge_runtime.remote.json` must use `mode=remote_control`, behavior port
+`18083`, and `allowed_client_host=192.168.0.220`. Expected startup output includes
+`REMOTE EDGE CONTROL ARMED IDLE`. The complete PC command, preflight checks and
+RViz button order are maintained in the `AiryLidar/README.md` section
+“强化学习 Orin + PC 真机测试速查”.
+
 ## Installation on Orin
 
 ```bash
