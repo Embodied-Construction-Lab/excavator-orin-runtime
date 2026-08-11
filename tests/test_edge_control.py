@@ -32,6 +32,7 @@ class StubRuntime:
             observation=tuple(0.0 for _ in range(38)),
             normalized_action=(0.1, -0.2, 0.3, -0.4),
             physical_action=(0.01, -0.02, 0.03, -0.04),
+            commanded_normalized_action=(0.08, -0.16, 0.24, -0.32),
         )
 
 
@@ -88,6 +89,11 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertEqual(packet["stamp_ms"], 5000)
         self.assertEqual(packet["valid_for_ms"], 300)
         self.assertEqual(runner.action_datagrams, 1)
+        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["commanded_normalized_action"],
+            [0.08, -0.16, 0.24, -0.32],
+        )
         runner.close(action_stamp_ms=5001)
         self.assertEqual(runner.action_datagrams, 2)
 

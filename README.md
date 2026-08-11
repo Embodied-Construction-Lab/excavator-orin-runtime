@@ -48,6 +48,39 @@ Historical joystick and `[swing, boom, stick, bucket]` rollout tools are intenti
 The old workspace-root `urdf/` project is also excluded. The deployed URDF is
 copied from `AiryLidar/kinematics/waji_description/urdf/waji.urdf`.
 
+## Current field RL Follow command
+
+The current field setup uses PC `192.168.0.220`, Orin `192.168.0.55`, STM32
+serial `/dev/ttyTHS1` and behavior RPC TCP `18083`. After STM32 Homing, start
+the Orin side first:
+
+```bash
+cd ~/workspace_/excavator-orin-runtime
+conda activate excavator-orin
+
+mkdir -p deploy/logs
+test -f deploy/edge_runtime.remote.json || \
+  cp deploy/edge_runtime.remote.example.json deploy/edge_runtime.remote.json
+python -m json.tool deploy/edge_runtime.remote.json >/dev/null
+
+run_tag=$(date +%Y%m%d_%H%M%S)
+
+python orin_state_sender.py \
+  --serial-port /dev/ttyTHS1 \
+  --control-enabled \
+  --pc-host 192.168.0.220 \
+  --edge-config deploy/edge_runtime.remote.json \
+  --edge-motion-authorization ALLOW_EDGE_MACHINE_MOTION \
+  --print-every 100 \
+  2>&1 | tee "deploy/logs/rl_follow_${run_tag}_stdout.log"
+```
+
+`deploy/edge_runtime.remote.json` must use `mode=remote_control`, behavior port
+`18083`, and `allowed_client_host=192.168.0.220`. Expected startup output includes
+`REMOTE EDGE CONTROL ARMED IDLE`. The complete PC command, preflight checks and
+RViz button order are maintained in the `AiryLidar/README.md` section
+“强化学习 Orin + PC 真机测试速查”.
+
 ## Installation on Orin
 
 ```bash
@@ -72,7 +105,7 @@ The default action source is `--pc-host`:
 ```bash
 python3 orin_state_sender.py \
   --control-enabled \
-  --pc-host 192.168.2.127 \
+  --pc-host 192.168.0.220 \
   --print-every 100
 ```
 
@@ -147,7 +180,7 @@ python3 orin_state_sender.py \
 
 Shadow mode still publishes Machine State to the PC, but the edge runtime has no
 action sink. It records each local Bucket Tip, 38D observation, normalized ONNX
-action, physical action and inference time:
+action, slew-limited normalized command, physical action and inference time:
 
 ```bash
 tail -n 3 deploy/logs/edge_runtime.jsonl | python3 -m json.tool --json-lines
@@ -191,6 +224,15 @@ longer crosses the PC network. The PC link carries monitoring and future
 low-rate trajectory/mission updates only. Ctrl+C, invalid sensor state, action
 lease expiry, trajectory completion and shutdown all produce a zero command.
 
+`follow_action_slew_rate_per_s` limits only how quickly the command sent to the
+actuator can approach a new ONNX target. It does not scale, negate or clip the
+steady-state ONNX target. With the deployed value `2.0`, a 10 Hz state stream
+allows at most about `0.2` normalized command change per update. Direction
+reversals therefore pass through zero instead of jumping directly from `+1` to
+`-1`. The first Follow sample is zero so a new behavior ramps from rest.
+Terminal, cancellation, rejected-state and shutdown zeros bypass the limiter
+and remain immediate.
+
 This static control mode remains available for the existing staged rollout.
 
 ## Remote edge Follow
@@ -220,12 +262,16 @@ python3 orin_state_sender.py \
 Motion remains gated by both `--control-enabled` and the exact authorization
 token. In `remote_control`, the Action Relay bind and allowlist are forcibly
 set to `127.0.0.1`; behavior RPC never writes serial, scales actions or changes
-signs.
+signs. Follow command slew limiting is an explicit Orin execution-runtime stage
+after ONNX inference; the audit keeps both `normalized_action` (raw ONNX output)
+and `commanded_normalized_action` (the value converted to physical velocity).
 
 Each TCP JSON message uses a four-byte big-endian payload length followed by
 UTF-8 JSON, with a maximum payload of 1 MiB and
-`schema_version="orin_behavior_rpc.v1"`. The server accepts `start_follow`,
-`cancel_follow`, `start_fixed_action` and `cancel_fixed_action`; it emits
+`schema_version="orin_behavior_rpc.v1"`. The server accepts the commissioning
+requests `start_follow`, `cancel_follow`, `start_fixed_action` and
+`cancel_fixed_action`. The Mission path uses `start_cycle`,
+`provide_dump_trajectory` and `cancel_cycle`; it emits
 `status`, `accepted`, `rejected`, `feedback` and `result`. It recomputes the
 canonical Trajectory Snapshot SHA-256 before
 acceptance. For remote Follow, the accepted snapshot is authoritative for the
@@ -234,6 +280,14 @@ PC-planned multi-point demonstrations without copying each dynamic Mission to
 Orin. The preloaded Mission still establishes the deployment frame, while
 `target_threshold` and `tube_radius` come only from the preloaded machine
 profile.
+
+`start_cycle` makes Orin execute `FollowDig → ExecuteDig` locally and return
+`DIG_LEG_COMPLETED` only after terminal zero is confirmed. The PC then replans
+from the new state and sends `provide_dump_trajectory`; Orin executes
+`FollowDump → ExecuteDump` locally and returns `SEQUENCE_COMPLETED`. This keeps
+environment-dependent planning on PC while removing the network round trip
+between Follow and its fixed action. An active-leg connection loss remains
+fail-closed and stops that local behavior.
 
 The fixed-action asset is loaded once before the serial port is opened. Its
 machine-profile and URDF SHA-256 bindings must match the deployed assets.

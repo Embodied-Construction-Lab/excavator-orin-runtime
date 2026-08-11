@@ -25,6 +25,7 @@ class StubRuntime:
             observation=tuple(float(index) for index in range(38)),
             normalized_action=(0.1, -0.2, 0.3, -0.4),
             physical_action=(0.01, -0.02, 0.03, -0.04),
+            commanded_normalized_action=(0.08, -0.16, 0.24, -0.32),
         )
 
 
@@ -52,6 +53,10 @@ class EdgeShadowObserverTest(unittest.TestCase):
         self.assertEqual(record["source_seq"], 7)
         self.assertEqual(record["waypoint_index"], 2)
         self.assertEqual(record["normalized_action"], [0.1, -0.2, 0.3, -0.4])
+        self.assertEqual(
+            record["commanded_normalized_action"],
+            [0.08, -0.16, 0.24, -0.32],
+        )
         self.assertEqual(record["physical_action"], [0.01, -0.02, 0.03, -0.04])
         self.assertEqual(record["runtime_monotonic_s"], 2.5)
         self.assertIn("loop_elapsed_ms", record)
@@ -106,6 +111,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
             config_path.parent / "machine_profile.json",
         )
         self.assertEqual(config.audit_path, self.root / "logs" / "edge.jsonl")
+        self.assertIsNone(config.follow_action_slew_rate_per_s)
 
     def test_control_mode_is_preserved_for_the_control_runner(self):
         config_path = self.root / "edge.json"
@@ -144,6 +150,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
                     "fixed_action_profile_path": "fixed_actions.json",
                     "audit_path": "edge.jsonl",
                     "action_valid_for_ms": 300,
+                    "follow_action_slew_rate_per_s": 2.0,
                     "remote_behavior": {
                         "bind_host": "0.0.0.0",
                         "bind_port": 18083,
@@ -166,6 +173,30 @@ class EdgeShadowObserverTest(unittest.TestCase):
         )
         self.assertEqual(config.remote_behavior.bind_port, 18083)
         self.assertEqual(config.remote_behavior.status_hz, 5.0)
+        self.assertEqual(config.follow_action_slew_rate_per_s, 2.0)
+
+    def test_follow_action_slew_rate_must_be_positive_when_configured(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "shadow",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "onnx_path": "policy.onnx",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                    "follow_action_slew_rate_per_s": 0.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "follow_action_slew_rate_per_s"):
+            load_edge_runtime_config(config_path)
 
     def test_config_loads_one_authoritative_mission_path(self):
         config_path = self.root / "edge.json"

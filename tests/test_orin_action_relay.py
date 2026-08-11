@@ -117,6 +117,24 @@ class ActionRelayTest(unittest.TestCase):
             (12.5, -9.25, 3.75, -7.5),
         )
 
+    def test_policy_action_console_log_labels_each_physical_command(self):
+        command = orin.DataCommand(
+            t_s=2080.229,
+            boom_v_ref_mps=-0.0146955703,
+            stick_v_ref_mps=-0.0329888032,
+            bucket_v_ref_mps=0.0,
+            swing_v_ref_radps=0.6,
+        )
+
+        message = orin.format_policy_action_tx_log(sequence=379, command=command)
+
+        self.assertEqual(
+            message,
+            "STM32 TX policy_action seq=379 t_ms:2080229 "
+            "boom:-0.0146955703m/s stick:-0.0329888032m/s "
+            "bucket:0m/s swing:0.6rad/s",
+        )
+
     def test_discards_older_queued_actions_and_applies_only_latest(self):
         destination = self.receiver.getsockname()
         self.sender.sendto(action_packet(1, [0.00351, 0.0, 0.0, 0.0]), destination)

@@ -7,5 +7,6 @@
   "trajectory_path": "assets/trajectory_command.json",
   "mission_path": "assets/excavation_cycle.json",
   "audit_path": "logs/edge_runtime.jsonl",
-  "action_valid_for_ms": 300
+  "action_valid_for_ms": 300,
+  "follow_action_slew_rate_per_s": 2.0
 }

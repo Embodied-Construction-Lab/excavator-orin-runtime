@@ -221,6 +221,7 @@ class EdgeFollowRuntimeFactory:
         mission: Mapping[str, Any],
         mission_sha256: str,
         runtime_type: Callable[..., Any] = EdgeFollowRuntime,
+        action_slew_rate_per_s: Optional[float] = None,
     ) -> None:
         if not isinstance(machine_profile, Mapping):
             raise ValueError("machine profile must be an object")
@@ -248,6 +249,7 @@ class EdgeFollowRuntimeFactory:
         self._kinematics = kinematics
         self._policy = policy
         self._mission = mission
+        self._action_slew_rate_per_s = action_slew_rate_per_s
         _sha256("mission_sha256", mission_sha256)
         self._runtime_type = runtime_type
 
@@ -267,6 +269,7 @@ class EdgeFollowRuntimeFactory:
             policy=OnnxPolicy(config.onnx_path),
             mission=mission,
             mission_sha256=hashlib.sha256(mission_bytes).hexdigest(),
+            action_slew_rate_per_s=config.follow_action_slew_rate_per_s,
         )
 
     def create(self, snapshot: FollowTrajectorySnapshot) -> EdgeFollowRuntime:
@@ -303,6 +306,7 @@ class EdgeFollowRuntimeFactory:
             policy=self._policy,
             trajectory=trajectory,
             mission=runtime_mission,
+            action_slew_rate_per_s=self._action_slew_rate_per_s,
         )
 
     def _validate_mission(self, snapshot: FollowTrajectorySnapshot) -> None:

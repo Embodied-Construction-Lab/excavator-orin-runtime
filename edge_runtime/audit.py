@@ -61,6 +61,14 @@ def summarize_audit_records(
         "loop_elapsed_ms": _distribution(
             _finite_numbers(records, "loop_elapsed_ms")
         ),
+        "raw_action_delta_abs": _action_delta_summary(
+            records,
+            "normalized_action",
+        ),
+        "commanded_action_delta_abs": _action_delta_summary(
+            records,
+            "commanded_normalized_action",
+        ),
         "progress": {
             "first": progress[0] if progress else None,
             "last": progress[-1] if progress else None,
@@ -81,6 +89,73 @@ def summarize_audit_records(
             else None
         ),
     }
+
+
+def _action_delta_summary(
+    records: Sequence[Mapping[str, Any]],
+    field: str,
+) -> Dict[str, Any]:
+    names = ("boom", "stick", "bucket", "swing")
+    deltas: List[List[float]] = [[] for _ in names]
+    reversals = [0 for _ in names]
+    previous_record: Mapping[str, Any] | None = None
+    previous_action: Sequence[float] | None = None
+    for record in records:
+        action = record.get(field)
+        if not _is_action(action):
+            previous_record = None
+            previous_action = None
+            continue
+        if (
+            previous_record is not None
+            and previous_action is not None
+            and _records_are_contiguous(previous_record, record)
+        ):
+            for index, (previous, current) in enumerate(
+                zip(previous_action, action)
+            ):
+                before = float(previous)
+                after = float(current)
+                deltas[index].append(abs(after - before))
+                if before * after < 0.0:
+                    reversals[index] += 1
+        previous_record = record
+        previous_action = action
+    result = {}
+    for index, name in enumerate(names):
+        distribution = _distribution(deltas[index])
+        distribution["sign_reversals"] = reversals[index]
+        result[name] = distribution
+    return result
+
+
+def _records_are_contiguous(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    if previous.get("schema_version") != current.get("schema_version"):
+        return False
+    previous_sequence = previous.get("source_seq")
+    current_sequence = current.get("source_seq")
+    if (
+        isinstance(previous_sequence, bool)
+        or not isinstance(previous_sequence, int)
+        or isinstance(current_sequence, bool)
+        or not isinstance(current_sequence, int)
+        or current_sequence <= previous_sequence
+    ):
+        return False
+    previous_time = previous.get("runtime_monotonic_s")
+    current_time = current.get("runtime_monotonic_s")
+    if (
+        isinstance(previous_time, bool)
+        or not isinstance(previous_time, (int, float))
+        or isinstance(current_time, bool)
+        or not isinstance(current_time, (int, float))
+    ):
+        return False
+    elapsed = float(current_time) - float(previous_time)
+    return math.isfinite(elapsed) and 0.0 <= elapsed <= 2.0
 
 
 def _finite_numbers(

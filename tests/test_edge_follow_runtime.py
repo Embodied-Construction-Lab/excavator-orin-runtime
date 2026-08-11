@@ -149,6 +149,19 @@ class RecordingPolicy:
         return list(self.action)
 
 
+class AlternatingPolicy:
+    def __init__(self):
+        self.actions = [
+            (1.0, -1.0, 0.5, -0.5),
+            (-1.0, 1.0, -0.5, 0.5),
+        ]
+        self.observations = []
+
+    def run(self, observation):
+        self.observations.append(list(observation))
+        return self.actions[min(len(self.observations) - 1, 1)]
+
+
 class EdgeFollowRuntimeTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -192,6 +205,44 @@ class EdgeFollowRuntimeTest(unittest.TestCase):
         for actual, expected in zip(step.observation[9:12], expected_unity_tip):
             self.assertAlmostEqual(actual, expected / 1.13, places=12)
         self.assertEqual(step.observation[30:34], (0.0, 0.0, 0.0, 0.0))
+
+    def test_follow_slew_limit_preserves_raw_policy_action_and_smooths_command(self):
+        policy = AlternatingPolicy()
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=policy,
+            trajectory=trajectory(),
+            mission=mission(),
+            action_slew_rate_per_s=2.0,
+        )
+
+        first = runtime.step(machine_state(sequence=10), now_s=1.0)
+        second = runtime.step(machine_state(sequence=11), now_s=1.1)
+        third = runtime.step(machine_state(sequence=12), now_s=1.2)
+
+        self.assertEqual(first.normalized_action, (1.0, -1.0, 0.5, -0.5))
+        self.assertEqual(first.commanded_normalized_action, (0.0, 0.0, 0.0, 0.0))
+        self.assertEqual(second.normalized_action, (-1.0, 1.0, -0.5, 0.5))
+        self.assertAlmostEqual(second.commanded_normalized_action[0], -0.2)
+        self.assertAlmostEqual(second.commanded_normalized_action[1], 0.2)
+        self.assertAlmostEqual(second.commanded_normalized_action[2], -0.2)
+        self.assertAlmostEqual(second.commanded_normalized_action[3], 0.2)
+        self.assertAlmostEqual(third.commanded_normalized_action[0], -0.4)
+        self.assertAlmostEqual(third.commanded_normalized_action[1], 0.4)
+        self.assertEqual(
+            second.observation[30:34],
+            first.normalized_action,
+        )
+        for actual, expected in zip(
+            third.observation[30:34],
+            second.normalized_action,
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(second.physical_action[0], -0.004)
+        self.assertAlmostEqual(second.physical_action[1], 0.01)
+        self.assertAlmostEqual(second.physical_action[2], -0.012)
+        self.assertAlmostEqual(second.physical_action[3], 0.12)
 
     def test_bucket_pitch_error_matches_unity_delta_angle_for_each_task_mode(self):
         observations = {}

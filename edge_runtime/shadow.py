@@ -40,6 +40,7 @@ class EdgeRuntimeConfig:
     fixed_action_profile_path: Optional[Path]
     audit_path: Path
     action_valid_for_ms: int
+    follow_action_slew_rate_per_s: Optional[float] = None
     remote_behavior: Optional[RemoteBehaviorConfig] = None
 
 
@@ -59,6 +60,7 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         "audit_path",
         "action_valid_for_ms",
     }
+    optional = {"follow_action_slew_rate_per_s"}
     if (
         not isinstance(value, dict)
         or "schema_version" not in value
@@ -69,11 +71,13 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         raise ValueError("edge shadow schema_version is invalid")
     mode = value["mode"]
     if mode in ("shadow", "control"):
-        if set(value) != common | {"trajectory_path"}:
+        required = common | {"trajectory_path"}
+        if not required <= set(value) <= required | optional:
             raise ValueError("edge shadow config fields are invalid")
         remote_behavior = None
     elif mode == "remote_control":
-        if set(value) != common | {"remote_behavior", "fixed_action_profile_path"}:
+        required = common | {"remote_behavior", "fixed_action_profile_path"}
+        if not required <= set(value) <= required | optional:
             raise ValueError("remote edge config fields are invalid")
         remote_behavior = _remote_behavior_config(value["remote_behavior"])
     else:
@@ -87,6 +91,22 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         or action_valid_for_ms <= 0
     ):
         raise ValueError("edge action_valid_for_ms must be a positive integer")
+    follow_action_slew_rate_per_s = value.get(
+        "follow_action_slew_rate_per_s"
+    )
+    if follow_action_slew_rate_per_s is not None:
+        if (
+            isinstance(follow_action_slew_rate_per_s, bool)
+            or not isinstance(follow_action_slew_rate_per_s, (int, float))
+            or not math.isfinite(float(follow_action_slew_rate_per_s))
+            or float(follow_action_slew_rate_per_s) <= 0.0
+        ):
+            raise ValueError(
+                "follow_action_slew_rate_per_s must be finite and positive"
+            )
+        follow_action_slew_rate_per_s = float(
+            follow_action_slew_rate_per_s
+        )
     root = config_path.parent
     return EdgeRuntimeConfig(
         mode=mode,
@@ -106,6 +126,7 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         ),
         audit_path=_relative_path(root, value["audit_path"]),
         action_valid_for_ms=action_valid_for_ms,
+        follow_action_slew_rate_per_s=follow_action_slew_rate_per_s,
         remote_behavior=remote_behavior,
     )
 
@@ -133,6 +154,7 @@ def build_edge_follow_runtime(config: EdgeRuntimeConfig) -> EdgeFollowRuntime:
         policy=OnnxPolicy(config.onnx_path),
         trajectory=trajectory,
         mission=mission,
+        action_slew_rate_per_s=config.follow_action_slew_rate_per_s,
     )
 
 

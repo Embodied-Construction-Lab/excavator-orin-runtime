@@ -19,6 +19,8 @@ class EdgeAuditSummaryTest(unittest.TestCase):
                 "loop_elapsed_ms": 0.30,
                 "episode_progress": 0.0,
                 "consecutive_rejections": 0,
+                "normalized_action": [1.0, -1.0, 0.5, -0.5],
+                "commanded_normalized_action": [0.2, -0.2, 0.2, -0.2],
                 "physical_action": [0.01, 0.0, 0.0, 0.0],
             },
             {
@@ -29,6 +31,8 @@ class EdgeAuditSummaryTest(unittest.TestCase):
                 "runtime_monotonic_s": 1.1,
                 "loop_elapsed_ms": 0.20,
                 "consecutive_rejections": 1,
+                "normalized_action": [-1.0, 1.0, -0.5, 0.5],
+                "commanded_normalized_action": [0.0, 0.0, 0.0, 0.0],
             },
             {
                 "mode": "shadow",
@@ -57,6 +61,18 @@ class EdgeAuditSummaryTest(unittest.TestCase):
         self.assertAlmostEqual(summary["state_input_hz"], 1000.0 / 150.0)
         self.assertAlmostEqual(summary["inference_ms"]["max"], 0.1)
         self.assertAlmostEqual(summary["loop_elapsed_ms"]["max"], 0.3)
+        self.assertEqual(
+            summary["raw_action_delta_abs"]["boom"]["max"],
+            2.0,
+        )
+        self.assertEqual(
+            summary["commanded_action_delta_abs"]["boom"]["max"],
+            0.2,
+        )
+        self.assertEqual(
+            summary["raw_action_delta_abs"]["boom"]["sign_reversals"],
+            1,
+        )
 
     def test_loader_reports_the_bad_jsonl_line(self):
         with tempfile.TemporaryDirectory() as temp_dir:

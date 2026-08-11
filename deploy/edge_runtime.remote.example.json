@@ -8,6 +8,7 @@
   "fixed_action_profile_path": "assets/fixed_actions.json",
   "audit_path": "logs/edge_runtime.jsonl",
   "action_valid_for_ms": 300,
+  "follow_action_slew_rate_per_s": 2.0,
   "remote_behavior": {
     "bind_host": "0.0.0.0",
     "bind_port": 18083,

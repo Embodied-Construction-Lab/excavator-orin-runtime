@@ -358,6 +358,17 @@ def format_float(value: float) -> str:
     return f"{value:.9g}"
 
 
+def format_policy_action_tx_log(sequence: object, command: DataCommand) -> str:
+    command_time_ms = int(round(command.t_s * 1000.0))
+    return (
+        f"STM32 TX policy_action seq={sequence} t_ms:{command_time_ms} "
+        f"boom:{format_float(command.boom_v_ref_mps)}m/s "
+        f"stick:{format_float(command.stick_v_ref_mps)}m/s "
+        f"bucket:{format_float(command.bucket_v_ref_mps)}m/s "
+        f"swing:{format_float(command.swing_v_ref_radps)}rad/s"
+    )
+
+
 def encode_data_command(command: DataCommand) -> bytes:
     t_ms = int(round(command.t_s * 1000.0))
     fields = (
@@ -529,11 +540,7 @@ def handle_policy_action_payload(
         )
     else:
         seq = packet.get("seq") if isinstance(packet, dict) else None
-        LOGGER.info(
-            "STM32 TX policy_action seq=%s: %s",
-            seq,
-            encoded.decode("ascii").strip(),
-        )
+        LOGGER.info("%s", format_policy_action_tx_log(seq, command))
 
     return True
 
@@ -753,11 +760,7 @@ class ActionRelay:
             if any(float(value) != 0.0 for value in action)
             else None
         )
-        LOGGER.info(
-            "STM32 TX policy_action seq=%s: %s",
-            sequence,
-            encoded.decode("ascii").strip(),
-        )
+        LOGGER.info("%s", format_policy_action_tx_log(sequence, command))
 
     def _active_command_must_stop(self) -> bool:
         if self._active_deadline_monotonic_s is None:
@@ -1010,6 +1013,7 @@ def main() -> None:
                 EdgeControlRunner,
                 FixedActionControlRunner,
             )
+            from edge_runtime.cycle import EdgeCycleCoordinator
             from edge_runtime.remote import EdgeBehaviorExecutor, RemoteBehaviorServer
 
             edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1036,7 +1040,7 @@ def main() -> None:
                 )
 
             remote = edge_config.remote_behavior
-            remote_executor = EdgeBehaviorExecutor(
+            behavior_executor = EdgeBehaviorExecutor(
                 runtime_factory=remote_runtime_factory,
                 runner_factory=build_remote_runner,
                 fixed_action_factory=fixed_action_runtime_factory,
@@ -1044,6 +1048,7 @@ def main() -> None:
                 sender_constructed=True,
                 state_timeout_s=remote.status_timeout_s,
             )
+            remote_executor = EdgeCycleCoordinator(behavior_executor)
             remote_server = RemoteBehaviorServer(
                 bind_host=remote.bind_host,
                 bind_port=remote.bind_port,

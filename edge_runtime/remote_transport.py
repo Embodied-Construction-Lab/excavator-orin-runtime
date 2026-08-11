@@ -81,6 +81,7 @@ class ConnectionEventStream:
         self,
         connection: Any,
         *,
+        connection_id: str = "unassigned",
         max_pending_events: int = _DEFAULT_PENDING_EVENTS,
     ) -> None:
         if (
@@ -89,14 +90,21 @@ class ConnectionEventStream:
             or max_pending_events < 1
         ):
             raise ValueError("max_pending_events must be a positive integer")
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            raise ValueError("connection_id must be non-empty")
         self._connection = connection
+        self._connection_id = connection_id
         self._pending: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(
             maxsize=max_pending_events
         )
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._failed = threading.Event()
+        self._failure_reason = ""
         self._next_sequence = 0
+        self._sent_count = 0
+        self._last_sent_type = "none"
+        self._last_sent_sequence = -1
         self._thread = threading.Thread(
             target=self._run,
             name="orin-remote-behavior-writer",
@@ -107,6 +115,24 @@ class ConnectionEventStream:
     @property
     def failed(self) -> bool:
         return self._failed.is_set()
+
+    @property
+    def failure_reason(self) -> str:
+        with self._lock:
+            return self._failure_reason
+
+    @property
+    def sent_summary(self) -> tuple[int, str, int]:
+        with self._lock:
+            return (
+                self._sent_count,
+                self._last_sent_type,
+                self._last_sent_sequence,
+            )
+
+    @property
+    def pending_count(self) -> int:
+        return self._pending.qsize()
 
     def start(self) -> None:
         if self._started:
@@ -125,10 +151,20 @@ class ConnectionEventStream:
             except queue.Full:
                 self._failed.set()
                 self._stop.set()
+                self._failure_reason = "backpressure"
                 should_abort = True
             else:
                 self._next_sequence += 1
         if should_abort:
+            LOGGER.error(
+                "remote behavior event writer failed: "
+                "connection_id=%s reason=backpressure event_type=%s "
+                "event_seq=%s pending_events=%d",
+                self._connection_id,
+                sequenced.get("type", "none"),
+                sequenced.get("seq", -1),
+                self._pending.qsize(),
+            )
             self._shutdown_connection()
 
     def close(self) -> None:
@@ -151,9 +187,26 @@ class ConnectionEventStream:
             try:
                 if event is not None:
                     send_message(self._connection, event)
-            except (OSError, ValueError):
+                    with self._lock:
+                        self._sent_count += 1
+                        self._last_sent_type = str(event.get("type", "unknown"))
+                        self._last_sent_sequence = int(event.get("seq", -1))
+            except (OSError, ValueError) as exc:
                 self._failed.set()
                 self._stop.set()
+                with self._lock:
+                    self._failure_reason = "send_error"
+                LOGGER.error(
+                    "remote behavior event writer failed: "
+                    "connection_id=%s reason=send_error event_type=%s "
+                    "event_seq=%s pending_events=%d error=%s: %s",
+                    self._connection_id,
+                    event.get("type") if event is not None else "none",
+                    event.get("seq") if event is not None else -1,
+                    self._pending.qsize(),
+                    type(exc).__name__,
+                    exc,
+                )
                 self._shutdown_connection()
                 return
             finally:
@@ -201,6 +254,7 @@ class RemoteBehaviorServer:
         self._socket_lock = threading.Lock()
         self._client_threads: set[threading.Thread] = set()
         self._connections: set[socket.socket] = set()
+        self._next_connection_sequence = 1
         self._started = False
 
     def start(self) -> None:
@@ -250,10 +304,25 @@ class RemoteBehaviorServer:
                     raise RuntimeError("remote behavior client did not stop")
         self._executor.close(emit_result=False)
 
-    def serve_connection(self, connection: socket.socket) -> None:
-        stream = ConnectionEventStream(connection)
+    def serve_connection(
+        self,
+        connection: socket.socket,
+        *,
+        connection_id: str = "rpc-direct",
+        peer: str = "unknown",
+    ) -> None:
+        LOGGER.info(
+            "remote behavior connection opened: connection_id=%s peer=%s",
+            connection_id,
+            peer,
+        )
+        stream = ConnectionEventStream(
+            connection,
+            connection_id=connection_id,
+        )
         stream.start()
         emit = stream.emit
+        close_reason = "server_shutdown"
 
         try:
             connection.settimeout(None)
@@ -271,13 +340,51 @@ class RemoteBehaviorServer:
                     continue
                 request = receive_message(connection)
                 if request is None:
+                    close_reason = "peer_eof"
                     break
+                LOGGER.info(
+                    "remote behavior request received: connection_id=%s "
+                    "peer=%s type=%s session_id=%s request_id=%s "
+                    "request_seq=%s",
+                    connection_id,
+                    peer,
+                    request.get("type", "unknown"),
+                    request.get("session_id", "unknown"),
+                    request.get("request_id", "unknown"),
+                    request.get("seq", -1),
+                )
                 self._executor.handle(request, emit)
-        except (OSError, ValueError):
-            LOGGER.warning("remote behavior connection closed after protocol error")
+            if stream.failed:
+                close_reason = stream.failure_reason or "writer_failed"
+        except (OSError, ValueError) as exc:
+            close_reason = "receive_error"
+            LOGGER.warning(
+                "remote behavior connection receive failed: "
+                "connection_id=%s peer=%s reason=%s error=%s: %s",
+                connection_id,
+                peer,
+                close_reason,
+                type(exc).__name__,
+                exc,
+            )
         finally:
             self._executor.disconnect(emit)
             stream.close()
+            if stream.failed:
+                close_reason = stream.failure_reason or "writer_failed"
+            sent_count, last_event_type, last_event_sequence = stream.sent_summary
+            LOGGER.info(
+                "remote behavior connection closed: connection_id=%s peer=%s "
+                "reason=%s events_sent=%d last_event_type=%s "
+                "last_event_seq=%d pending_events=%d",
+                connection_id,
+                peer,
+                close_reason,
+                sent_count,
+                last_event_type,
+                last_event_sequence,
+                stream.pending_count,
+            )
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -299,9 +406,12 @@ class RemoteBehaviorServer:
                 )
                 connection.close()
                 continue
+            connection_id = f"rpc-{self._next_connection_sequence:06d}"
+            self._next_connection_sequence += 1
+            peer = f"{address[0]}:{address[1]}"
             thread = threading.Thread(
                 target=self._serve_client,
-                args=(connection,),
+                args=(connection, connection_id, peer),
                 name="orin-remote-behavior-client",
                 daemon=False,
             )
@@ -310,9 +420,18 @@ class RemoteBehaviorServer:
                 self._client_threads.add(thread)
             thread.start()
 
-    def _serve_client(self, connection: socket.socket) -> None:
+    def _serve_client(
+        self,
+        connection: socket.socket,
+        connection_id: str,
+        peer: str,
+    ) -> None:
         try:
-            self.serve_connection(connection)
+            self.serve_connection(
+                connection,
+                connection_id=connection_id,
+                peer=peer,
+            )
         finally:
             connection.close()
             with self._socket_lock:
