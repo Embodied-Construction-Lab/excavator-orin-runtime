@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import select
+import signal
 import socket
 import struct
 import threading
@@ -907,6 +908,11 @@ def edge_mode_controls_motion(mode: str) -> bool:
     return mode in ("control", "remote_control")
 
 
+def _raise_keyboard_interrupt_on_termination(_signum, _frame) -> None:
+    """Route process-manager SIGTERM through the existing terminal-zero cleanup."""
+    raise KeyboardInterrupt
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bridge unified STM32 state to PC machine_state_v1 UDP JSON.",
@@ -1170,6 +1176,7 @@ def main() -> None:
 
     seq = 0
     last_receive_monotonic_s: Optional[float] = None
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_termination)
 
     try:
         while True:

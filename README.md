@@ -364,6 +364,8 @@ relay maps values by the declared action names into the fixed STM32 field order;
 physical limits.
 
 Ctrl+C, scheduler lag, normal completion and Action Relay shutdown all lead to zero commands.
+进程管理器发送的 `SIGTERM` 会进入同一 `KeyboardInterrupt`/`finally` 清理路径，用于 RL→示教采集
+切换时先写终态零命令再释放 `/dev/ttyTHS1`。
 PC live actions and local CSV replay must not be enabled at the same time.
 
 ## Updating Orin

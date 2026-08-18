@@ -14,6 +14,10 @@ LIVE_ROW = (
 
 
 class Stm32CsvSafetyFlagsTest(unittest.TestCase):
+    def test_sigterm_handler_enters_existing_keyboard_interrupt_cleanup_path(self):
+        with self.assertRaises(KeyboardInterrupt):
+            orin._raise_keyboard_interrupt_on_termination(None, None)
+
     def test_unified_firmware_defaults_match_field_serial_link(self):
         self.assertEqual(orin.DEFAULT_SERIAL_PORT, "/dev/ttyTHS1")
         self.assertEqual(orin.DEFAULT_BAUDRATE, 460800)
