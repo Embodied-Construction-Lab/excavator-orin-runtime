@@ -913,6 +913,34 @@ def _raise_keyboard_interrupt_on_termination(_signum, _frame) -> None:
     raise KeyboardInterrupt
 
 
+def wait_for_hardware_start_gate(
+    path: str | Path,
+    *,
+    poll_interval_s: float = 0.05,
+) -> None:
+    """Finish model loading, then wait without opening the STM32 serial port.
+
+    The gate is a one-shot file: the process that creates it transfers hardware
+    ownership only after the previous Runtime has written terminal zero and
+    proved that ``/dev/ttyTHS1`` is released.
+    """
+
+    gate = Path(path)
+    if not gate.is_absolute():
+        raise ValueError("hardware start gate must be an absolute path")
+    if not math.isfinite(poll_interval_s) or poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be positive and finite")
+    LOGGER.info("RL prewarm ready: waiting for hardware start gate: %s", gate)
+    while True:
+        try:
+            gate.unlink()
+        except FileNotFoundError:
+            time.sleep(poll_interval_s)
+        else:
+            LOGGER.info("RL hardware start gate accepted: %s", gate)
+            return
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bridge unified STM32 state to PC machine_state_v1 UDP JSON.",
@@ -1010,6 +1038,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             + EDGE_MOTION_AUTHORIZATION
         ),
     )
+    parser.add_argument(
+        "--hardware-start-gate",
+        type=Path,
+        help=(
+            "After loading edge assets and ONNX, wait for this absolute one-shot "
+            "file before opening the STM32 serial port."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1053,6 +1089,14 @@ def main() -> None:
             )
         else:
             edge_runtime = build_edge_follow_runtime(edge_config)
+
+    if args.hardware_start_gate is not None:
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_termination)
+        try:
+            wait_for_hardware_start_gate(args.hardware_start_gate)
+        except KeyboardInterrupt:
+            LOGGER.info("RL prewarm cancelled before hardware acquisition")
+            return
 
     LOGGER.info(
         "opening serial %s @ %d, sending UDP JSON to %s:%d, listening policy_action on %s:%d from %s",

@@ -1,5 +1,10 @@
+import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import orin_state_sender as orin
 
@@ -14,6 +19,74 @@ LIVE_ROW = (
 
 
 class Stm32CsvSafetyFlagsTest(unittest.TestCase):
+    def test_hardware_start_gate_waits_until_one_shot_file_arrives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "rl.start"
+            finished = threading.Event()
+
+            def wait_for_gate():
+                orin.wait_for_hardware_start_gate(gate, poll_interval_s=0.001)
+                finished.set()
+
+            worker = threading.Thread(target=wait_for_gate)
+            worker.start()
+            time.sleep(0.02)
+
+            self.assertFalse(finished.is_set())
+            gate.touch()
+            worker.join(timeout=1.0)
+
+            self.assertTrue(finished.is_set())
+            self.assertFalse(gate.exists())
+
+    def test_hardware_start_gate_requires_absolute_path(self):
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            orin.wait_for_hardware_start_gate(
+                Path("relative.start"), poll_interval_s=0.001
+            )
+
+    def test_cli_accepts_hardware_start_gate_without_changing_default(self):
+        default_args = orin.parse_args([])
+        gated_args = orin.parse_args(
+            ["--hardware-start-gate", "/tmp/excavator-rl-control/test.start"]
+        )
+
+        self.assertIsNone(default_args.hardware_start_gate)
+        self.assertEqual(
+            gated_args.hardware_start_gate,
+            Path("/tmp/excavator-rl-control/test.start"),
+        )
+
+    def test_cancelled_hardware_gate_opens_no_device_or_network_socket(self):
+        args = SimpleNamespace(
+            allowed_action_host=None,
+            pc_host="192.168.50.1",
+            edge_config=None,
+            hardware_start_gate=Path(
+                "/tmp/excavator-rl-control/hybrid_cancelled.start"
+            ),
+        )
+
+        with (
+            mock.patch.object(orin, "parse_args", return_value=args),
+            mock.patch.object(orin.signal, "signal"),
+            mock.patch.object(
+                orin,
+                "wait_for_hardware_start_gate",
+                side_effect=KeyboardInterrupt,
+            ),
+            mock.patch.object(orin, "open_serial") as open_serial,
+            mock.patch.object(orin, "open_action_socket") as open_action_socket,
+            mock.patch.object(orin.socket, "socket") as open_udp_socket,
+            mock.patch.object(orin, "send_udp_json") as send_machine_state,
+        ):
+            orin.main()
+
+        open_serial.assert_not_called()
+        open_action_socket.assert_not_called()
+        open_udp_socket.assert_not_called()
+        send_machine_state.assert_not_called()
+
     def test_sigterm_handler_enters_existing_keyboard_interrupt_cleanup_path(self):
         with self.assertRaises(KeyboardInterrupt):
             orin._raise_keyboard_interrupt_on_termination(None, None)

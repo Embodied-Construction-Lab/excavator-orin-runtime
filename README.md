@@ -87,6 +87,14 @@ python orin_state_sender.py \
 RViz button order are maintained in the `AiryLidar/README.md` section
 “强化学习 Orin + PC 真机测试速查”.
 
+The hybrid Mission Adapter may additionally pass an absolute
+`--hardware-start-gate`. In that internal mode the process validates deployment
+assets and loads ONNX first, logs `RL prewarm ready`, and waits without opening
+the serial port, action socket, behavior RPC port, or publishing Machine State.
+The Adapter creates the one-shot gate only after the previous Runtime has sent
+terminal zero and `/dev/ttyTHS1` is confirmed released. This flag is an internal
+handoff mechanism; normal standalone RL commands do not need it.
+
 ## Installation on Orin
 
 ```bash
