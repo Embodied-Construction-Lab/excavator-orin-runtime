@@ -370,14 +370,25 @@ class EdgeControlRunnerTest(unittest.TestCase):
 
             self.assertTrue(serial.written.wait(0.1))
             deadline = time.monotonic() + 0.1
+            def has_expected_velocity_command():
+                return any(
+                    (
+                        command["boom_mps"],
+                        command["stick_mps"],
+                        command["bucket_mps"],
+                        command["swing_radps"],
+                    )
+                    == (0.01, -0.02, 0.03, -0.04)
+                    for command in (
+                        json.loads(value.decode("ascii")) for value in serial.writes
+                    )
+                )
             while (
                 time.monotonic() < deadline
-                and not any(b";0.01;-0.02;0.03;-0.04\n" in value for value in serial.writes)
+                and not has_expected_velocity_command()
             ):
                 time.sleep(0.005)
-            self.assertTrue(
-                any(b";0.01;-0.02;0.03;-0.04\n" in value for value in serial.writes)
-            )
+            self.assertTrue(has_expected_velocity_command())
         finally:
             runner.close(action_stamp_ms=orin_state_sender.now_ms())
             relay.close()

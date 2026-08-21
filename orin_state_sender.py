@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Read STM32 state from /dev/ttyTHS0 and send machine_state_v1 to PC over UDP.
+"""Read unified STM32 state and send machine_state_v1 to PC over UDP.
 
-Default STM32 serial input is CSV text:
+Default STM32 serial input is `stm32_control_telemetry.v2` CSV from the unified
+`F407/data_celect` firmware. Legacy 19-field CSV remains readable for offline
+compatibility:
 
     t,x1,x2,y1,y2,s_boom,s_stick,s_bucket,v_boom,v_stick,v_bucket,
     a_boom,a_stick,a_bucket,yaw,yaw_rate,rs485_ok,adc_ok,imu_ok
@@ -33,6 +35,7 @@ import logging
 import math
 import os
 import select
+import signal
 import socket
 import struct
 import threading
@@ -44,8 +47,8 @@ from typing import Dict, List, Optional
 
 LOGGER = logging.getLogger("orin_state_sender")
 
-DEFAULT_SERIAL_PORT = "/dev/ttyTHS0"
-DEFAULT_BAUDRATE = 115200
+DEFAULT_SERIAL_PORT = "/dev/ttyTHS1"
+DEFAULT_BAUDRATE = 460800
 DEFAULT_PC_STATE_HOST = "192.168.2.127"
 DEFAULT_PC_STATE_PORT = 18081
 DEFAULT_ORIN_ACTION_BIND_HOST = "0.0.0.0"
@@ -59,6 +62,36 @@ MM_TO_M = 0.001
 POLICY_ACTION_NAMES = ("boom", "stick", "bucket", "swing")
 ACTION_FUTURE_SKEW_MS = 50
 EDGE_MOTION_AUTHORIZATION = "ALLOW_EDGE_MACHINE_MOTION"
+STM32_V2_SCHEMA_VERSION = "stm32_control_telemetry.v2"
+STM32_VELOCITY_COMMAND_SCHEMA_VERSION = "stm32_velocity_command.v1"
+STM32_V2_FIELDS = (
+    "schema_version", "control_seq", "control_stamp_ms", "sensor_seq",
+    "sensor_stamp_ms", "sensor_is_new", "command_rx_seq",
+    "command_source_stamp_ms", "command_received_stamp_ms", "command_age_ms",
+    "command_action_boom", "command_action_stick", "command_action_bucket",
+    "command_action_swing", "boom_pos_mm", "stick_pos_mm", "bucket_pos_mm",
+    "boom_vel_mmps", "stick_vel_mmps", "bucket_vel_mmps", "boom_angle_deg",
+    "arm_angle_deg", "bucket_angle_deg", "swing_angle_deg", "swing_vel_degps",
+    "boom_v_ref_mmps", "stick_v_ref_mmps", "bucket_v_ref_mmps",
+    "swing_v_ref_degps", "pid_out_boom", "pid_out_stick", "pid_out_bucket",
+    "pid_out_swing", "valve_boom_deg", "valve_stick_deg", "valve_bucket_deg",
+    "swing_percent", "pump_percent", "pwm_boom", "pwm_stick", "pwm_bucket",
+    "pwm_swing", "pwm_pump", "control_mode", "homing_complete",
+    "command_valid", "command_timed_out", "control_enabled", "estop",
+    "limit_mask", "rs485_ok", "dwj_ok", "imu_ok", "fault_flags",
+    "dropped_command_frames",
+)
+STM32_V2_INTEGER_FIELDS = frozenset(
+    {
+        "control_seq", "control_stamp_ms", "sensor_seq", "sensor_stamp_ms",
+        "sensor_is_new", "command_rx_seq", "command_source_stamp_ms",
+        "command_received_stamp_ms", "command_age_ms", "pwm_boom",
+        "pwm_stick", "pwm_bucket", "pwm_swing", "pwm_pump", "control_mode",
+        "homing_complete", "command_valid", "command_timed_out",
+        "control_enabled", "estop", "limit_mask", "rs485_ok", "dwj_ok",
+        "imu_ok", "fault_flags", "dropped_command_frames",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +115,9 @@ class Stm32State:
     rs485_ok: bool = True
     adc_ok: bool = True
     imu_ok: bool = True
+    command_rx_seq: int = 0
+    command_received: bool = False
+    stm32_control_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,6 +183,10 @@ def parse_stm32_csv_line(line: str) -> Optional[Stm32State]:
 
     if not fields:
         return None
+    if tuple(fields) == STM32_V2_FIELDS:
+        return None
+    if fields[0] == STM32_V2_SCHEMA_VERSION:
+        return _parse_stm32_v2_fields(fields)
     if any(ch.isalpha() or ch == "_" for ch in fields[0]):
         return None
 
@@ -224,6 +264,69 @@ def parse_stm32_csv_line(line: str) -> Optional[Stm32State]:
         rs485_ok=rs485_ok,
         adc_ok=adc_ok,
         imu_ok=imu_ok,
+    )
+
+
+def _parse_stm32_v2_fields(fields: List[str]) -> Stm32State:
+    if len(fields) != len(STM32_V2_FIELDS):
+        raise ValueError(
+            f"bad STM32 v2 CSV field count: {len(fields)} != {len(STM32_V2_FIELDS)}"
+        )
+    raw = dict(zip(STM32_V2_FIELDS, fields))
+    parsed: Dict[str, float | int] = {}
+
+    def finite_float(name: str) -> float:
+        return float(parsed[name])
+
+    def nonnegative_int(name: str) -> int:
+        return int(parsed[name])
+
+    for name in STM32_V2_FIELDS[1:]:
+        try:
+            value: float | int
+            if name in STM32_V2_INTEGER_FIELDS:
+                value = int(raw[name])
+                if value < 0:
+                    raise ValueError
+            else:
+                value = float(raw[name])
+                if not math.isfinite(value):
+                    raise ValueError
+        except ValueError as exc:
+            raise ValueError(f"bad STM32 v2 field {name}: {raw[name]!r}") from exc
+        parsed[name] = value
+
+    command_valid = _parse_hardware_status(
+        "command_valid", finite_float("command_valid")
+    )
+    command_timed_out = _parse_hardware_status(
+        "command_timed_out", finite_float("command_timed_out")
+    )
+    return Stm32State(
+        t_ms=nonnegative_int("control_stamp_ms"),
+        x1=finite_float("command_action_swing"),
+        x2=finite_float("command_action_bucket"),
+        y1=finite_float("command_action_stick"),
+        y2=finite_float("command_action_boom"),
+        s_boom=finite_float("boom_pos_mm") * MM_TO_M,
+        s_stick=finite_float("stick_pos_mm") * MM_TO_M,
+        s_bucket=finite_float("bucket_pos_mm") * MM_TO_M,
+        v_boom=finite_float("boom_vel_mmps") * MM_TO_M,
+        v_stick=finite_float("stick_vel_mmps") * MM_TO_M,
+        v_bucket=finite_float("bucket_vel_mmps") * MM_TO_M,
+        a_boom=math.radians(finite_float("boom_angle_deg")),
+        a_stick=math.radians(finite_float("arm_angle_deg")),
+        a_bucket=math.radians(finite_float("bucket_angle_deg")),
+        yaw=math.radians(finite_float("swing_angle_deg")),
+        yaw_rate=math.radians(finite_float("swing_vel_degps")),
+        rs485_ok=_parse_hardware_status("rs485_ok", finite_float("rs485_ok")),
+        adc_ok=_parse_hardware_status("dwj_ok", finite_float("dwj_ok")),
+        imu_ok=_parse_hardware_status("imu_ok", finite_float("imu_ok")),
+        command_rx_seq=nonnegative_int("command_rx_seq"),
+        command_received=command_valid or command_timed_out,
+        stm32_control_enabled=_parse_hardware_status(
+            "control_enabled", finite_float("control_enabled")
+        ),
     )
 
 
@@ -369,16 +472,52 @@ def format_policy_action_tx_log(sequence: object, command: DataCommand) -> str:
     )
 
 
-def encode_data_command(command: DataCommand) -> bytes:
-    t_ms = int(round(command.t_s * 1000.0))
-    fields = (
-        str(t_ms),
-        format_float(command.boom_v_ref_mps),
-        format_float(command.stick_v_ref_mps),
-        format_float(command.bucket_v_ref_mps),
-        format_float(command.swing_v_ref_radps),
-    )
-    return (";".join(fields) + "\n").encode("ascii")
+class Stm32VelocityCommandEncoder:
+    """Encode the unified STM32 physical-velocity command contract."""
+
+    def __init__(self) -> None:
+        self._next_sequence = 0
+
+    @property
+    def next_sequence(self) -> int:
+        return self._next_sequence
+
+    def synchronize(self, *, command_rx_seq: int, command_received: bool) -> int:
+        if (
+            isinstance(command_rx_seq, bool)
+            or not isinstance(command_rx_seq, int)
+            or command_rx_seq < 0
+            or command_rx_seq > 0xFFFFFFFF
+        ):
+            raise ValueError("command_rx_seq must be a uint32")
+        self._next_sequence = (
+            (command_rx_seq + 1) & 0xFFFFFFFF if command_received else 0
+        )
+        return self._next_sequence
+
+    def encode(self, command: DataCommand) -> bytes:
+        values = (
+            command.t_s,
+            command.boom_v_ref_mps,
+            command.stick_v_ref_mps,
+            command.bucket_v_ref_mps,
+            command.swing_v_ref_radps,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("STM32 velocity command values must be finite")
+        if command.t_s < 0.0:
+            raise ValueError("STM32 velocity command time must be non-negative")
+        payload = {
+            "schema_version": STM32_VELOCITY_COMMAND_SCHEMA_VERSION,
+            "boom_mps": command.boom_v_ref_mps,
+            "stick_mps": command.stick_v_ref_mps,
+            "bucket_mps": command.bucket_v_ref_mps,
+            "swing_radps": command.swing_v_ref_radps,
+            "command_seq": self._next_sequence,
+            "command_source_stamp_ms": int(command.t_s * 1000.0) & 0xFFFFFFFF,
+        }
+        self._next_sequence = (self._next_sequence + 1) & 0xFFFFFFFF
+        return (json.dumps(payload, separators=(",", ":")) + "\n").encode("ascii")
 
 
 def zero_data_command(command_time_s: float) -> DataCommand:
@@ -501,81 +640,6 @@ def open_action_socket(bind_host: str, bind_port: int) -> socket.socket:
     return sock
 
 
-def handle_policy_action_payload(
-    payload: bytes,
-    addr: tuple[str, int],
-    ser: object,
-    control_enabled: bool,
-    estop: bool,
-    sensor_valid: bool,
-    stm32_alive: bool,
-    command_time_s: float,
-    receive_wall_ms: int,
-) -> bool:
-    try:
-        packet = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        LOGGER.warning("drop invalid policy_action from %s: %s", addr, exc)
-        return False
-
-    command, reject_reasons = policy_action_to_data_command(
-        packet=packet,
-        command_time_s=command_time_s,
-        receive_wall_ms=receive_wall_ms,
-        control_enabled=control_enabled,
-        estop=estop,
-        sensor_valid=sensor_valid,
-        stm32_alive=stm32_alive,
-    )
-    encoded = encode_data_command(command)
-    ser.write(encoded)
-    ser.flush()
-
-    if reject_reasons:
-        LOGGER.warning(
-            "policy_action rejected from %s: %s; STM32 TX safe zero: %s",
-            addr,
-            ",".join(reject_reasons),
-            encoded.decode("ascii").strip(),
-        )
-    else:
-        seq = packet.get("seq") if isinstance(packet, dict) else None
-        LOGGER.info("%s", format_policy_action_tx_log(seq, command))
-
-    return True
-
-
-def drain_policy_actions(
-    action_sock: socket.socket,
-    ser: object,
-    control_enabled: bool,
-    estop: bool,
-    sensor_valid: bool,
-    stm32_alive: bool,
-) -> int:
-    handled = 0
-    while True:
-        try:
-            payload, addr = action_sock.recvfrom(8192)
-        except BlockingIOError:
-            break
-
-        if handle_policy_action_payload(
-            payload=payload,
-            addr=addr,
-            ser=ser,
-            control_enabled=control_enabled,
-            estop=estop,
-            sensor_valid=sensor_valid,
-            stm32_alive=stm32_alive,
-            command_time_s=time.monotonic(),
-            receive_wall_ms=now_ms(),
-        ):
-            handled += 1
-
-    return handled
-
-
 class ActionRelay:
     """Receive the newest PC action independently of the STM32 state cadence."""
 
@@ -587,6 +651,7 @@ class ActionRelay:
         control_enabled: bool,
         estop: bool,
         poll_interval_s: float = 0.01,
+        command_encoder: Optional[Stm32VelocityCommandEncoder] = None,
     ) -> None:
         if not allowed_action_host:
             raise ValueError("allowed_action_host must be non-empty")
@@ -598,6 +663,9 @@ class ActionRelay:
         self._control_enabled = bool(control_enabled)
         self._estop = bool(estop)
         self._poll_interval_s = float(poll_interval_s)
+        self._command_encoder = command_encoder or Stm32VelocityCommandEncoder()
+        self._command_encoder_lock = threading.Lock()
+        self._command_sequence_synchronized = False
         self._safety_lock = threading.Lock()
         self._sensor_valid = False
         self._stm32_alive = False
@@ -619,6 +687,17 @@ class ActionRelay:
             self._sensor_valid = bool(sensor_valid)
             self._stm32_alive = bool(stm32_alive)
             self._last_state_monotonic_s = time.monotonic()
+
+    def synchronize_command_sequence(self, state: Stm32State) -> int:
+        with self._command_encoder_lock:
+            if self._command_sequence_synchronized:
+                return self._command_encoder.next_sequence
+            next_sequence = self._command_encoder.synchronize(
+                command_rx_seq=state.command_rx_seq,
+                command_received=state.command_received,
+            )
+            self._command_sequence_synchronized = True
+            return next_sequence
 
     def start(self) -> None:
         if self._started:
@@ -697,10 +776,14 @@ class ActionRelay:
         return payload, addr
 
     def _write_zero(self) -> None:
-        encoded = encode_data_command(zero_data_command(time.monotonic()))
+        encoded = self._encode_command(zero_data_command(time.monotonic()))
         self._ser.write(encoded)
         self._ser.flush()
         self._active_deadline_monotonic_s = None
+
+    def _encode_command(self, command: DataCommand) -> bytes:
+        with self._command_encoder_lock:
+            return self._command_encoder.encode(command)
 
     def _apply_payload(self, payload: bytes, addr: tuple[str, int]) -> None:
         try:
@@ -736,7 +819,19 @@ class ActionRelay:
             sensor_valid=sensor_valid,
             stm32_alive=stm32_alive,
         )
-        encoded = encode_data_command(command)
+        command_is_nonzero = any(
+            value != 0.0
+            for value in (
+                command.boom_v_ref_mps,
+                command.stick_v_ref_mps,
+                command.bucket_v_ref_mps,
+                command.swing_v_ref_radps,
+            )
+        )
+        if not reject_reasons and command_is_nonzero and self._active_deadline_monotonic_s is None:
+            # Claim VELOCITY_REFERENCE through a zero command before motion.
+            self._write_zero()
+        encoded = self._encode_command(command)
         self._ser.write(encoded)
         self._ser.flush()
         if reject_reasons:
@@ -813,9 +908,14 @@ def edge_mode_controls_motion(mode: str) -> bool:
     return mode in ("control", "remote_control")
 
 
+def _raise_keyboard_interrupt_on_termination(_signum, _frame) -> None:
+    """Route process-manager SIGTERM through the existing terminal-zero cleanup."""
+    raise KeyboardInterrupt
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Bridge STM32 /dev/ttyTHS0 state to PC machine_state_v1 UDP JSON.",
+        description="Bridge unified STM32 state to PC machine_state_v1 UDP JSON.",
     )
     parser.add_argument(
         "--serial-port",
@@ -1076,6 +1176,7 @@ def main() -> None:
 
     seq = 0
     last_receive_monotonic_s: Optional[float] = None
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_termination)
 
     try:
         while True:
@@ -1111,6 +1212,7 @@ def main() -> None:
                     continue
 
             last_receive_monotonic_s = time.monotonic()
+            action_relay.synchronize_command_sequence(state)
             packet = build_machine_state_packet(
                 state=state,
                 seq=seq,

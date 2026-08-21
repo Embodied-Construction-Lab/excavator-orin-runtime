@@ -14,6 +14,60 @@ LIVE_ROW = (
 
 
 class Stm32CsvSafetyFlagsTest(unittest.TestCase):
+    def test_sigterm_handler_enters_existing_keyboard_interrupt_cleanup_path(self):
+        with self.assertRaises(KeyboardInterrupt):
+            orin._raise_keyboard_interrupt_on_termination(None, None)
+
+    def test_unified_firmware_defaults_match_field_serial_link(self):
+        self.assertEqual(orin.DEFAULT_SERIAL_PORT, "/dev/ttyTHS1")
+        self.assertEqual(orin.DEFAULT_BAUDRATE, 460800)
+
+    def test_unified_v2_row_maps_state_safety_and_command_sequence(self):
+        values = {field: "0" for field in orin.STM32_V2_FIELDS}
+        values.update(
+            schema_version="stm32_control_telemetry.v2",
+            control_stamp_ms="1234",
+            command_rx_seq="41",
+            command_valid="1",
+            control_enabled="1",
+            boom_pos_mm="100.0",
+            stick_pos_mm="120.0",
+            bucket_pos_mm="80.0",
+            boom_vel_mmps="2.0",
+            stick_vel_mmps="-3.0",
+            bucket_vel_mmps="4.0",
+            boom_angle_deg="10.0",
+            arm_angle_deg="20.0",
+            bucket_angle_deg="30.0",
+            swing_angle_deg="40.0",
+            swing_vel_degps="5.0",
+            rs485_ok="1",
+            dwj_ok="1",
+            imu_ok="1",
+        )
+        row = ",".join(values[field] for field in orin.STM32_V2_FIELDS)
+
+        state = orin.parse_stm32_csv_line(row)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.command_rx_seq, 41)
+        self.assertTrue(state.command_received)
+        self.assertTrue(state.stm32_control_enabled)
+        self.assertAlmostEqual(state.s_boom, 0.1)
+        self.assertAlmostEqual(state.v_stick, -0.003)
+        self.assertAlmostEqual(state.yaw, 0.6981317008)
+
+    def test_unified_v2_rejects_corruption_in_any_telemetry_field(self):
+        values = {field: "0" for field in orin.STM32_V2_FIELDS}
+        values.update(
+            schema_version="stm32_control_telemetry.v2",
+            pid_out_boom="nan",
+        )
+        row = ",".join(values[field] for field in orin.STM32_V2_FIELDS)
+
+        with self.assertRaisesRegex(ValueError, "pid_out_boom"):
+            orin.parse_stm32_csv_line(row)
+
     def test_live_19_field_row_maps_all_hardware_validity_flags(self):
         state = orin.parse_stm32_csv_line(LIVE_ROW)
 

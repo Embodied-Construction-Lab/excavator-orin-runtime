@@ -45,6 +45,18 @@ def action_packet(sequence, action, valid_for_ms=100, stamp_ms=None):
     ).encode("utf-8")
 
 
+def stm32_command(payload):
+    return json.loads(payload.decode("ascii"))
+
+
+def is_zero_command(payload):
+    command = stm32_command(payload)
+    return all(
+        command[name] == 0.0
+        for name in ("boom_mps", "stick_mps", "bucket_mps", "swing_radps")
+    )
+
+
 class ActionRelayTest(unittest.TestCase):
     def setUp(self):
         self.receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -70,6 +82,63 @@ class ActionRelayTest(unittest.TestCase):
         self.assertEqual(args.pc_host, "192.0.2.10")
         self.assertEqual(args.allowed_action_host, "127.0.0.1")
 
+    def test_velocity_encoder_resumes_stm32_sequence_and_preserves_physical_units(self):
+        encoder = orin.Stm32VelocityCommandEncoder()
+        encoder.synchronize(command_rx_seq=41, command_received=True)
+        command = orin.DataCommand(
+            t_s=1.234567,
+            boom_v_ref_mps=0.12,
+            stick_v_ref_mps=-0.08,
+            bucket_v_ref_mps=0.04,
+            swing_v_ref_radps=-0.15,
+        )
+
+        payload = json.loads(encoder.encode(command))
+
+        self.assertEqual(payload["schema_version"], "stm32_velocity_command.v1")
+        self.assertEqual(payload["command_seq"], 42)
+        self.assertEqual(payload["command_source_stamp_ms"], 1234)
+        self.assertEqual(
+            [
+                payload["boom_mps"],
+                payload["stick_mps"],
+                payload["bucket_mps"],
+                payload["swing_radps"],
+            ],
+            [0.12, -0.08, 0.04, -0.15],
+        )
+
+    def test_relay_zero_mode_claim_continues_from_stm32_ack_sequence(self):
+        relay = orin.ActionRelay(
+            action_sock=self.receiver,
+            ser=self.serial,
+            allowed_action_host="127.0.0.1",
+            control_enabled=True,
+            estop=False,
+            poll_interval_s=0.005,
+        )
+        state = orin.Stm32State(
+            *(0 for _ in range(16)),
+            command_rx_seq=41,
+            command_received=True,
+        )
+        relay.synchronize_command_sequence(state)
+        relay.update_safety(sensor_valid=True, stm32_alive=True)
+        relay.start()
+        try:
+            self.sender.sendto(
+                action_packet(1, [0.01, 0.0, 0.0, 0.0]),
+                self.receiver.getsockname(),
+            )
+            deadline = time.monotonic() + 0.1
+            while len(self.serial.writes) < 2 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(stm32_command(self.serial.writes[0])["command_seq"], 42)
+            self.assertTrue(is_zero_command(self.serial.writes[0]))
+            self.assertEqual(stm32_command(self.serial.writes[1])["command_seq"], 43)
+        finally:
+            relay.close()
+
     def test_receives_action_without_waiting_for_another_state_frame(self):
         relay = orin.ActionRelay(
             action_sock=self.receiver,
@@ -89,7 +158,16 @@ class ActionRelayTest(unittest.TestCase):
             )
             self.assertTrue(self.serial.written.wait(0.08))
             self.assertLess(time.monotonic() - started, 0.08)
-            self.assertIn(b";0.00351;0;0;0\n", self.serial.writes[-1])
+            deadline = time.monotonic() + 0.08
+            while len(self.serial.writes) < 2 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertGreaterEqual(len(self.serial.writes), 2)
+            self.assertTrue(is_zero_command(self.serial.writes[-2]))
+            self.assertEqual(stm32_command(self.serial.writes[-2])["command_seq"], 0)
+            command = stm32_command(self.serial.writes[-1])
+            self.assertEqual(command["schema_version"], "stm32_velocity_command.v1")
+            self.assertEqual(command["command_seq"], 1)
+            self.assertEqual(command["boom_mps"], 0.00351)
         finally:
             relay.close()
 
@@ -153,7 +231,7 @@ class ActionRelayTest(unittest.TestCase):
             self.assertTrue(self.serial.written.wait(0.08))
             time.sleep(0.02)
             self.assertEqual(self.serial.writes, [self.serial.writes[0]])
-            self.assertTrue(self.serial.writes[0].endswith(b";0;0;0;0\n"))
+            self.assertTrue(is_zero_command(self.serial.writes[0]))
         finally:
             relay.close()
 
@@ -174,8 +252,10 @@ class ActionRelayTest(unittest.TestCase):
         try:
             self.assertTrue(self.serial.written.wait(0.08))
             time.sleep(0.02)
-            self.assertFalse(any(b";0.00351;" in item for item in self.serial.writes))
-            self.assertTrue(self.serial.writes[-1].endswith(b";0;0;0;0\n"))
+            self.assertFalse(
+                any(stm32_command(item)["boom_mps"] == 0.00351 for item in self.serial.writes)
+            )
+            self.assertTrue(is_zero_command(self.serial.writes[-1]))
         finally:
             relay.close()
 
@@ -197,11 +277,11 @@ class ActionRelayTest(unittest.TestCase):
             )
             self.assertTrue(self.serial.written.wait(0.08))
             deadline = time.monotonic() + 0.12
-            while time.monotonic() < deadline and not self.serial.writes[-1].endswith(
-                b";0;0;0;0\n"
+            while time.monotonic() < deadline and not is_zero_command(
+                self.serial.writes[-1]
             ):
                 time.sleep(0.005)
-            self.assertTrue(self.serial.writes[-1].endswith(b";0;0;0;0\n"))
+            self.assertTrue(is_zero_command(self.serial.writes[-1]))
         finally:
             relay.close()
 
@@ -224,11 +304,11 @@ class ActionRelayTest(unittest.TestCase):
             self.assertTrue(self.serial.written.wait(0.08))
             relay.update_safety(sensor_valid=False, stm32_alive=True)
             deadline = time.monotonic() + 0.08
-            while time.monotonic() < deadline and not self.serial.writes[-1].endswith(
-                b";0;0;0;0\n"
+            while time.monotonic() < deadline and not is_zero_command(
+                self.serial.writes[-1]
             ):
                 time.sleep(0.005)
-            self.assertTrue(self.serial.writes[-1].endswith(b";0;0;0;0\n"))
+            self.assertTrue(is_zero_command(self.serial.writes[-1]))
         finally:
             relay.close()
 
@@ -253,8 +333,10 @@ class ActionRelayTest(unittest.TestCase):
                 self.receiver.getsockname(),
             )
             self.assertTrue(self.serial.written.wait(0.08))
-            self.assertFalse(any(b";0.00351;" in item for item in self.serial.writes))
-            self.assertTrue(self.serial.writes[-1].endswith(b";0;0;0;0\n"))
+            self.assertFalse(
+                any(stm32_command(item)["boom_mps"] == 0.00351 for item in self.serial.writes)
+            )
+            self.assertTrue(is_zero_command(self.serial.writes[-1]))
         finally:
             relay.close()
 

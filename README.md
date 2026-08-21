@@ -32,6 +32,12 @@ The action array sent to STM32 contains physical velocity references:
 The compatibility protocol currently retains
 `action_type="normalized_velocity_command"`; the values must not be normalized again.
 
+The active unified STM32 wire command is newline-delimited JSON with
+`schema_version="stm32_velocity_command.v1"`. The Action Relay resumes the
+STM32 command sequence from `stm32_control_telemetry.v2` and sends a velocity
+zero before the first nonzero command, so changing from manual/ACT to RL does
+not require a firmware flash.
+
 ## Files
 
 - `orin_state_sender.py`: reads STM32 state, publishes `machine_state_v1`, validates action structure/timing/safety state and relays finite physical velocity commands to STM32 without magnitude checks.
@@ -50,9 +56,9 @@ copied from `AiryLidar/kinematics/waji_description/urdf/waji.urdf`.
 
 ## Current field RL Follow command
 
-The current field setup uses PC `192.168.0.220`, Orin `192.168.0.55`, STM32
-serial `/dev/ttyTHS1` and behavior RPC TCP `18083`. After STM32 Homing, start
-the Orin side first:
+The example field setup uses PC `192.168.0.220`, Orin `192.168.0.55`, STM32
+serial `/dev/ttyTHS1` at `460800` and behavior RPC TCP `18083`. After the
+explicit start-pose/preposition check, start the Orin side first:
 
 ```bash
 cd ~/workspace_/excavator-orin-runtime
@@ -109,7 +115,8 @@ python3 orin_state_sender.py \
   --print-every 100
 ```
 
-Only one `orin_state_sender.py` process may own `/dev/ttyTHS0`.
+Only one Runtime may own `/dev/ttyTHS1`. The defaults are `/dev/ttyTHS1` at
+`460800` baud, matching the unified `F407/data_celect` firmware.
 
 ## Edge deployment assets
 
@@ -357,6 +364,8 @@ relay maps values by the declared action names into the fixed STM32 field order;
 physical limits.
 
 Ctrl+C, scheduler lag, normal completion and Action Relay shutdown all lead to zero commands.
+进程管理器发送的 `SIGTERM` 会进入同一 `KeyboardInterrupt`/`finally` 清理路径，用于 RL→示教采集
+切换时先写终态零命令再释放 `/dev/ttyTHS1`。
 PC live actions and local CSV replay must not be enabled at the same time.
 
 ## Updating Orin
