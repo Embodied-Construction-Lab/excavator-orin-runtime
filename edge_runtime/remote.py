@@ -366,7 +366,12 @@ class EdgeBehaviorExecutor:
         action_stamp_clock: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
         sender_constructed: bool = False,
         state_timeout_s: float = 0.3,
+        resident_rl_authorized: Optional[Callable[[], bool]] = None,
     ) -> None:
+        if resident_rl_authorized is not None and not callable(
+            resident_rl_authorized
+        ):
+            raise ValueError("resident_rl_authorized must be callable")
         self._runtime_factory = runtime_factory
         self._runner_factory = runner_factory
         self._fixed_action_factory = fixed_action_factory
@@ -382,11 +387,22 @@ class EdgeBehaviorExecutor:
         self._last_action_datagrams = 0
         self._sender_constructed = bool(sender_constructed)
         self._state_timeout_s = _positive("state_timeout_s", state_timeout_s)
+        self._resident_rl_authorized = resident_rl_authorized
 
     @property
     def busy(self) -> bool:
         with self._lock:
             return self._active is not None
+
+    def run_when_idle(self, operation: Callable[[], Any]) -> Any:
+        """Atomically exclude new RL behaviors while another owner is claimed."""
+
+        if not callable(operation):
+            raise ValueError("operation must be callable")
+        with self._lock:
+            if self._active is not None:
+                raise RuntimeError("an RL behavior is active")
+            return operation()
 
     def start(
         self,
@@ -657,6 +673,14 @@ class EdgeBehaviorExecutor:
             active = self._active
             if active is None:
                 return
+            resident_gate_reason = self._resident_rl_gate_reason_locked()
+            if resident_gate_reason is not None:
+                self._finish(
+                    outcome="FAILED",
+                    reason_code="MOTION_GATE_CLOSED",
+                    message=resident_gate_reason,
+                )
+                return
             try:
                 step = active.runner.observe(
                     machine_state,
@@ -889,9 +913,32 @@ class EdgeBehaviorExecutor:
             return "control_disabled"
         if not self._sender_constructed:
             return "sender_unavailable"
+        resident_gate_reason = self._resident_rl_gate_reason_locked()
+        if resident_gate_reason is not None:
+            return resident_gate_reason
         if active is not None:
             return "behavior_active"
         return "ready"
+
+    def _resident_rl_gate_reason_locked(self) -> str | None:
+        """Require Mission-selected RL authority for resident behavior RPCs.
+
+        Legacy non-resident deployments omit the callback and keep their
+        existing local motion gate.  Resident deployments supply the current
+        core predicate, so a Follow/fixed-action runner cannot claim RL merely
+        because an external behavior request arrived while ACT owns motion.
+        """
+
+        authorized = self._resident_rl_authorized
+        if authorized is None:
+            return None
+        try:
+            is_authorized = authorized()
+        except Exception:
+            return "resident_rl_authorization_unavailable"
+        if is_authorized is not True:
+            return "resident_rl_not_active"
+        return None
 
     def _finish(
         self,

@@ -112,6 +112,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
         )
         self.assertEqual(config.audit_path, self.root / "logs" / "edge.jsonl")
         self.assertIsNone(config.follow_action_slew_rate_per_s)
+        self.assertEqual(config.action_transport, "loopback_udp")
 
     def test_control_mode_is_preserved_for_the_control_runner(self):
         config_path = self.root / "edge.json"
@@ -151,6 +152,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
                     "audit_path": "edge.jsonl",
                     "action_valid_for_ms": 300,
                     "follow_action_slew_rate_per_s": 2.0,
+                    "action_transport": "resident_sink",
                     "remote_behavior": {
                         "bind_host": "0.0.0.0",
                         "bind_port": 18083,
@@ -174,6 +176,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
         self.assertEqual(config.remote_behavior.bind_port, 18083)
         self.assertEqual(config.remote_behavior.status_hz, 5.0)
         self.assertEqual(config.follow_action_slew_rate_per_s, 2.0)
+        self.assertEqual(config.action_transport, "resident_sink")
 
     def test_follow_action_slew_rate_must_be_positive_when_configured(self):
         config_path = self.root / "edge.json"
@@ -196,6 +199,29 @@ class EdgeShadowObserverTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "follow_action_slew_rate_per_s"):
+            load_edge_runtime_config(config_path)
+
+    def test_action_transport_must_be_known_when_configured(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "control",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "onnx_path": "policy.onnx",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                    "action_transport": "shared_memory_magic",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "action_transport"):
             load_edge_runtime_config(config_path)
 
     def test_config_loads_one_authoritative_mission_path(self):

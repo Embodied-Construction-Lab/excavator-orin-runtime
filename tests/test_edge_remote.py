@@ -440,6 +440,173 @@ def safe_machine_state(*, seq=1):
 
 
 class EdgeBehaviorExecutorTest(unittest.TestCase):
+    def test_run_when_idle_serializes_resident_act_claim_with_behavior_start(self):
+        authorized = [True]
+        events = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=SimpleNamespace(create=lambda snapshot: object()),
+            runner_factory=lambda runtime: SimpleNamespace(
+                action_datagrams=0,
+                close=lambda **kwargs: None,
+            ),
+            wall_clock=lambda: 101.0,
+            monotonic_clock=lambda: 7.0,
+            sender_constructed=True,
+            resident_rl_authorized=lambda: authorized[0],
+        )
+        executor.observe(safe_machine_state())
+
+        def claim_act():
+            authorized[0] = False
+            return 17
+
+        self.assertEqual(executor.run_when_idle(claim_act), 17)
+        executor.start(start_request(), events.append)
+
+        self.assertEqual(events[-1]["type"], "rejected")
+        self.assertEqual(events[-1]["message"], "resident_rl_not_active")
+        self.assertFalse(executor.busy)
+
+    def test_run_when_idle_rejects_act_claim_during_active_rl_behavior(self):
+        calls = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=SimpleNamespace(create=lambda snapshot: object()),
+            runner_factory=lambda runtime: SimpleNamespace(
+                action_datagrams=0,
+                close=lambda **kwargs: None,
+            ),
+            wall_clock=lambda: 101.0,
+            monotonic_clock=lambda: 7.0,
+            sender_constructed=True,
+        )
+        executor.observe(safe_machine_state())
+        executor.start(start_request(), lambda _event: None)
+
+        with self.assertRaisesRegex(RuntimeError, "behavior is active"):
+            executor.run_when_idle(lambda: calls.append("act"))
+
+        self.assertEqual(calls, [])
+
+    def test_resident_mission_gate_rejects_follow_before_rl_activation(self):
+        created = []
+
+        class Factory:
+            def create(self, snapshot):
+                created.append(snapshot.trajectory_id)
+                return object()
+
+        events = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=Factory(),
+            runner_factory=lambda runtime: object(),
+            wall_clock=lambda: 101.0,
+            monotonic_clock=lambda: 7.0,
+            sender_constructed=True,
+            resident_rl_authorized=lambda: False,
+        )
+        executor.observe(safe_machine_state())
+
+        executor.start(start_request(), events.append)
+
+        self.assertEqual(events[-1]["type"], "rejected")
+        self.assertEqual(events[-1]["reason_code"], "MOTION_NOT_READY")
+        self.assertEqual(events[-1]["message"], "resident_rl_not_active")
+        self.assertEqual(created, [])
+        self.assertFalse(executor.busy)
+        self.assertEqual(
+            executor.status_event()["motion_gate_reason"],
+            "resident_rl_not_active",
+        )
+
+    def test_resident_mission_gate_rejects_fixed_action_before_rl_activation(self):
+        created = []
+
+        class FixedFactory:
+            profile = SimpleNamespace(validation_status="candidate")
+
+            def create(self, behavior):
+                created.append(behavior)
+                return object()
+
+        events = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=object(),
+            runner_factory=lambda runtime: object(),
+            fixed_action_factory=FixedFactory(),
+            fixed_runner_factory=lambda runtime, behavior: object(),
+            monotonic_clock=lambda: 7.0,
+            sender_constructed=True,
+            resident_rl_authorized=lambda: False,
+        )
+        executor.observe(safe_machine_state())
+
+        executor.handle(fixed_action_request(), events.append)
+
+        self.assertEqual(events[-1]["type"], "rejected")
+        self.assertEqual(events[-1]["reason_code"], "MOTION_NOT_READY")
+        self.assertEqual(events[-1]["message"], "resident_rl_not_active")
+        self.assertEqual(created, [])
+        self.assertFalse(executor.busy)
+
+    def test_resident_mission_gate_allows_follow_for_active_rl_generation(self):
+        events = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=SimpleNamespace(create=lambda snapshot: object()),
+            runner_factory=lambda runtime: SimpleNamespace(
+                action_datagrams=0,
+                close=lambda **kwargs: None,
+            ),
+            wall_clock=lambda: 101.0,
+            monotonic_clock=lambda: 7.0,
+            sender_constructed=True,
+            resident_rl_authorized=lambda: True,
+        )
+        executor.observe(safe_machine_state())
+
+        executor.start(start_request(), events.append)
+
+        self.assertEqual(events[-1]["type"], "accepted")
+        self.assertTrue(executor.busy)
+
+    def test_resident_mission_gate_stops_follow_before_observe_after_rl_revocation(self):
+        authorized = [True]
+        observed = []
+        closed = []
+
+        class Runner:
+            action_datagrams = 0
+
+            def observe(self, state, *, now_s, action_stamp_ms):
+                observed.append(state)
+                return follow_step()
+
+            def close(self, *, action_stamp_ms):
+                closed.append(action_stamp_ms)
+
+        events = []
+        executor = EdgeBehaviorExecutor(
+            runtime_factory=SimpleNamespace(create=lambda snapshot: object()),
+            runner_factory=lambda runtime: Runner(),
+            wall_clock=lambda: 101.0,
+            monotonic_clock=lambda: 7.0,
+            action_stamp_clock=lambda: 101000,
+            sender_constructed=True,
+            resident_rl_authorized=lambda: authorized[0],
+        )
+        executor.observe(safe_machine_state())
+        executor.start(start_request(), events.append)
+        authorized[0] = False
+
+        executor.observe(safe_machine_state(seq=2))
+
+        self.assertEqual(observed, [])
+        self.assertEqual(closed, [101000])
+        self.assertEqual(events[-1]["type"], "result")
+        self.assertEqual(events[-1]["outcome"], "FAILED")
+        self.assertEqual(events[-1]["reason_code"], "MOTION_GATE_CLOSED")
+        self.assertEqual(events[-1]["message"], "resident_rl_not_active")
+        self.assertFalse(executor.busy)
+
     def test_status_reflects_latest_machine_safety_while_idle(self):
         executor = EdgeBehaviorExecutor(
             runtime_factory=object(),

@@ -32,6 +32,7 @@ class RemoteBehaviorConfig:
 @dataclass(frozen=True)
 class EdgeRuntimeConfig:
     mode: str
+    action_transport: str
     machine_profile_path: Path
     urdf_path: Path
     onnx_path: Path
@@ -53,6 +54,7 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
     common = {
         "schema_version",
         "mode",
+        "action_transport",
         "machine_profile_path",
         "urdf_path",
         "onnx_path",
@@ -70,6 +72,19 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
     if value["schema_version"] != "orin_edge_runtime.v1":
         raise ValueError("edge shadow schema_version is invalid")
     mode = value["mode"]
+    if mode in ("shadow", "control", "remote_control"):
+        required = common | (
+            {"trajectory_path"}
+            if mode in ("shadow", "control")
+            else {"remote_behavior", "fixed_action_profile_path"}
+        )
+        legacy_required = required - {"action_transport"}
+        if set(value) == legacy_required or set(value) == legacy_required | optional:
+            value = dict(value)
+            value["action_transport"] = "loopback_udp"
+    action_transport = value.get("action_transport")
+    if action_transport not in {"loopback_udp", "resident_sink"}:
+        raise ValueError("edge action_transport must be loopback_udp or resident_sink")
     if mode in ("shadow", "control"):
         required = common | {"trajectory_path"}
         if not required <= set(value) <= required | optional:
@@ -110,6 +125,7 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
     root = config_path.parent
     return EdgeRuntimeConfig(
         mode=mode,
+        action_transport=action_transport,
         machine_profile_path=_relative_path(root, value["machine_profile_path"]),
         urdf_path=_relative_path(root, value["urdf_path"]),
         onnx_path=_relative_path(root, value["onnx_path"]),
