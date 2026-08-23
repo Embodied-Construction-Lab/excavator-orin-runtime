@@ -33,6 +33,7 @@ _PASSIVE_REJECTION_REASONS = frozenset(
 HANDOFF_SAMPLE_SCHEMA_VERSION = "resident_handoff_sample.v1"
 HANDOFF_SAMPLE_LOG_PREFIX = "RESIDENT_HANDOFF_SAMPLE "
 _HANDOFF_LOGGER = logging.getLogger("edge_runtime.resident_handoff")
+_IDLE_ZERO_KEEPALIVE_NS = 100_000_000
 
 
 class SerialWriter(Protocol):
@@ -205,6 +206,7 @@ class ResidentCommandSink:
         self._candidate_lease: _CandidateLease | None = None
         self._handoff_measurement: _HandoffMeasurement | None = None
         self._pending_first_nonzero_ack: _PendingFirstNonzeroAck | None = None
+        self._last_command_write_ns: int | None = None
         self._synchronized = False
         self._unsafe_zero_latched = False
         self._terminally_disarmed = False
@@ -584,6 +586,20 @@ class ResidentCommandSink:
                 now_monotonic_ns=now,
                 expected_mode=snapshot.active_binding.mode,
             ):
+                last_write = self._last_command_write_ns
+                if (
+                    lease is None
+                    and self._pending_first_nonzero_ack is None
+                    and last_write is not None
+                    and now - last_write >= _IDLE_ZERO_KEEPALIVE_NS
+                ):
+                    return self._write_locked(
+                        mode=snapshot.active_binding.mode,
+                        action=ZERO_ACTION,
+                        monotonic_ns=now,
+                        reason="active_policy_idle_keepalive",
+                        accepted=False,
+                    )
                 return None
             return self._revoke_for_safety_locked(
                 now,
@@ -815,6 +831,7 @@ class ResidentCommandSink:
             if written != len(payload):
                 raise OSError(f"short serial write: {written}/{len(payload)} bytes")
             self._serial.flush()
+            self._last_command_write_ns = monotonic_ns
         except Exception as exc:
             self._cancel_handoff_measurement_locked()
             self._terminal_error = f"{type(exc).__name__}: {exc}"

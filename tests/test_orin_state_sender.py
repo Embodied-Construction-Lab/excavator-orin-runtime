@@ -553,6 +553,7 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
                 "wait_for_resident_terminal_zero_ack",
                 return_value=True,
             ) as wait_for_terminal_ack,
+            mock.patch.object(orin.LOGGER, "info") as logger_info,
             mock.patch.object(orin.signal, "signal"),
         ):
             orin.main()
@@ -573,6 +574,15 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
             "notify_act_worker_disconnected",
         )
         control_server_factory.assert_called_once()
+        info_formats = [call.args[0] for call in logger_info.call_args_list]
+        self.assertIn(
+            "RESIDENT_CONTROL_READY control_socket=%s act_socket=%s",
+            info_formats,
+        )
+        self.assertIn(
+            "RESIDENT_HARDWARE_READY sensor_valid=True",
+            info_formats,
+        )
         idle_probe = control_server_factory.call_args.kwargs["rl_behavior_idle"]
         self.assertTrue(idle_probe())
         atomic_gate = control_server_factory.call_args.kwargs[

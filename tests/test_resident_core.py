@@ -170,8 +170,12 @@ class ResidentMotionCoreTest(unittest.TestCase):
         )
 
         writes_before_expiry = len(self.serial.writes)
-        self.assertIsNone(self.core.tick(now_monotonic_ns=2_529_999_999))
-        self.assertEqual(len(self.serial.writes), writes_before_expiry)
+        keepalive = self.core.tick(now_monotonic_ns=2_529_999_999)
+        self.assertIsNotNone(keepalive)
+        assert keepalive is not None
+        self.assertEqual(keepalive.reason, "active_policy_idle_keepalive")
+        self.assertEqual(keepalive.effective_action, ZERO_ACTION)
+        self.assertEqual(len(self.serial.writes), writes_before_expiry + 1)
 
         expired = self.core.tick(now_monotonic_ns=2_530_000_000)
 
@@ -217,8 +221,11 @@ class ResidentMotionCoreTest(unittest.TestCase):
 
         result = self.core.tick(now_monotonic_ns=1_100_000_000)
 
-        self.assertIsNone(result)
-        self.assertEqual(len(self.serial.writes), writes_before_tick)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.reason, "active_policy_idle_keepalive")
+        self.assertEqual(result.effective_action, ZERO_ACTION)
+        self.assertEqual(len(self.serial.writes), writes_before_tick + 1)
         self.assertTrue(self.core.is_operational)
         self.assertFalse(self.core.mission_lease_is_active)
 

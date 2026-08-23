@@ -1518,6 +1518,7 @@ def main() -> None:
     resident_data_link = None
     resident_control_server = None
     resident_initialized = False
+    resident_hardware_ready_logged = False
     behavior_executor = None
     if resident_action_transport:
         resident_motion_core = ResidentMotionCore(
@@ -1701,6 +1702,12 @@ def main() -> None:
             resident_data_link.start()
         if resident_control_server is not None:
             resident_control_server.start()
+        if resident_action_transport:
+            LOGGER.info(
+                "RESIDENT_CONTROL_READY control_socket=%s act_socket=%s",
+                args.resident_control_socket,
+                args.resident_act_socket,
+            )
         while True:
             if resident_owner_tick_requests_exit(
                 resident_motion_core,
@@ -1796,6 +1803,9 @@ def main() -> None:
                     resident_initialized = True
                 else:
                     resident_motion_core.observe_telemetry(resident_frame)
+                if sensor_valid and not resident_hardware_ready_logged:
+                    LOGGER.info("RESIDENT_HARDWARE_READY sensor_valid=True")
+                    resident_hardware_ready_logged = True
                 publish_resident_act_state_if_active(
                     state=state,
                     receive_monotonic_ns=receive_monotonic_ns,

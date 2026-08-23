@@ -166,6 +166,28 @@ class ResidentCommandSinkTest(unittest.TestCase):
         self.assertEqual(self.packets()[-1]["X1"], -0.4)
         self.assertEqual(self.packets()[-1]["Y2"], 0.1)
 
+    def test_active_policy_without_a_candidate_refreshes_the_safe_zero(self) -> None:
+        generation = self.activate(self.rl)
+        writes_after_activation = len(self.serial.writes)
+
+        before_interval = self.sink.tick(now_monotonic_ns=1_090_000_000)
+        self.assertIsNone(before_interval)
+        self.assertEqual(len(self.serial.writes), writes_after_activation)
+
+        keepalive = self.sink.tick(now_monotonic_ns=1_100_000_000)
+        self.assertIsNotNone(keepalive)
+        assert keepalive is not None
+        self.assertTrue(keepalive.write_performed)
+        self.assertFalse(keepalive.accepted)
+        self.assertEqual(keepalive.reason, "active_policy_idle_keepalive")
+        self.assertEqual(keepalive.effective_action, ZERO_ACTION)
+        self.assertEqual(
+            self.packets()[-1]["schema_version"],
+            "stm32_velocity_command.v1",
+        )
+        self.assertEqual(self.sink.snapshot().generation, generation)
+        self.assertEqual(self.sink.snapshot().active_binding, self.rl)
+
     def test_rl_to_act_uses_two_acknowledged_zeros_with_one_sequence(self) -> None:
         self.activate(self.rl)
         generation = self.sink.request_handoff(
