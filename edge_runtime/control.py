@@ -16,6 +16,21 @@ from .fixed_actions import FixedActionRuntime, FixedActionRuntimeStep
 LOGGER = logging.getLogger("orin_edge_control")
 
 
+def _runtime_trajectory_controller_backend(runtime: Any) -> str:
+    direct = getattr(runtime, "trajectory_controller_backend", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    # EdgeControlRunner and EdgeFollowRuntime are one package-owned boundary;
+    # inspect the configured controller before the first step so a rejected
+    # first state still records which experiment backend was active.
+    controller = getattr(runtime, "_controller", None)
+    descriptor = getattr(controller, "descriptor", None)
+    backend = getattr(descriptor, "backend_id", None)
+    if isinstance(backend, str) and backend.strip():
+        return backend
+    return "unknown"
+
+
 class ActionSink(Protocol):
     def send(self, payload: bytes) -> object:
         ...
@@ -67,6 +82,9 @@ class EdgeControlRunner:
         self._action_sequence = action_sequence or ActionSequence()
         self._action_datagrams = 0
         self._consecutive_rejections = 0
+        self._trajectory_controller_backend = (
+            _runtime_trajectory_controller_backend(runtime)
+        )
         self._resident_activation_started = False
         self._retain_action_authority = retain_action_authority
 
@@ -97,6 +115,9 @@ class EdgeControlRunner:
                     "source_stamp_ms": machine_state.get("stamp_ms"),
                     "reason": str(exc),
                     "exception_type": type(exc).__name__,
+                    "trajectory_controller_backend": (
+                        self._trajectory_controller_backend
+                    ),
                     "consecutive_rejections": self._consecutive_rejections,
                     "runtime_monotonic_s": float(now_s),
                     "loop_elapsed_ms": loop_elapsed_ms,
@@ -110,6 +131,13 @@ class EdgeControlRunner:
             return None
 
         self._consecutive_rejections = 0
+        step_backend = getattr(
+            step,
+            "trajectory_controller_backend",
+            self._trajectory_controller_backend,
+        )
+        if isinstance(step_backend, str) and step_backend.strip():
+            self._trajectory_controller_backend = step_backend
         loop_elapsed_ms = (time.perf_counter() - started) * 1000.0
         result_status = getattr(
             step,
@@ -144,6 +172,7 @@ class EdgeControlRunner:
                 "tracking_timeout_s": getattr(step, "tracking_timeout_s", None),
                 "waypoint_tolerance_m": getattr(step, "waypoint_tolerance_m", None),
                 "inference_ms": getattr(step, "inference_ms", None),
+                "trajectory_controller_backend": self._trajectory_controller_backend,
                 "consecutive_rejections": self._consecutive_rejections,
                 "runtime_monotonic_s": float(now_s),
                 "loop_elapsed_ms": loop_elapsed_ms,

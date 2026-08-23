@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from .actions import (
     physical_velocity_from_normalized,
@@ -19,11 +19,10 @@ from .observation import (
     waypoint_values_to_unity,
 )
 from .trajectory import MissionFollowLimits, TrajectorySnapshot, WaypointTracker
-
-
-class Policy(Protocol):
-    def run(self, observation: Sequence[float]) -> Sequence[float]:
-        ...
+from .trajectory_controller import (
+    OnnxRlTrajectoryControllerAdapter,
+    TrajectoryController,
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +49,7 @@ class EdgeFollowStep:
         float,
         float,
     ] = (0.0, 0.0, 0.0, 0.0)
+    trajectory_controller_backend: str = "unknown"
 
 
 class EdgeFollowRuntime:
@@ -60,7 +60,8 @@ class EdgeFollowRuntime:
         *,
         machine_profile: Mapping[str, Any],
         kinematics: UrdfBucketTipKinematics,
-        policy: Policy,
+        policy: Any = None,
+        controller: Optional[TrajectoryController] = None,
         trajectory: Mapping[str, Any],
         mission: Mapping[str, Any],
         action_slew_rate_per_s: Optional[float] = None,
@@ -71,7 +72,14 @@ class EdgeFollowRuntime:
             raise ValueError("deployed URDF root must be fk_root")
         self._machine_profile = machine_profile
         self._kinematics = kinematics
-        self._policy = policy
+        if (policy is None) == (controller is None):
+            raise ValueError("exactly one trajectory controller or legacy policy is required")
+        self._controller = (
+            controller
+            if controller is not None
+            else OnnxRlTrajectoryControllerAdapter(policy)
+        )
+        self._controller.reset()
         if action_slew_rate_per_s is not None:
             rate = float(action_slew_rate_per_s)
             if not math.isfinite(rate) or rate <= 0.0:
@@ -173,11 +181,8 @@ class EdgeFollowRuntime:
             episode_progress=episode_progress,
         )
         if self._terminal_result is None:
-            normalized = tuple(float(value) for value in self._policy.run(observation))
-            if len(normalized) != 4 or not all(
-                math.isfinite(value) for value in normalized
-            ):
-                raise ValueError("policy output must contain four finite values")
+            controller_output = self._controller.compute_action(observation)
+            normalized = controller_output.normalized_action
             if self._action_slew_rate_per_s is None:
                 commanded_normalized = normalized
             else:
@@ -196,9 +201,7 @@ class EdgeFollowRuntime:
                 commanded_normalized,
                 self._machine_profile,
             )
-            inference_ms = float(getattr(self._policy, "last_inference_ms", 0.0))
-            if not math.isfinite(inference_ms) or inference_ms < 0.0:
-                raise ValueError("policy inference_ms must be nonnegative and finite")
+            inference_ms = controller_output.inference_ms
             result_status = "ACTIVE"
         else:
             normalized = (0.0, 0.0, 0.0, 0.0)
@@ -224,6 +227,7 @@ class EdgeFollowRuntime:
             inference_ms=inference_ms,
             result=result_status,
             commanded_normalized_action=commanded_normalized,
+            trajectory_controller_backend=self._controller.descriptor.backend_id,
         )
         self._previous_tip = tip
         if result_status == "ACTIVE":

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -5,8 +6,20 @@ from pathlib import Path
 
 import orin_state_sender
 
-from edge_runtime.follow import EdgeFollowStep
-from edge_runtime.shadow import EdgeShadowObserver, load_edge_runtime_config
+from edge_runtime.follow import EdgeFollowRuntime, EdgeFollowStep
+from edge_runtime.kinematics import UrdfBucketTipKinematics
+from edge_runtime.shadow import (
+    EdgeShadowObserver,
+    build_edge_shadow_observer,
+    load_edge_runtime_config,
+)
+from edge_runtime.trajectory_controller import (
+    TrajectoryControlOutput,
+    TrajectoryControllerDescriptor,
+)
+from tests.test_edge_follow_runtime import machine_profile, machine_state
+from tests.test_edge_kinematics import URDF
+from tests.test_edge_trajectory import mission, trajectory
 
 
 class StubRuntime:
@@ -84,6 +97,50 @@ class EdgeShadowObserverTest(unittest.TestCase):
         self.assertEqual(record["exception_type"], "ValueError")
         self.assertEqual(record["consecutive_rejections"], 1)
 
+    def test_first_rejection_audits_the_configured_runtime_backend(self):
+        class Controller:
+            descriptor = TrajectoryControllerDescriptor(
+                backend_id="cartesian_p",
+                implementation="test.Controller",
+            )
+
+            def reset(self):
+                return None
+
+            def compute_action(self, _observation):
+                return TrajectoryControlOutput(
+                    normalized_action=(0.0, 0.0, 0.0, 0.0),
+                    inference_ms=0.0,
+                )
+
+        urdf_path = self.root / "machine.urdf"
+        urdf_path.write_text(URDF, encoding="utf-8")
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=UrdfBucketTipKinematics.from_path(urdf_path),
+            controller=Controller(),
+            trajectory=trajectory(),
+            mission=mission(),
+        )
+        audit_path = self.root / "edge.jsonl"
+        observer = EdgeShadowObserver(
+            runtime=runtime,
+            audit_path=audit_path,
+        )
+        self.addCleanup(observer.close)
+
+        result = observer.observe(
+            {"seq": 1, "stamp_ms": 1_000},
+            now_s=1.0,
+        )
+
+        self.assertIsNone(result)
+        record = json.loads(audit_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["trajectory_controller_backend"],
+            "cartesian_p",
+        )
+
     def test_config_paths_are_resolved_relative_to_config_file(self):
         config_path = self.root / "deploy" / "edge_shadow.json"
         config_path.parent.mkdir()
@@ -95,6 +152,7 @@ class EdgeShadowObserverTest(unittest.TestCase):
                     "machine_profile_path": "machine_profile.json",
                     "urdf_path": "waji.urdf",
                     "onnx_path": "policy.onnx",
+                    "trajectory_controller_backend": "onnx_rl",
                     "trajectory_path": "trajectory.json",
                     "mission_path": "excavation_cycle.json",
                     "audit_path": "../logs/edge.jsonl",
@@ -113,6 +171,171 @@ class EdgeShadowObserverTest(unittest.TestCase):
         self.assertEqual(config.audit_path, self.root / "logs" / "edge.jsonl")
         self.assertIsNone(config.follow_action_slew_rate_per_s)
         self.assertEqual(config.action_transport, "loopback_udp")
+        self.assertEqual(config.trajectory_controller_backend, "onnx_rl")
+
+    def test_legacy_config_defaults_to_onnx_rl_controller(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "shadow",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "onnx_path": "policy.onnx",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_edge_runtime_config(config_path)
+
+        self.assertEqual(config.trajectory_controller_backend, "onnx_rl")
+
+    def test_unknown_trajectory_controller_backend_is_rejected(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "shadow",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "onnx_path": "policy.onnx",
+                    "trajectory_controller_backend": "rl_typo",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "trajectory_controller_backend"):
+            load_edge_runtime_config(config_path)
+
+    def test_invalid_mode_is_reported_before_backend_specific_fields(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "bogus",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "edge runtime mode"):
+            load_edge_runtime_config(config_path)
+
+    def test_classical_trajectory_controller_backend_is_explicitly_selectable(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "shadow",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "trajectory_controller_backend": "cartesian_p",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_edge_runtime_config(config_path)
+
+        self.assertEqual(config.trajectory_controller_backend, "cartesian_p")
+        self.assertIsNone(config.onnx_path)
+
+    def test_cartesian_p_shadow_builds_and_runs_without_an_onnx_artifact(self):
+        mission_value = mission()
+        mission_bytes = json.dumps(
+            mission_value,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        trajectory_value = trajectory()
+        trajectory_value["mission"] = {
+            **trajectory_value["mission"],
+            "sha256": hashlib.sha256(mission_bytes).hexdigest(),
+        }
+        paths = {
+            "machine_profile.json": machine_profile(),
+            "trajectory.json": trajectory_value,
+        }
+        for name, value in paths.items():
+            (self.root / name).write_text(
+                json.dumps(value),
+                encoding="utf-8",
+            )
+        (self.root / "mission.json").write_bytes(mission_bytes)
+        (self.root / "machine.urdf").write_text(URDF, encoding="utf-8")
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "shadow",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "machine.urdf",
+                    "trajectory_controller_backend": "cartesian_p",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "mission.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        observer = build_edge_shadow_observer(config_path)
+        self.addCleanup(observer.close)
+        step = observer.observe(
+            machine_state(sequence=1, stamp_ms=1_000),
+            now_s=1.0,
+        )
+
+        self.assertIsNotNone(step)
+        self.assertEqual(step.trajectory_controller_backend, "cartesian_p")
+        record = json.loads((self.root / "edge.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual(record["trajectory_controller_backend"], "cartesian_p")
+
+    def test_onnx_trajectory_controller_still_requires_model_path(self):
+        config_path = self.root / "edge.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "orin_edge_runtime.v1",
+                    "mode": "shadow",
+                    "machine_profile_path": "machine_profile.json",
+                    "urdf_path": "waji.urdf",
+                    "trajectory_controller_backend": "onnx_rl",
+                    "trajectory_path": "trajectory.json",
+                    "mission_path": "excavation_cycle.json",
+                    "audit_path": "edge.jsonl",
+                    "action_valid_for_ms": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "onnx_path"):
+            load_edge_runtime_config(config_path)
 
     def test_control_mode_is_preserved_for_the_control_runner(self):
         config_path = self.root / "edge.json"

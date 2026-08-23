@@ -166,6 +166,28 @@ The trajectory snapshot must use `frame_id=machine_root_ros`. The URDF FK root
 is `fk_root`; the current deployed frame adapter is the explicit identity
 `machine_root_ros -> fk_root`.
 
+`trajectory_controller_backend` is the strict algorithm-selection seam. Keep
+the active field configuration explicit as `onnx_rl`. `cartesian_p` is a
+deterministic reference controller for controlled ablation experiments; it
+shares the same 38D input and normalized `[boom, stick, bucket, swing]` output
+contract, but it is not field-qualified merely by selecting the name. Shadow
+mode may select `cartesian_p` without motion authorization. In `control` or
+`remote_control`, it additionally requires this independent exact launch opt-in:
+
+```bash
+--trajectory-controller-commissioning-authorization \
+  ALLOW_CARTESIAN_P_MACHINE_MOTION
+```
+
+This literal is an auditable commissioning acknowledgement, not a secret. It
+does not replace `--control-enabled` or `--edge-motion-authorization`; a missing
+or incorrect value is rejected before controller construction or serial
+ownership. The `onnx_rl` launch contract is unchanged. Legacy configs without
+the backend field continue to mean `onnx_rl`; unknown names fail at
+configuration load. `onnx_path` is mandatory for `onnx_rl` and may be omitted
+for `cartesian_p`, so the classical ablation does not depend on an unrelated
+model artifact.
+
 The execution waypoint tolerance and Follow deadline have one authoritative
 source:
 

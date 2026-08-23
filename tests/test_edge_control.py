@@ -12,13 +12,22 @@ import orin_state_sender
 
 from edge_runtime import control
 from edge_runtime.control import EdgeControlRunner, FixedActionControlRunner
-from edge_runtime.follow import EdgeFollowStep
+from edge_runtime.follow import EdgeFollowRuntime, EdgeFollowStep
+from edge_runtime.kinematics import UrdfBucketTipKinematics
 from edge_runtime.resident_ingress import ResidentVelocityActionAdapter
 from edge_runtime.resident_motion import ControlMode, ZERO_ACTION
 from edge_runtime.resident_sink import ResidentCommandSink, ResidentTelemetry
+from edge_runtime.trajectory_controller import (
+    TrajectoryControlOutput,
+    TrajectoryControllerDescriptor,
+)
+from tests.test_edge_follow_runtime import machine_profile, mission, trajectory
+from tests.test_edge_kinematics import URDF
 
 
 class StubRuntime:
+    trajectory_controller_backend = "test_controller"
+
     def __init__(self, *, completed=False, failure=None):
         self.completed = completed
         self.failure = failure
@@ -37,6 +46,7 @@ class StubRuntime:
             normalized_action=(0.1, -0.2, 0.3, -0.4),
             physical_action=(0.01, -0.02, 0.03, -0.04),
             commanded_normalized_action=(0.08, -0.16, 0.24, -0.32),
+            trajectory_controller_backend="test_controller",
         )
 
 
@@ -129,6 +139,10 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertEqual(
             record["commanded_normalized_action"],
             [0.08, -0.16, 0.24, -0.32],
+        )
+        self.assertEqual(
+            record["trajectory_controller_backend"],
+            "test_controller",
         )
         runner.close(action_stamp_ms=5001)
         self.assertEqual(runner.action_datagrams, 2)
@@ -271,6 +285,57 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertEqual(
             [packet["action"] for packet in sink.payloads],
             [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+        )
+        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["trajectory_controller_backend"],
+            "test_controller",
+        )
+
+    def test_first_rejection_audits_the_configured_runtime_backend(self):
+        class Controller:
+            descriptor = TrajectoryControllerDescriptor(
+                backend_id="cartesian_p",
+                implementation="test.Controller",
+            )
+
+            def reset(self):
+                return None
+
+            def compute_action(self, _observation):
+                return TrajectoryControlOutput(
+                    normalized_action=(0.0, 0.0, 0.0, 0.0),
+                    inference_ms=0.0,
+                )
+
+        urdf_path = Path(self.temp_dir.name) / "machine.urdf"
+        urdf_path.write_text(URDF, encoding="utf-8")
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=UrdfBucketTipKinematics.from_path(urdf_path),
+            controller=Controller(),
+            trajectory=trajectory(),
+            mission=mission(),
+        )
+        runner = EdgeControlRunner(
+            runtime=runtime,
+            action_sink=RecordingSink(),
+            audit_path=self.audit_path,
+            valid_for_ms=300,
+        )
+
+        result = runner.observe(
+            {"seq": 1, "stamp_ms": 1_000},
+            now_s=1.0,
+            action_stamp_ms=1_000,
+        )
+        runner.close(action_stamp_ms=1_001)
+
+        self.assertIsNone(result)
+        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["trajectory_controller_backend"],
+            "cartesian_p",
         )
 
     def test_timeout_result_sends_zero_and_never_reuses_nonzero_action(self):

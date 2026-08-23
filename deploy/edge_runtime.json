@@ -4,6 +4,7 @@
   "machine_profile_path": "assets/machine_profile.json",
   "urdf_path": "assets/waji.urdf",
   "onnx_path": "assets/policy.onnx",
+  "trajectory_controller_backend": "onnx_rl",
   "trajectory_path": "assets/trajectory_command.json",
   "mission_path": "assets/excavation_cycle.json",
   "audit_path": "logs/edge_runtime.jsonl",

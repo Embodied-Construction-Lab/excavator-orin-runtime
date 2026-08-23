@@ -1,10 +1,15 @@
 import io
 import json
 import socket
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
+
+from edge_runtime.trajectory_controller import TrajectoryControllerDescriptor
 
 from edge_runtime.follow import EdgeFollowStep
 from edge_runtime.remote_transport import ConnectionEventStream
@@ -259,6 +264,206 @@ class FollowTrajectorySnapshotTest(unittest.TestCase):
 
 
 class EdgeFollowRuntimeFactoryTest(unittest.TestCase):
+    def test_from_config_honors_legacy_remote_onnx_policy_patch(self):
+        profile = {
+            "machine_id": "scale_excavator_v1",
+            "observation_schema": {
+                "normalizers": {
+                    "target_threshold": 0.03,
+                    "tube_radius": 0.04,
+                }
+            },
+        }
+        mission = {
+            "schema_version": "excavation_mission.v1",
+            "mission_id": "mission-1",
+            "frame_id": "machine_root_ros",
+            "limits": {
+                "waypoint_tolerance_m": 0.25,
+                "waypoint_dwell_s": 0.0,
+                "tracking_timeout_s": 60.0,
+            },
+        }
+        loaded_paths = []
+
+        class PatchedOnnxPolicy:
+            def __init__(self, path):
+                loaded_paths.append(path)
+
+            def run(self, _observation):
+                return (0.0, 0.0, 0.0, 0.0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "machine_profile.json"
+            mission_path = root / "mission.json"
+            onnx_path = root / "policy.onnx"
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+            mission_path.write_text(json.dumps(mission), encoding="utf-8")
+            config = SimpleNamespace(
+                machine_profile_path=profile_path,
+                mission_path=mission_path,
+                urdf_path=root / "machine.urdf",
+                trajectory_controller_backend="onnx_rl",
+                onnx_path=onnx_path,
+                follow_action_slew_rate_per_s=None,
+            )
+            with (
+                mock.patch(
+                    "edge_runtime.remote.UrdfBucketTipKinematics.from_path",
+                    return_value=SimpleNamespace(root_link="fk_root"),
+                ),
+                mock.patch(
+                    "edge_runtime.remote.OnnxPolicy",
+                    PatchedOnnxPolicy,
+                ),
+            ):
+                factory = EdgeFollowRuntimeFactory.from_config(config)
+                first = factory._controller_builder()
+                second = factory._controller_builder()
+
+        self.assertEqual(loaded_paths, [onnx_path])
+        self.assertIsNot(first, second)
+        self.assertEqual(first.descriptor.backend_id, "onnx_rl")
+        self.assertEqual(second.descriptor.backend_id, "onnx_rl")
+
+    def test_from_config_uses_one_preloaded_builder_for_fresh_controllers(self):
+        profile = {
+            "machine_id": "scale_excavator_v1",
+            "observation_schema": {
+                "normalizers": {
+                    "target_threshold": 0.03,
+                    "tube_radius": 0.04,
+                }
+            },
+        }
+        mission = {
+            "schema_version": "excavation_mission.v1",
+            "mission_id": "mission-1",
+            "frame_id": "machine_root_ros",
+            "limits": {
+                "waypoint_tolerance_m": 0.25,
+                "waypoint_dwell_s": 0.0,
+                "tracking_timeout_s": 60.0,
+            },
+        }
+        controllers = []
+
+        class Controller:
+            descriptor = TrajectoryControllerDescriptor(
+                backend_id="cartesian_p",
+                implementation="test.Controller",
+            )
+
+            def __init__(self):
+                self.reset_count = 0
+                controllers.append(self)
+
+            def reset(self):
+                self.reset_count += 1
+
+        def build_controller():
+            return Controller()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "machine_profile.json"
+            mission_path = root / "mission.json"
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+            mission_path.write_text(json.dumps(mission), encoding="utf-8")
+            config = SimpleNamespace(
+                machine_profile_path=profile_path,
+                mission_path=mission_path,
+                urdf_path=root / "machine.urdf",
+                trajectory_controller_backend="cartesian_p",
+                onnx_path=None,
+                follow_action_slew_rate_per_s=None,
+            )
+            with (
+                mock.patch(
+                    "edge_runtime.remote.UrdfBucketTipKinematics.from_path",
+                    return_value=SimpleNamespace(root_link="fk_root"),
+                ),
+                mock.patch(
+                    "edge_runtime.remote.build_trajectory_controller_builder",
+                    return_value=build_controller,
+                ) as build_deployment,
+            ):
+                factory = EdgeFollowRuntimeFactory.from_config(config)
+                snapshot = FollowTrajectorySnapshot.from_mapping(
+                    trajectory_snapshot(),
+                    now_s=101.0,
+                )
+                factory.create(snapshot)
+                factory.create(snapshot)
+
+        build_deployment.assert_called_once_with(
+            "cartesian_p",
+            onnx_path=None,
+        )
+        self.assertEqual(len(controllers), 2)
+        self.assertIsNot(controllers[0], controllers[1])
+        self.assertEqual([item.reset_count for item in controllers], [1, 1])
+
+    def test_controller_builder_creates_a_fresh_controller_for_each_behavior(self):
+        controller_instances = []
+        runtime_arguments = []
+
+        def build_controller():
+            controller = object()
+            controller_instances.append(controller)
+            return controller
+
+        class RecordingRuntime:
+            def __init__(self, **kwargs):
+                runtime_arguments.append(kwargs)
+
+        profile = {
+            "machine_id": "scale_excavator_v1",
+            "observation_schema": {
+                "normalizers": {
+                    "target_threshold": 0.03,
+                    "tube_radius": 0.04,
+                }
+            },
+        }
+        mission = {
+            "schema_version": "excavation_mission.v1",
+            "mission_id": "mission-1",
+            "frame_id": "machine_root_ros",
+            "limits": {
+                "waypoint_tolerance_m": 0.25,
+                "waypoint_dwell_s": 0.0,
+                "tracking_timeout_s": 60.0,
+            },
+        }
+        factory = EdgeFollowRuntimeFactory(
+            machine_profile=profile,
+            kinematics=object(),
+            controller_builder=build_controller,
+            controller_backend="cartesian_p",
+            mission=mission,
+            mission_sha256="a" * 64,
+            runtime_type=RecordingRuntime,
+        )
+        snapshot = FollowTrajectorySnapshot.from_mapping(
+            trajectory_snapshot(),
+            now_s=101.0,
+        )
+
+        factory.create(snapshot)
+        factory.create(snapshot)
+
+        self.assertEqual(len(controller_instances), 2)
+        self.assertIsNot(controller_instances[0], controller_instances[1])
+        self.assertIs(
+            runtime_arguments[0]["controller"], controller_instances[0]
+        )
+        self.assertIs(
+            runtime_arguments[1]["controller"], controller_instances[1]
+        )
+        self.assertEqual(factory.trajectory_controller_backend, "cartesian_p")
+
     def test_builds_each_runtime_from_preloaded_assets_and_profile_normalizers(self):
         calls = []
 
@@ -423,6 +628,7 @@ def follow_step(*, result="ACTIVE"):
         waypoint_distance_m=0.12,
         follow_elapsed_s=2.5,
         result=result,
+        trajectory_controller_backend="test_controller",
     )
 
 
@@ -696,11 +902,19 @@ class EdgeBehaviorExecutorTest(unittest.TestCase):
         self.assertEqual(feedback["bucket_tip"], [0.11, 0.22, 0.33])
         self.assertEqual(feedback["tracking_state"], "ACTIVE")
         self.assertEqual(feedback["action_datagrams"], 3)
+        self.assertEqual(
+            feedback["trajectory_controller_backend"],
+            "test_controller",
+        )
         result = events[3]
         self.assertEqual(result["type"], "result")
         self.assertEqual(result["outcome"], "SUCCEEDED")
         self.assertTrue(result["quiescence_confirmed"])
         self.assertEqual(result["action_datagrams"], 3)
+        self.assertEqual(
+            result["trajectory_controller_backend"],
+            "test_controller",
+        )
         self.assertEqual(call_order[-1][0], "close")
         self.assertFalse(executor.busy)
 
@@ -1041,6 +1255,7 @@ class RemoteBehaviorServerTest(unittest.TestCase):
             status_interval_s=0.01,
         )
         client, server_side = socket.socketpair()
+        client.settimeout(1.0)
         thread = threading.Thread(
             target=server.serve_connection,
             args=(server_side,),
@@ -1168,6 +1383,7 @@ class RemoteBehaviorServerTest(unittest.TestCase):
             executor=executor,
         )
         client, server_side = socket.socketpair()
+        client.settimeout(1.0)
         thread = threading.Thread(
             target=server.serve_connection,
             args=(server_side,),

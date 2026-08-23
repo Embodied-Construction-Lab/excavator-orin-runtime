@@ -443,6 +443,110 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         open_udp_socket.assert_not_called()
         send_machine_state.assert_not_called()
 
+    def test_cartesian_p_control_requires_separate_commissioning_authorization_before_runtime_build(self):
+        args = orin.parse_args(
+            [
+                "--edge-config",
+                "/tmp/cartesian-control.json",
+                "--control-enabled",
+                "--edge-motion-authorization",
+                orin.EDGE_MOTION_AUTHORIZATION,
+            ]
+        )
+        config = SimpleNamespace(
+            mode="control",
+            trajectory_controller_backend="cartesian_p",
+        )
+
+        with (
+            mock.patch.object(orin, "parse_args", return_value=args),
+            mock.patch(
+                "edge_runtime.shadow.load_edge_runtime_config",
+                return_value=config,
+            ),
+            mock.patch(
+                "edge_runtime.shadow.build_edge_follow_runtime",
+            ) as build_runtime,
+            mock.patch.object(orin, "open_serial") as open_serial,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cartesian_p.*commissioning authorization",
+            ):
+                orin.main()
+
+        build_runtime.assert_not_called()
+        open_serial.assert_not_called()
+
+    def test_cartesian_p_remote_control_requires_separate_commissioning_authorization(self):
+        args = orin.parse_args(
+            [
+                "--edge-config",
+                "/tmp/cartesian-remote.json",
+                "--control-enabled",
+                "--edge-motion-authorization",
+                orin.EDGE_MOTION_AUTHORIZATION,
+            ]
+        )
+        config = SimpleNamespace(
+            mode="remote_control",
+            trajectory_controller_backend="cartesian_p",
+        )
+
+        with (
+            mock.patch.object(orin, "parse_args", return_value=args),
+            mock.patch(
+                "edge_runtime.shadow.load_edge_runtime_config",
+                return_value=config,
+            ),
+            mock.patch.object(orin, "open_serial") as open_serial,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cartesian_p.*commissioning authorization",
+            ):
+                orin.main()
+
+        open_serial.assert_not_called()
+
+    def test_cartesian_p_powered_mode_accepts_only_the_exact_commissioning_authorization(self):
+        config = SimpleNamespace(
+            mode="control",
+            trajectory_controller_backend="cartesian_p",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exact commissioning"):
+            orin.validate_trajectory_controller_commissioning(config, "true")
+
+        orin.validate_trajectory_controller_commissioning(
+            config,
+            orin.CARTESIAN_P_COMMISSIONING_AUTHORIZATION,
+        )
+        args = orin.parse_args(
+            [
+                "--trajectory-controller-commissioning-authorization",
+                orin.CARTESIAN_P_COMMISSIONING_AUTHORIZATION,
+            ]
+        )
+        self.assertEqual(
+            args.trajectory_controller_commissioning_authorization,
+            orin.CARTESIAN_P_COMMISSIONING_AUTHORIZATION,
+        )
+
+    def test_commissioning_authorization_does_not_change_shadow_or_onnx_rl(self):
+        for config in (
+            SimpleNamespace(
+                mode="shadow",
+                trajectory_controller_backend="cartesian_p",
+            ),
+            SimpleNamespace(
+                mode="control",
+                trajectory_controller_backend="onnx_rl",
+            ),
+        ):
+            with self.subTest(config=config):
+                orin.validate_trajectory_controller_commissioning(config, "")
+
     def test_resident_main_uses_one_core_without_opening_action_socket(self):
         values = {field: "0" for field in orin.STM32_V2_FIELDS}
         values.update(

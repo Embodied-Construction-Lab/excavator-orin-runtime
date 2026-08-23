@@ -87,6 +87,9 @@ MM_TO_M = 0.001
 POLICY_ACTION_NAMES = ("boom", "stick", "bucket", "swing")
 ACTION_FUTURE_SKEW_MS = 50
 EDGE_MOTION_AUTHORIZATION = "ALLOW_EDGE_MACHINE_MOTION"
+CARTESIAN_P_COMMISSIONING_AUTHORIZATION = (
+    "ALLOW_CARTESIAN_P_MACHINE_MOTION"
+)
 STM32_V2_SCHEMA_VERSION = "stm32_control_telemetry.v2"
 STM32_VELOCITY_COMMAND_SCHEMA_VERSION = VELOCITY_COMMAND_SCHEMA_VERSION
 STM32_V2_FIELDS = (
@@ -1238,6 +1241,27 @@ def edge_mode_controls_motion(mode: str) -> bool:
     return mode in ("control", "remote_control")
 
 
+def validate_trajectory_controller_commissioning(
+    edge_config: object,
+    authorization: str,
+) -> None:
+    """Require an independent opt-in for an unqualified powered controller."""
+    if not edge_mode_controls_motion(getattr(edge_config, "mode", "")):
+        return
+    backend = getattr(
+        edge_config,
+        "trajectory_controller_backend",
+        "onnx_rl",
+    )
+    if backend != "cartesian_p":
+        return
+    if authorization != CARTESIAN_P_COMMISSIONING_AUTHORIZATION:
+        raise RuntimeError(
+            "cartesian_p powered mode requires exact commissioning authorization: "
+            + CARTESIAN_P_COMMISSIONING_AUTHORIZATION
+        )
+
+
 def validate_resident_motion_request(args: argparse.Namespace, edge_config: object) -> None:
     if not args.resident_motion_core:
         return
@@ -1393,8 +1417,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--edge-motion-authorization",
         default="",
         help=(
-            "Exact token required when edge config mode=control: "
+            "Exact token required when edge config mode=control or "
+            "remote_control: "
             + EDGE_MOTION_AUTHORIZATION
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-controller-commissioning-authorization",
+        default="",
+        help=(
+            "Independent exact authorization required when cartesian_p is "
+            "selected in control or remote_control: "
+            + CARTESIAN_P_COMMISSIONING_AUTHORIZATION
         ),
     )
     parser.add_argument(
@@ -1460,6 +1494,14 @@ def main() -> None:
                     "edge control requires --edge-motion-authorization "
                     + EDGE_MOTION_AUTHORIZATION
                 )
+            validate_trajectory_controller_commissioning(
+                edge_config,
+                getattr(
+                    args,
+                    "trajectory_controller_commissioning_authorization",
+                    "",
+                ),
+            )
             args.action_bind_host = "127.0.0.1"
             allowed_action_host = "127.0.0.1"
         # Validate copied assets and load ONNX before taking serial ownership.
