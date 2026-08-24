@@ -4,6 +4,10 @@ import unittest
 from pathlib import Path
 
 from edge_runtime.follow import EdgeFollowRuntime
+from edge_runtime.trajectory_controller import (
+    TrajectoryControlOutput,
+    TrajectoryControllerDescriptor,
+)
 from edge_runtime.kinematics import UrdfBucketTipKinematics
 from edge_runtime.trajectory import TrajectorySnapshot, WaypointTracker
 from tests.test_edge_kinematics import URDF
@@ -163,6 +167,45 @@ class AlternatingPolicy:
 
 
 class EdgeFollowRuntimeTest(unittest.TestCase):
+    def test_controller_seam_preserves_normalized_and_physical_axis_contracts(self):
+        class Controller:
+            descriptor = TrajectoryControllerDescriptor(
+                backend_id="test_controller",
+                implementation="test.Controller",
+            )
+
+            def __init__(self):
+                self.reset_count = 0
+                self.observations = []
+
+            def reset(self):
+                self.reset_count += 1
+
+            def compute_action(self, observation):
+                self.observations.append(tuple(observation))
+                return TrajectoryControlOutput(
+                    normalized_action=(0.5, -0.5, 0.1, -0.2),
+                    inference_ms=1.25,
+                )
+
+        controller = Controller()
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            controller=controller,
+            trajectory=trajectory(),
+            mission=mission(),
+        )
+
+        step = runtime.step(machine_state(sequence=1, stamp_ms=1_000), now_s=1.0)
+
+        self.assertEqual(controller.reset_count, 1)
+        self.assertEqual(controller.observations, [step.observation])
+        self.assertEqual(step.normalized_action, (0.5, -0.5, 0.1, -0.2))
+        self.assertEqual(step.physical_action, (0.02, -0.025, 0.003, -0.12))
+        self.assertEqual(step.inference_ms, 1.25)
+        self.assertEqual(step.trajectory_controller_backend, "test_controller")
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         urdf_path = Path(self.temp_dir.name) / "waji.urdf"

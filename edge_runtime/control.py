@@ -16,6 +16,21 @@ from .fixed_actions import FixedActionRuntime, FixedActionRuntimeStep
 LOGGER = logging.getLogger("orin_edge_control")
 
 
+def _runtime_trajectory_controller_backend(runtime: Any) -> str:
+    direct = getattr(runtime, "trajectory_controller_backend", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    # EdgeControlRunner and EdgeFollowRuntime are one package-owned boundary;
+    # inspect the configured controller before the first step so a rejected
+    # first state still records which experiment backend was active.
+    controller = getattr(runtime, "_controller", None)
+    descriptor = getattr(controller, "descriptor", None)
+    backend = getattr(descriptor, "backend_id", None)
+    if isinstance(backend, str) and backend.strip():
+        return backend
+    return "unknown"
+
+
 class ActionSink(Protocol):
     def send(self, payload: bytes) -> object:
         ...
@@ -48,9 +63,12 @@ class EdgeControlRunner:
         audit_path: Path,
         valid_for_ms: int,
         action_sequence: Optional[ActionSequence] = None,
+        retain_action_authority: bool = False,
     ) -> None:
         if valid_for_ms <= 0:
             raise ValueError("edge action valid_for_ms must be positive")
+        if not isinstance(retain_action_authority, bool):
+            raise ValueError("retain_action_authority must be boolean")
         self._runtime = runtime
         self._action_sink = action_sink
         self._audit_path = Path(audit_path)
@@ -64,6 +82,11 @@ class EdgeControlRunner:
         self._action_sequence = action_sequence or ActionSequence()
         self._action_datagrams = 0
         self._consecutive_rejections = 0
+        self._trajectory_controller_backend = (
+            _runtime_trajectory_controller_backend(runtime)
+        )
+        self._resident_activation_started = False
+        self._retain_action_authority = retain_action_authority
 
     @property
     def action_datagrams(self) -> int:
@@ -82,7 +105,7 @@ class EdgeControlRunner:
         except Exception as exc:
             self._consecutive_rejections += 1
             loop_elapsed_ms = (time.perf_counter() - started) * 1000.0
-            self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+            self._stop_or_zero(action_stamp_ms)
             self._append(
                 {
                     "schema_version": "orin_edge_control_audit.v1",
@@ -92,6 +115,9 @@ class EdgeControlRunner:
                     "source_stamp_ms": machine_state.get("stamp_ms"),
                     "reason": str(exc),
                     "exception_type": type(exc).__name__,
+                    "trajectory_controller_backend": (
+                        self._trajectory_controller_backend
+                    ),
                     "consecutive_rejections": self._consecutive_rejections,
                     "runtime_monotonic_s": float(now_s),
                     "loop_elapsed_ms": loop_elapsed_ms,
@@ -105,6 +131,13 @@ class EdgeControlRunner:
             return None
 
         self._consecutive_rejections = 0
+        step_backend = getattr(
+            step,
+            "trajectory_controller_backend",
+            self._trajectory_controller_backend,
+        )
+        if isinstance(step_backend, str) and step_backend.strip():
+            self._trajectory_controller_backend = step_backend
         loop_elapsed_ms = (time.perf_counter() - started) * 1000.0
         result_status = getattr(
             step,
@@ -116,7 +149,11 @@ class EdgeControlRunner:
             if result_status == "ACTIVE" and not step.completed
             else (0.0, 0.0, 0.0, 0.0)
         )
-        self._send(action, action_stamp_ms)
+        self._dispatch_action(
+            action,
+            action_stamp_ms,
+            policy_active=result_status == "ACTIVE" and not step.completed,
+        )
         self._append(
             {
                 "schema_version": "orin_edge_control_audit.v1",
@@ -135,6 +172,7 @@ class EdgeControlRunner:
                 "tracking_timeout_s": getattr(step, "tracking_timeout_s", None),
                 "waypoint_tolerance_m": getattr(step, "waypoint_tolerance_m", None),
                 "inference_ms": getattr(step, "inference_ms", None),
+                "trajectory_controller_backend": self._trajectory_controller_backend,
                 "consecutive_rejections": self._consecutive_rejections,
                 "runtime_monotonic_s": float(now_s),
                 "loop_elapsed_ms": loop_elapsed_ms,
@@ -154,9 +192,48 @@ class EdgeControlRunner:
 
     def close(self, *, action_stamp_ms: int) -> None:
         try:
-            self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+            self._stop_or_zero(action_stamp_ms)
         finally:
             self._audit_handle.close()
+
+    def _dispatch_action(
+        self,
+        action: tuple[float, float, float, float],
+        action_stamp_ms: int,
+        *,
+        policy_active: bool,
+    ) -> None:
+        if policy_active:
+            self._ensure_resident_activation_if_supported()
+            self._send(action, action_stamp_ms)
+            return
+        self._stop_or_zero(action_stamp_ms)
+
+    def _stop_or_zero(self, action_stamp_ms: int) -> None:
+        if self._retain_action_authority:
+            if self._resident_activation_started:
+                self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+            return
+        if self._stop_if_resident_supported():
+            return
+        self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+
+    def _ensure_resident_activation_if_supported(self) -> None:
+        if self._resident_activation_started:
+            return
+        begin_activation = getattr(self._action_sink, "begin_activation", None)
+        if begin_activation is None:
+            return
+        begin_activation(now_monotonic_ns=time.monotonic_ns())
+        self._resident_activation_started = True
+
+    def _stop_if_resident_supported(self) -> bool:
+        request_stop = getattr(self._action_sink, "request_stop", None)
+        if request_stop is None:
+            return False
+        request_stop(now_monotonic_ns=time.monotonic_ns())
+        self._resident_activation_started = False
+        return True
 
     def _send(self, action: tuple, action_stamp_ms: int) -> None:
         sequence = self._action_sequence.next()
@@ -191,11 +268,14 @@ class FixedActionControlRunner:
         audit_path: Path,
         valid_for_ms: int,
         action_sequence: Optional[ActionSequence] = None,
+        retain_action_authority: bool = False,
     ) -> None:
         if behavior not in {"ExecuteDig", "ExecuteDump"}:
             raise ValueError("fixed action behavior is invalid")
         if valid_for_ms <= 0:
             raise ValueError("edge action valid_for_ms must be positive")
+        if not isinstance(retain_action_authority, bool):
+            raise ValueError("retain_action_authority must be boolean")
         self._runtime = runtime
         self._behavior = behavior
         self._action_sink = action_sink
@@ -210,6 +290,8 @@ class FixedActionControlRunner:
         self._action_sequence = action_sequence or ActionSequence()
         self._action_datagrams = 0
         self._closed = False
+        self._resident_activation_started = False
+        self._retain_action_authority = retain_action_authority
 
     @property
     def action_datagrams(self) -> int:
@@ -226,7 +308,7 @@ class FixedActionControlRunner:
         try:
             step = self._runtime.step(machine_state, now_s=now_s)
         except Exception as exc:
-            self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+            self._stop_or_zero(action_stamp_ms)
             self._append(
                 {
                     "schema_version": "orin_fixed_action_control_audit.v1",
@@ -249,7 +331,11 @@ class FixedActionControlRunner:
             )
             return None
         action = step.physical_action if step.result == "ACTIVE" else (0.0, 0.0, 0.0, 0.0)
-        self._send(action, action_stamp_ms)
+        self._dispatch_action(
+            action,
+            action_stamp_ms,
+            policy_active=step.result == "ACTIVE",
+        )
         self._append(
             {
                 "schema_version": "orin_fixed_action_control_audit.v1",
@@ -276,9 +362,48 @@ class FixedActionControlRunner:
             return
         self._closed = True
         try:
-            self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+            self._stop_or_zero(action_stamp_ms)
         finally:
             self._audit_handle.close()
+
+    def _dispatch_action(
+        self,
+        action: tuple[float, float, float, float],
+        action_stamp_ms: int,
+        *,
+        policy_active: bool,
+    ) -> None:
+        if policy_active:
+            self._ensure_resident_activation_if_supported()
+            self._send(action, action_stamp_ms)
+            return
+        self._stop_or_zero(action_stamp_ms)
+
+    def _stop_or_zero(self, action_stamp_ms: int) -> None:
+        if self._retain_action_authority:
+            if self._resident_activation_started:
+                self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+            return
+        if self._stop_if_resident_supported():
+            return
+        self._send((0.0, 0.0, 0.0, 0.0), action_stamp_ms)
+
+    def _ensure_resident_activation_if_supported(self) -> None:
+        if self._resident_activation_started:
+            return
+        begin_activation = getattr(self._action_sink, "begin_activation", None)
+        if begin_activation is None:
+            return
+        begin_activation(now_monotonic_ns=time.monotonic_ns())
+        self._resident_activation_started = True
+
+    def _stop_if_resident_supported(self) -> bool:
+        request_stop = getattr(self._action_sink, "request_stop", None)
+        if request_stop is None:
+            return False
+        request_stop(now_monotonic_ns=time.monotonic_ns())
+        self._resident_activation_started = False
+        return True
 
     def _send(self, action: tuple, action_stamp_ms: int) -> None:
         packet = {

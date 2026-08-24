@@ -13,11 +13,23 @@ from typing import Any, Mapping, Optional
 
 from .follow import EdgeFollowRuntime, EdgeFollowStep
 from .kinematics import UrdfBucketTipKinematics
-from .onnx_policy import OnnxPolicy
 from .trajectory import validate_trajectory_mission
+from .trajectory_controller import build_trajectory_controller
 
 
 LOGGER = logging.getLogger("orin_edge_shadow")
+
+
+def _runtime_trajectory_controller_backend(runtime: Any) -> str:
+    direct = getattr(runtime, "trajectory_controller_backend", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    controller = getattr(runtime, "_controller", None)
+    descriptor = getattr(controller, "descriptor", None)
+    backend = getattr(descriptor, "backend_id", None)
+    if isinstance(backend, str) and backend.strip():
+        return backend
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -32,9 +44,11 @@ class RemoteBehaviorConfig:
 @dataclass(frozen=True)
 class EdgeRuntimeConfig:
     mode: str
+    action_transport: str
     machine_profile_path: Path
     urdf_path: Path
-    onnx_path: Path
+    onnx_path: Path | None
+    trajectory_controller_backend: str
     trajectory_path: Optional[Path]
     mission_path: Path
     fixed_action_profile_path: Optional[Path]
@@ -53,14 +67,18 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
     common = {
         "schema_version",
         "mode",
+        "action_transport",
         "machine_profile_path",
         "urdf_path",
-        "onnx_path",
         "mission_path",
         "audit_path",
         "action_valid_for_ms",
     }
-    optional = {"follow_action_slew_rate_per_s"}
+    optional = {
+        "follow_action_slew_rate_per_s",
+        "trajectory_controller_backend",
+        "onnx_path",
+    }
     if (
         not isinstance(value, dict)
         or "schema_version" not in value
@@ -70,13 +88,51 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
     if value["schema_version"] != "orin_edge_runtime.v1":
         raise ValueError("edge shadow schema_version is invalid")
     mode = value["mode"]
+    if mode not in {"shadow", "control", "remote_control"}:
+        raise ValueError(
+            "edge runtime mode must be shadow, control, or remote_control"
+        )
+    trajectory_controller_backend = value.get(
+        "trajectory_controller_backend", "onnx_rl"
+    )
+    if trajectory_controller_backend not in {"onnx_rl", "cartesian_p"}:
+        raise ValueError(
+            "trajectory_controller_backend must be onnx_rl or cartesian_p"
+        )
+    controller_required = (
+        {"onnx_path"}
+        if trajectory_controller_backend == "onnx_rl"
+        else set()
+    )
+    if trajectory_controller_backend == "onnx_rl" and (
+        not isinstance(value.get("onnx_path"), str)
+        or not value["onnx_path"].strip()
+    ):
+        raise ValueError("onnx_path is required for onnx_rl")
+    if mode in ("shadow", "control", "remote_control"):
+        required = common | controller_required | (
+            {"trajectory_path"}
+            if mode in ("shadow", "control")
+            else {"remote_behavior", "fixed_action_profile_path"}
+        )
+        legacy_required = required - {"action_transport"}
+        if legacy_required <= set(value) <= legacy_required | optional:
+            value = dict(value)
+            value["action_transport"] = "loopback_udp"
+    action_transport = value.get("action_transport")
+    if action_transport not in {"loopback_udp", "resident_sink"}:
+        raise ValueError("edge action_transport must be loopback_udp or resident_sink")
     if mode in ("shadow", "control"):
-        required = common | {"trajectory_path"}
+        required = common | controller_required | {"trajectory_path"}
         if not required <= set(value) <= required | optional:
             raise ValueError("edge shadow config fields are invalid")
         remote_behavior = None
     elif mode == "remote_control":
-        required = common | {"remote_behavior", "fixed_action_profile_path"}
+        required = (
+            common
+            | controller_required
+            | {"remote_behavior", "fixed_action_profile_path"}
+        )
         if not required <= set(value) <= required | optional:
             raise ValueError("remote edge config fields are invalid")
         remote_behavior = _remote_behavior_config(value["remote_behavior"])
@@ -110,9 +166,15 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
     root = config_path.parent
     return EdgeRuntimeConfig(
         mode=mode,
+        action_transport=action_transport,
         machine_profile_path=_relative_path(root, value["machine_profile_path"]),
         urdf_path=_relative_path(root, value["urdf_path"]),
-        onnx_path=_relative_path(root, value["onnx_path"]),
+        onnx_path=(
+            _relative_path(root, value["onnx_path"])
+            if "onnx_path" in value
+            else None
+        ),
+        trajectory_controller_backend=trajectory_controller_backend,
         trajectory_path=(
             _relative_path(root, value["trajectory_path"])
             if mode != "remote_control"
@@ -151,7 +213,10 @@ def build_edge_follow_runtime(config: EdgeRuntimeConfig) -> EdgeFollowRuntime:
     return EdgeFollowRuntime(
         machine_profile=machine_profile,
         kinematics=UrdfBucketTipKinematics.from_path(config.urdf_path),
-        policy=OnnxPolicy(config.onnx_path),
+        controller=build_trajectory_controller(
+            config.trajectory_controller_backend,
+            onnx_path=config.onnx_path,
+        ),
         trajectory=trajectory,
         mission=mission,
         action_slew_rate_per_s=config.follow_action_slew_rate_per_s,
@@ -181,6 +246,9 @@ class EdgeShadowObserver:
             buffering=1,
         )
         self._consecutive_rejections = 0
+        self._trajectory_controller_backend = (
+            _runtime_trajectory_controller_backend(runtime)
+        )
 
     def observe(
         self,
@@ -203,6 +271,9 @@ class EdgeShadowObserver:
                 "source_stamp_ms": machine_state.get("stamp_ms"),
                 "reason": str(exc),
                 "exception_type": type(exc).__name__,
+                "trajectory_controller_backend": (
+                    self._trajectory_controller_backend
+                ),
                 "consecutive_rejections": self._consecutive_rejections,
                 "runtime_monotonic_s": runtime_time,
                 "inference_elapsed_ms": loop_elapsed_ms,
@@ -213,6 +284,13 @@ class EdgeShadowObserver:
             return None
 
         self._consecutive_rejections = 0
+        step_backend = getattr(
+            step,
+            "trajectory_controller_backend",
+            self._trajectory_controller_backend,
+        )
+        if isinstance(step_backend, str) and step_backend.strip():
+            self._trajectory_controller_backend = step_backend
         loop_elapsed_ms = (time.perf_counter() - started) * 1000.0
         record = asdict(step)
         record.update(
@@ -220,6 +298,9 @@ class EdgeShadowObserver:
                 "schema_version": "orin_edge_shadow_audit.v1",
                 "mode": "shadow",
                 "status": step.result,
+                "trajectory_controller_backend": (
+                    self._trajectory_controller_backend
+                ),
                 "consecutive_rejections": self._consecutive_rejections,
                 "runtime_monotonic_s": runtime_time,
                 "inference_elapsed_ms": loop_elapsed_ms,

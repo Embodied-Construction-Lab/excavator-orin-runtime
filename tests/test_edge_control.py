@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,10 +12,22 @@ import orin_state_sender
 
 from edge_runtime import control
 from edge_runtime.control import EdgeControlRunner, FixedActionControlRunner
-from edge_runtime.follow import EdgeFollowStep
+from edge_runtime.follow import EdgeFollowRuntime, EdgeFollowStep
+from edge_runtime.kinematics import UrdfBucketTipKinematics
+from edge_runtime.resident_ingress import ResidentVelocityActionAdapter
+from edge_runtime.resident_motion import ControlMode, ZERO_ACTION
+from edge_runtime.resident_sink import ResidentCommandSink, ResidentTelemetry
+from edge_runtime.trajectory_controller import (
+    TrajectoryControlOutput,
+    TrajectoryControllerDescriptor,
+)
+from tests.test_edge_follow_runtime import machine_profile, mission, trajectory
+from tests.test_edge_kinematics import URDF
 
 
 class StubRuntime:
+    trajectory_controller_backend = "test_controller"
+
     def __init__(self, *, completed=False, failure=None):
         self.completed = completed
         self.failure = failure
@@ -33,6 +46,17 @@ class StubRuntime:
             normalized_action=(0.1, -0.2, 0.3, -0.4),
             physical_action=(0.01, -0.02, 0.03, -0.04),
             commanded_normalized_action=(0.08, -0.16, 0.24, -0.32),
+            trajectory_controller_backend="test_controller",
+        )
+
+
+class ZeroActionRuntime(StubRuntime):
+    def step(self, machine_state, *, now_s):
+        return replace(
+            super().step(machine_state, now_s=now_s),
+            normalized_action=(0.0, 0.0, 0.0, 0.0),
+            physical_action=(0.0, 0.0, 0.0, 0.0),
+            commanded_normalized_action=(0.0, 0.0, 0.0, 0.0),
         )
 
 
@@ -56,6 +80,28 @@ class RecordingSerial:
 
     def flush(self):
         return None
+
+
+def resident_telemetry(
+    *,
+    receive_ns: int,
+    command_seq: int,
+    valid: bool,
+    mode: ControlMode | None,
+) -> ResidentTelemetry:
+    return ResidentTelemetry(
+        receive_monotonic_ns=receive_ns,
+        command_rx_seq=command_seq,
+        command_valid=valid,
+        command_timed_out=False,
+        control_mode=mode,
+        command_action=ZERO_ACTION,
+        control_enabled=True,
+        estop=False,
+        sensor_valid=True,
+        stm32_alive=True,
+        fault_flags=0,
+    )
 
 
 class EdgeControlRunnerTest(unittest.TestCase):
@@ -93,6 +139,10 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertEqual(
             record["commanded_normalized_action"],
             [0.08, -0.16, 0.24, -0.32],
+        )
+        self.assertEqual(
+            record["trajectory_controller_backend"],
+            "test_controller",
         )
         runner.close(action_stamp_ms=5001)
         self.assertEqual(runner.action_datagrams, 2)
@@ -236,6 +286,57 @@ class EdgeControlRunnerTest(unittest.TestCase):
             [packet["action"] for packet in sink.payloads],
             [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
         )
+        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["trajectory_controller_backend"],
+            "test_controller",
+        )
+
+    def test_first_rejection_audits_the_configured_runtime_backend(self):
+        class Controller:
+            descriptor = TrajectoryControllerDescriptor(
+                backend_id="cartesian_p",
+                implementation="test.Controller",
+            )
+
+            def reset(self):
+                return None
+
+            def compute_action(self, _observation):
+                return TrajectoryControlOutput(
+                    normalized_action=(0.0, 0.0, 0.0, 0.0),
+                    inference_ms=0.0,
+                )
+
+        urdf_path = Path(self.temp_dir.name) / "machine.urdf"
+        urdf_path.write_text(URDF, encoding="utf-8")
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=UrdfBucketTipKinematics.from_path(urdf_path),
+            controller=Controller(),
+            trajectory=trajectory(),
+            mission=mission(),
+        )
+        runner = EdgeControlRunner(
+            runtime=runtime,
+            action_sink=RecordingSink(),
+            audit_path=self.audit_path,
+            valid_for_ms=300,
+        )
+
+        result = runner.observe(
+            {"seq": 1, "stamp_ms": 1_000},
+            now_s=1.0,
+            action_stamp_ms=1_000,
+        )
+        runner.close(action_stamp_ms=1_001)
+
+        self.assertIsNone(result)
+        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["trajectory_controller_backend"],
+            "cartesian_p",
+        )
 
     def test_timeout_result_sends_zero_and_never_reuses_nonzero_action(self):
         class TimeoutRuntime:
@@ -339,7 +440,10 @@ class EdgeControlRunnerTest(unittest.TestCase):
         self.assertIn("loop_elapsed_ms", records[-1])
 
     def test_loopback_control_uses_existing_action_relay_as_only_serial_writer(self):
-        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except PermissionError:
+            self.skipTest("sandbox does not permit local UDP sockets")
         receiver.bind(("127.0.0.1", 0))
         receiver.setblocking(False)
         sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -394,6 +498,195 @@ class EdgeControlRunnerTest(unittest.TestCase):
             relay.close()
             sender.close()
             receiver.close()
+
+    def test_resident_control_runner_claims_then_moves_then_requests_stop(self):
+        serial = RecordingSerial()
+        sink = ResidentCommandSink(serial, max_state_age_ms=200.0)
+        sink.initialize(
+            resident_telemetry(
+                receive_ns=990_000_000,
+                command_seq=0,
+                valid=False,
+                mode=None,
+            )
+        )
+        adapter = ResidentVelocityActionAdapter(
+            sink,
+            source="rl_follow",
+        )
+        runner = EdgeControlRunner(
+            runtime=StubRuntime(),
+            action_sink=adapter,
+            audit_path=self.audit_path,
+            valid_for_ms=100,
+        )
+
+        first_now_ns = time.monotonic_ns()
+        first = runner.observe(
+            {"seq": 1, "stamp_ms": 9_990},
+            now_s=1.0,
+            action_stamp_ms=time.time_ns() // 1_000_000,
+        )
+        claim_packet = json.loads(serial.writes[-1].decode("ascii"))
+        sink.observe_telemetry(
+            resident_telemetry(
+                receive_ns=max(time.monotonic_ns(), first_now_ns + 1),
+                command_seq=claim_packet["command_seq"],
+                valid=True,
+                mode=ControlMode.VELOCITY_REFERENCE,
+            )
+        )
+        second = runner.observe(
+            {"seq": 2, "stamp_ms": 10_090},
+            now_s=1.03,
+            action_stamp_ms=time.time_ns() // 1_000_000,
+        )
+        runner.close(action_stamp_ms=time.time_ns() // 1_000_000)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        packets = [json.loads(payload.decode("ascii")) for payload in serial.writes]
+        self.assertEqual(packets[0]["boom_mps"], 0.0)
+        self.assertEqual(
+            (
+                packets[1]["boom_mps"],
+                packets[1]["stick_mps"],
+                packets[1]["bucket_mps"],
+                packets[1]["swing_radps"],
+            ),
+            (0.01, -0.02, 0.03, -0.04),
+        )
+        self.assertEqual(packets[-1]["boom_mps"], 0.0)
+
+    def test_resident_control_failure_before_activation_does_not_raise_or_claim(self):
+        serial = RecordingSerial()
+        sink = ResidentCommandSink(serial, max_state_age_ms=200.0)
+        sink.initialize(
+            resident_telemetry(
+                receive_ns=990_000_000,
+                command_seq=0,
+                valid=False,
+                mode=None,
+            )
+        )
+        adapter = ResidentVelocityActionAdapter(
+            sink,
+            source="rl_follow",
+        )
+        runner = EdgeControlRunner(
+            runtime=StubRuntime(failure="sensor_invalid"),
+            action_sink=adapter,
+            audit_path=self.audit_path,
+            valid_for_ms=100,
+        )
+
+        result = runner.observe(
+            {"seq": 3, "stamp_ms": 10_000},
+            now_s=1.0,
+            action_stamp_ms=10_000,
+        )
+        runner.close(action_stamp_ms=10_001)
+
+        self.assertIsNone(result)
+        self.assertEqual(serial.writes, [])
+
+    def test_active_zero_action_does_not_release_and_reclaim_resident_policy(self):
+        serial = RecordingSerial()
+        sink = ResidentCommandSink(serial, max_state_age_ms=200.0)
+        sink.initialize(
+            resident_telemetry(
+                receive_ns=990_000_000,
+                command_seq=0,
+                valid=False,
+                mode=None,
+            )
+        )
+        adapter = ResidentVelocityActionAdapter(
+            sink,
+            source="rl_follow",
+        )
+        runner = EdgeControlRunner(
+            runtime=ZeroActionRuntime(),
+            action_sink=adapter,
+            audit_path=self.audit_path,
+            valid_for_ms=100,
+        )
+
+        runner.observe(
+            {"seq": 1, "stamp_ms": 9_990},
+            now_s=1.0,
+            action_stamp_ms=time.time_ns() // 1_000_000,
+        )
+        generation = adapter.generation
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        sink.observe_telemetry(
+            resident_telemetry(
+                receive_ns=time.monotonic_ns(),
+                command_seq=claim["command_seq"],
+                valid=True,
+                mode=ControlMode.VELOCITY_REFERENCE,
+            )
+        )
+
+        runner.observe(
+            {"seq": 2, "stamp_ms": 10_090},
+            now_s=1.1,
+            action_stamp_ms=time.time_ns() // 1_000_000,
+        )
+
+        self.assertEqual(adapter.generation, generation)
+        self.assertEqual(sink.snapshot().active_binding.source, "rl_follow")
+        self.assertEqual(len(serial.writes), 2)
+        runner.close(action_stamp_ms=time.time_ns() // 1_000_000)
+
+    def test_shared_resident_runner_close_keeps_rl_authority_and_writes_zero(self):
+        serial = RecordingSerial()
+        sink = ResidentCommandSink(serial, max_state_age_ms=200.0)
+        sink.initialize(
+            resident_telemetry(
+                receive_ns=990_000_000,
+                command_seq=0,
+                valid=False,
+                mode=None,
+            )
+        )
+        adapter = ResidentVelocityActionAdapter(sink, source="rl_follow")
+        generation = adapter.begin_activation(now_monotonic_ns=time.monotonic_ns())
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        sink.observe_telemetry(
+            resident_telemetry(
+                receive_ns=time.monotonic_ns(),
+                command_seq=claim["command_seq"],
+                valid=True,
+                mode=ControlMode.VELOCITY_REFERENCE,
+            )
+        )
+        runner = EdgeControlRunner(
+            runtime=StubRuntime(),
+            action_sink=adapter,
+            audit_path=self.audit_path,
+            valid_for_ms=100,
+            retain_action_authority=True,
+        )
+        runner.observe(
+            {"seq": 1, "stamp_ms": 9_990},
+            now_s=1.0,
+            action_stamp_ms=time.time_ns() // 1_000_000,
+        )
+
+        runner.close(action_stamp_ms=time.time_ns() // 1_000_000)
+
+        snapshot = sink.snapshot()
+        self.assertEqual(snapshot.generation, generation)
+        self.assertEqual(snapshot.active_binding.source, "rl_follow")
+        terminal = json.loads(serial.writes[-1].decode("ascii"))
+        self.assertEqual(
+            [
+                terminal[name]
+                for name in ("boom_mps", "stick_mps", "bucket_mps", "swing_radps")
+            ],
+            [0.0] * 4,
+        )
 
 
 if __name__ == "__main__":

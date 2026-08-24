@@ -42,7 +42,25 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+
+from edge_runtime.resident_motion import ControlMode, ZERO_ACTION
+from edge_runtime.resident_commands import (
+    Stm32ResidentCommandEncoder,
+    VELOCITY_COMMAND_SCHEMA_VERSION,
+)
+from edge_runtime.resident_control import (
+    DEFAULT_MISSION_LEASE_MS,
+    ResidentMotionControlServer,
+)
+from edge_runtime.resident_core import ResidentMotionCore
+from edge_runtime.resident_data_link import ResidentActDataLink
+from edge_runtime.resident_sink import ResidentTelemetry, ResidentWriteResult
+from edge_runtime.resident_state import (
+    ResidentActState,
+    decode_resident_state,
+    encode_resident_state,
+)
 
 
 LOGGER = logging.getLogger("orin_state_sender")
@@ -54,6 +72,13 @@ DEFAULT_PC_STATE_PORT = 18081
 DEFAULT_ORIN_ACTION_BIND_HOST = "0.0.0.0"
 DEFAULT_ORIN_ACTION_BIND_PORT = 18082
 DEFAULT_MACHINE_ID = "scale_excavator_v1"
+DEFAULT_EDGE_ACTION_TRANSPORT = "loopback_udp"
+RESIDENT_EDGE_ACTION_TRANSPORT = "resident_sink"
+DEFAULT_RESIDENT_STATE_AGE_MS = 100.0
+DEFAULT_RESIDENT_TERMINAL_ACK_TIMEOUT_S = 0.6
+DEFAULT_RESIDENT_RUNTIME_ROOT = Path.home() / ".local/run/excavator-resident"
+DEFAULT_RESIDENT_ACT_SOCKET = DEFAULT_RESIDENT_RUNTIME_ROOT / "act.sock"
+DEFAULT_RESIDENT_CONTROL_SOCKET = DEFAULT_RESIDENT_RUNTIME_ROOT / "control.sock"
 
 STM32_FRAME_FORMAT = "<I15f"
 STM32_FRAME_SIZE = struct.calcsize(STM32_FRAME_FORMAT)
@@ -62,8 +87,11 @@ MM_TO_M = 0.001
 POLICY_ACTION_NAMES = ("boom", "stick", "bucket", "swing")
 ACTION_FUTURE_SKEW_MS = 50
 EDGE_MOTION_AUTHORIZATION = "ALLOW_EDGE_MACHINE_MOTION"
+CARTESIAN_P_COMMISSIONING_AUTHORIZATION = (
+    "ALLOW_CARTESIAN_P_MACHINE_MOTION"
+)
 STM32_V2_SCHEMA_VERSION = "stm32_control_telemetry.v2"
-STM32_VELOCITY_COMMAND_SCHEMA_VERSION = "stm32_velocity_command.v1"
+STM32_VELOCITY_COMMAND_SCHEMA_VERSION = VELOCITY_COMMAND_SCHEMA_VERSION
 STM32_V2_FIELDS = (
     "schema_version", "control_seq", "control_stamp_ms", "sensor_seq",
     "sensor_stamp_ms", "sensor_is_new", "command_rx_seq",
@@ -118,6 +146,19 @@ class Stm32State:
     command_rx_seq: int = 0
     command_received: bool = False
     stm32_control_enabled: bool = False
+    hardware_motion_gate_available: bool = False
+    command_valid: bool = False
+    command_timed_out: bool = False
+    stm32_control_mode: int = 3
+    command_boom_mps: float = 0.0
+    command_stick_mps: float = 0.0
+    command_bucket_mps: float = 0.0
+    command_swing_radps: float = 0.0
+    stm32_estop: bool = False
+    stm32_fault_flags: int = 0
+    control_seq: int = 0
+    sensor_seq: int = 0
+    sensor_is_new: bool = True
 
 
 @dataclass(frozen=True)
@@ -146,6 +187,7 @@ def open_serial(port: str, baudrate: int, timeout_s: float):
         bytesize=serial.EIGHTBITS,
         parity=serial.PARITY_NONE,
         stopbits=serial.STOPBITS_ONE,
+        exclusive=True,
     )
     ser.setDTR(False)
     ser.setRTS(False)
@@ -327,6 +369,21 @@ def _parse_stm32_v2_fields(fields: List[str]) -> Stm32State:
         stm32_control_enabled=_parse_hardware_status(
             "control_enabled", finite_float("control_enabled")
         ),
+        hardware_motion_gate_available=True,
+        command_valid=command_valid,
+        command_timed_out=command_timed_out,
+        stm32_control_mode=nonnegative_int("control_mode"),
+        command_boom_mps=finite_float("boom_v_ref_mmps") * MM_TO_M,
+        command_stick_mps=finite_float("stick_v_ref_mmps") * MM_TO_M,
+        command_bucket_mps=finite_float("bucket_v_ref_mmps") * MM_TO_M,
+        command_swing_radps=math.radians(finite_float("swing_v_ref_degps")),
+        stm32_estop=_parse_hardware_status("estop", finite_float("estop")),
+        stm32_fault_flags=nonnegative_int("fault_flags"),
+        control_seq=nonnegative_int("control_seq"),
+        sensor_seq=nonnegative_int("sensor_seq"),
+        sensor_is_new=_parse_hardware_status(
+            "sensor_is_new", finite_float("sensor_is_new")
+        ),
     )
 
 
@@ -334,6 +391,278 @@ def _parse_hardware_status(name: str, value: float) -> bool:
     if not math.isfinite(value) or value not in (0.0, 1.0):
         raise ValueError("%s must be 0 or 1" % name)
     return value == 1.0
+
+
+def resident_telemetry_from_state(
+    state: Stm32State,
+    *,
+    receive_monotonic_ns: int,
+    runtime_control_enabled: bool,
+    runtime_estop: bool,
+    sensor_valid: bool,
+    stm32_alive: bool,
+) -> ResidentTelemetry:
+    """Adapt parsed v2 telemetry to the resident final-write contract."""
+
+    if state.stm32_control_mode == 1:
+        mode = ControlMode.MANUAL_ACTION
+        action = (state.y2, state.y1, state.x2, state.x1)
+    elif state.stm32_control_mode == 2:
+        mode = ControlMode.VELOCITY_REFERENCE
+        action = (
+            state.command_boom_mps,
+            state.command_stick_mps,
+            state.command_bucket_mps,
+            state.command_swing_radps,
+        )
+    else:
+        mode = None
+        action = ZERO_ACTION
+    return ResidentTelemetry(
+        receive_monotonic_ns=receive_monotonic_ns,
+        command_rx_seq=state.command_rx_seq,
+        command_valid=state.command_valid,
+        command_timed_out=state.command_timed_out,
+        control_mode=mode,
+        command_action=action,
+        control_enabled=(
+            bool(runtime_control_enabled) and state.stm32_control_enabled
+        ),
+        estop=bool(runtime_estop) or state.stm32_estop,
+        sensor_valid=bool(sensor_valid),
+        stm32_alive=bool(stm32_alive),
+        fault_flags=state.stm32_fault_flags,
+    )
+
+
+def wait_for_resident_terminal_zero_ack(
+    serial_reader,
+    result: ResidentWriteResult,
+    *,
+    timeout_s: float = DEFAULT_RESIDENT_TERMINAL_ACK_TIMEOUT_S,
+) -> bool:
+    """Wait for the exact STM32 echo of the resident terminal zero.
+
+    A resident Runtime owns the serial device until this function returns.  It
+    therefore cannot hand the device to another process merely because the
+    final zero was written; the matching command sequence, control mode and
+    four zero axes must first be observed in fresh unified telemetry.
+    """
+
+    if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+        raise ValueError("terminal zero ACK timeout must be finite and positive")
+    if not result.write_performed:
+        return (
+            result.reason == "terminal_disarm"
+            and result.command_seq is None
+            and result.mode is None
+            and result.effective_action == ZERO_ACTION
+        )
+    if (
+        result.command_seq is None
+        or result.mode is None
+        or result.effective_action != ZERO_ACTION
+    ):
+        return False
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            raw_line = serial_reader.readline()
+        except OSError:
+            return False
+        if not raw_line:
+            continue
+        try:
+            state = parse_stm32_csv_line(raw_line.decode("ascii"))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if state is None:
+            continue
+        frame = resident_telemetry_from_state(
+            state,
+            receive_monotonic_ns=time.monotonic_ns(),
+            runtime_control_enabled=True,
+            runtime_estop=False,
+            sensor_valid=True,
+            stm32_alive=True,
+        )
+        if (
+            frame.command_rx_seq == result.command_seq
+            and frame.command_valid
+            and not frame.command_timed_out
+            and frame.control_mode is result.mode
+            and frame.command_action == ZERO_ACTION
+        ):
+            return True
+    return False
+
+
+def resident_act_state_from_state(
+    state: Stm32State,
+    *,
+    receive_monotonic_ns: int,
+    control_generation: int,
+    runtime_control_enabled: bool,
+    runtime_estop: bool,
+    sensor_valid: bool,
+    stm32_alive: bool,
+) -> ResidentActState:
+    """Adapt unified telemetry to the canonical 11D resident ACT contract."""
+
+    return ResidentActState(
+        state=(
+            state.s_boom,
+            state.s_stick,
+            state.s_bucket,
+            state.v_boom,
+            state.v_stick,
+            state.v_bucket,
+            state.a_boom,
+            state.a_stick,
+            state.a_bucket,
+            state.yaw,
+            state.yaw_rate,
+        ),
+        receive_monotonic_ns=receive_monotonic_ns,
+        state_monotonic_ns=receive_monotonic_ns,
+        control_seq=state.control_seq,
+        sensor_seq=state.sensor_seq,
+        sensor_is_new=state.sensor_is_new,
+        control_enabled=(
+            bool(runtime_control_enabled) and state.stm32_control_enabled
+        ),
+        estop=bool(runtime_estop) or state.stm32_estop,
+        rs485_ok=state.rs485_ok,
+        dwj_ok=state.adc_ok,
+        imu_ok=state.imu_ok,
+        sensor_valid=bool(sensor_valid),
+        stm32_alive=bool(stm32_alive),
+        fault_flags=state.stm32_fault_flags,
+        control_generation=control_generation,
+    )
+
+
+def publish_resident_act_state_if_active(
+    *,
+    state: Stm32State,
+    receive_monotonic_ns: int,
+    core: ResidentMotionCore,
+    data_link: ResidentActDataLink,
+    runtime_control_enabled: bool,
+    runtime_estop: bool,
+    sensor_valid: bool,
+    stm32_alive: bool,
+) -> bool:
+    """Publish every ACT-era telemetry frame, including 20 Hz safety updates.
+
+    ``sensor_is_new`` remains part of the strict frame so the worker performs
+    inference only for the 10 Hz observation stream.  Publishing the
+    intervening telemetry rows is still required: control/fault evidence can
+    change on those rows and must reset the resident policy queue immediately.
+    """
+
+    control_generation = core.active_act_generation
+    if control_generation is None:
+        return False
+    frame = resident_act_state_from_state(
+        state,
+        receive_monotonic_ns=receive_monotonic_ns,
+        control_generation=control_generation,
+        runtime_control_enabled=runtime_control_enabled,
+        runtime_estop=runtime_estop,
+        sensor_valid=sensor_valid,
+        stm32_alive=stm32_alive,
+    )
+    data_link.publish(encode_resident_state(frame))
+    return True
+
+
+def resident_machine_state_control_enabled(
+    *,
+    runtime_control_enabled: bool,
+    core: ResidentMotionCore,
+) -> bool:
+    """Expose the active resident policy gate in ``machine_state_v1``.
+
+    Both RL and ACT are valid motion owners.  Reporting only the RL phase as
+    enabled made live state appear disabled throughout an otherwise healthy
+    ACT segment.
+    """
+
+    return (
+        bool(runtime_control_enabled)
+        and core.mission_lease_is_active
+        and (core.rl_is_active or core.act_is_active)
+    )
+
+
+def resident_rl_behavior_authorization(
+    resident_action_transport: bool,
+    core: ResidentMotionCore,
+) -> Callable[[], bool] | None:
+    """Bind remote RL behaviors to the generation selected by the Mission."""
+
+    if not resident_action_transport:
+        return None
+    return lambda: core.mission_lease_is_active and core.rl_is_active
+
+
+def resident_rl_behavior_idle_probe(
+    executor_supplier: Callable[[], object | None],
+) -> Callable[[], bool]:
+    """Report whether a resident RL behavior has fully released its runner."""
+
+    if not callable(executor_supplier):
+        raise ValueError("executor_supplier must be callable")
+
+    def is_idle() -> bool:
+        executor = executor_supplier()
+        if executor is None:
+            return True
+        return getattr(executor, "busy") is False
+
+    return is_idle
+
+
+def resident_act_activation_gate(
+    executor_supplier: Callable[[], object | None],
+) -> Callable[[Callable[[], object]], object]:
+    """Atomically claim ACT only while the remote RL executor is idle."""
+
+    if not callable(executor_supplier):
+        raise ValueError("executor_supplier must be callable")
+
+    def run_when_idle(operation: Callable[[], object]) -> object:
+        executor = executor_supplier()
+        if executor is None:
+            raise RuntimeError("resident RL behavior executor is unavailable")
+        gate = getattr(executor, "run_when_idle", None)
+        if not callable(gate):
+            raise RuntimeError("resident RL behavior executor gate is unavailable")
+        return gate(operation)
+
+    return run_when_idle
+
+
+def resident_owner_tick_requests_exit(
+    core: ResidentMotionCore | None,
+    *,
+    initialized: bool,
+    now_monotonic_ns: int,
+) -> bool:
+    """Run owner watchdogs independently of telemetry and detect terminal stop."""
+
+    if core is None or not initialized:
+        return False
+    core.tick(now_monotonic_ns=now_monotonic_ns)
+    if core.is_operational:
+        return False
+    LOGGER.warning(
+        "resident motion core disarmed; exiting owner to release serial, "
+        "ACT data link, and control sockets"
+    )
+    return True
 
 
 def validate_state(
@@ -401,6 +730,18 @@ def build_machine_state_packet(
         state,
         last_receive_monotonic_s,
     )
+    merged_control_enabled = bool(control_enabled)
+    merged_estop = bool(estop)
+    if state.hardware_motion_gate_available:
+        merged_control_enabled = (
+            merged_control_enabled and state.stm32_control_enabled
+        )
+        merged_estop = merged_estop or state.stm32_estop
+        if state.stm32_fault_flags:
+            fault_flags.append(
+                f"stm32_fault_flags:0x{state.stm32_fault_flags:08x}"
+            )
+            sensor_valid = False
 
     packet: Dict = {
         "type": "machine_state_v1",
@@ -411,10 +752,10 @@ def build_machine_state_packet(
         "machine_id": machine_id,
         "stm32_stamp_ms": state.t_ms,
         "safety": {
-            "estop": estop,
+            "estop": merged_estop,
             "stm32_alive": stm32_alive,
             "sensor_valid": sensor_valid,
-            "control_enabled": control_enabled,
+            "control_enabled": merged_control_enabled,
             "fault_flags": fault_flags,
         },
         "actuator_state": {
@@ -476,24 +817,17 @@ class Stm32VelocityCommandEncoder:
     """Encode the unified STM32 physical-velocity command contract."""
 
     def __init__(self) -> None:
-        self._next_sequence = 0
+        self._encoder = Stm32ResidentCommandEncoder()
 
     @property
     def next_sequence(self) -> int:
-        return self._next_sequence
+        return self._encoder.next_sequence
 
     def synchronize(self, *, command_rx_seq: int, command_received: bool) -> int:
-        if (
-            isinstance(command_rx_seq, bool)
-            or not isinstance(command_rx_seq, int)
-            or command_rx_seq < 0
-            or command_rx_seq > 0xFFFFFFFF
-        ):
-            raise ValueError("command_rx_seq must be a uint32")
-        self._next_sequence = (
-            (command_rx_seq + 1) & 0xFFFFFFFF if command_received else 0
+        return self._encoder.synchronize(
+            command_rx_seq=command_rx_seq,
+            command_received=command_received,
         )
-        return self._next_sequence
 
     def encode(self, command: DataCommand) -> bytes:
         values = (
@@ -507,17 +841,16 @@ class Stm32VelocityCommandEncoder:
             raise ValueError("STM32 velocity command values must be finite")
         if command.t_s < 0.0:
             raise ValueError("STM32 velocity command time must be non-negative")
-        payload = {
-            "schema_version": STM32_VELOCITY_COMMAND_SCHEMA_VERSION,
-            "boom_mps": command.boom_v_ref_mps,
-            "stick_mps": command.stick_v_ref_mps,
-            "bucket_mps": command.bucket_v_ref_mps,
-            "swing_radps": command.swing_v_ref_radps,
-            "command_seq": self._next_sequence,
-            "command_source_stamp_ms": int(command.t_s * 1000.0) & 0xFFFFFFFF,
-        }
-        self._next_sequence = (self._next_sequence + 1) & 0xFFFFFFFF
-        return (json.dumps(payload, separators=(",", ":")) + "\n").encode("ascii")
+        return self._encoder.encode(
+            mode=ControlMode.VELOCITY_REFERENCE,
+            action=(
+                command.boom_v_ref_mps,
+                command.stick_v_ref_mps,
+                command.bucket_v_ref_mps,
+                command.swing_v_ref_radps,
+            ),
+            monotonic_ns=int(command.t_s * 1_000_000_000),
+        )
 
 
 def zero_data_command(command_time_s: float) -> DataCommand:
@@ -908,9 +1241,87 @@ def edge_mode_controls_motion(mode: str) -> bool:
     return mode in ("control", "remote_control")
 
 
+def validate_trajectory_controller_commissioning(
+    edge_config: object,
+    authorization: str,
+) -> None:
+    """Require an independent opt-in for an unqualified powered controller."""
+    if not edge_mode_controls_motion(getattr(edge_config, "mode", "")):
+        return
+    backend = getattr(
+        edge_config,
+        "trajectory_controller_backend",
+        "onnx_rl",
+    )
+    if backend != "cartesian_p":
+        return
+    if authorization != CARTESIAN_P_COMMISSIONING_AUTHORIZATION:
+        raise RuntimeError(
+            "cartesian_p powered mode requires exact commissioning authorization: "
+            + CARTESIAN_P_COMMISSIONING_AUTHORIZATION
+        )
+
+
+def validate_resident_motion_request(args: argparse.Namespace, edge_config: object) -> None:
+    if not args.resident_motion_core:
+        return
+    if edge_config is None:
+        raise ValueError("resident motion core requires an edge config")
+    if not edge_mode_controls_motion(getattr(edge_config, "mode", "")):
+        raise ValueError("resident motion core requires an edge motion mode")
+    if args.input_format != "csv":
+        raise ValueError("resident motion core requires unified STM32 CSV telemetry")
+    if not args.control_enabled:
+        raise ValueError("resident motion core requires --control-enabled")
+    if (
+        getattr(edge_config, "action_transport", DEFAULT_EDGE_ACTION_TRANSPORT)
+        != RESIDENT_EDGE_ACTION_TRANSPORT
+    ):
+        raise ValueError(
+            "resident motion core requires edge action_transport=resident_sink"
+        )
+
+
+def edge_uses_resident_action_transport(edge_config: object | None) -> bool:
+    if edge_config is None:
+        return False
+    return edge_mode_controls_motion(getattr(edge_config, "mode", "")) and (
+        getattr(edge_config, "action_transport", DEFAULT_EDGE_ACTION_TRANSPORT)
+        == RESIDENT_EDGE_ACTION_TRANSPORT
+    )
+
+
 def _raise_keyboard_interrupt_on_termination(_signum, _frame) -> None:
     """Route process-manager SIGTERM through the existing terminal-zero cleanup."""
     raise KeyboardInterrupt
+
+
+def wait_for_hardware_start_gate(
+    path: str | Path,
+    *,
+    poll_interval_s: float = 0.05,
+) -> None:
+    """Finish model loading, then wait without opening the STM32 serial port.
+
+    The gate is a one-shot file: the process that creates it transfers hardware
+    ownership only after the previous Runtime has written terminal zero and
+    proved that ``/dev/ttyTHS1`` is released.
+    """
+
+    gate = Path(path)
+    if not gate.is_absolute():
+        raise ValueError("hardware start gate must be an absolute path")
+    if not math.isfinite(poll_interval_s) or poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be positive and finite")
+    LOGGER.info("RL prewarm ready: waiting for hardware start gate: %s", gate)
+    while True:
+        try:
+            gate.unlink()
+        except FileNotFoundError:
+            time.sleep(poll_interval_s)
+        else:
+            LOGGER.info("RL hardware start gate accepted: %s", gate)
+            return
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -1006,9 +1417,54 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--edge-motion-authorization",
         default="",
         help=(
-            "Exact token required when edge config mode=control: "
+            "Exact token required when edge config mode=control or "
+            "remote_control: "
             + EDGE_MOTION_AUTHORIZATION
         ),
+    )
+    parser.add_argument(
+        "--trajectory-controller-commissioning-authorization",
+        default="",
+        help=(
+            "Independent exact authorization required when cartesian_p is "
+            "selected in control or remote_control: "
+            + CARTESIAN_P_COMMISSIONING_AUTHORIZATION
+        ),
+    )
+    parser.add_argument(
+        "--hardware-start-gate",
+        type=Path,
+        help=(
+            "After loading edge assets and ONNX, wait for this absolute one-shot "
+            "file before opening the STM32 serial port."
+        ),
+    )
+    parser.add_argument(
+        "--resident-motion-core",
+        action="store_true",
+        help=(
+            "Use the experimental single-owner resident RL/ACT command core. "
+            "Requires a motion edge config and unified STM32 CSV telemetry."
+        ),
+    )
+    parser.add_argument(
+        "--resident-act-socket",
+        type=Path,
+        default=Path(
+            os.getenv("RESIDENT_ACT_SOCKET", str(DEFAULT_RESIDENT_ACT_SOCKET))
+        ),
+        help="Absolute Unix socket shared with the resident ACT worker.",
+    )
+    parser.add_argument(
+        "--resident-control-socket",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "RESIDENT_CONTROL_SOCKET",
+                str(DEFAULT_RESIDENT_CONTROL_SOCKET),
+            )
+        ),
+        help="Absolute Unix socket for low-rate resident policy handoff commands.",
     )
     return parser.parse_args(argv)
 
@@ -1038,6 +1494,14 @@ def main() -> None:
                     "edge control requires --edge-motion-authorization "
                     + EDGE_MOTION_AUTHORIZATION
                 )
+            validate_trajectory_controller_commissioning(
+                edge_config,
+                getattr(
+                    args,
+                    "trajectory_controller_commissioning_authorization",
+                    "",
+                ),
+            )
             args.action_bind_host = "127.0.0.1"
             allowed_action_host = "127.0.0.1"
         # Validate copied assets and load ONNX before taking serial ownership.
@@ -1053,29 +1517,84 @@ def main() -> None:
             )
         else:
             edge_runtime = build_edge_follow_runtime(edge_config)
+    validate_resident_motion_request(args, edge_config)
 
-    LOGGER.info(
-        "opening serial %s @ %d, sending UDP JSON to %s:%d, listening policy_action on %s:%d from %s",
-        args.serial_port,
-        args.baudrate,
-        args.pc_host,
-        args.pc_port,
-        args.action_bind_host,
-        args.action_bind_port,
-        allowed_action_host,
+    if args.hardware_start_gate is not None:
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_termination)
+        try:
+            wait_for_hardware_start_gate(args.hardware_start_gate)
+        except KeyboardInterrupt:
+            LOGGER.info("RL prewarm cancelled before hardware acquisition")
+            return
+
+    resident_action_transport = (
+        args.resident_motion_core
+        and edge_uses_resident_action_transport(edge_config)
     )
+    if resident_action_transport:
+        LOGGER.info(
+            "opening serial %s @ %d, sending UDP JSON to %s:%d, using resident action sink for %s",
+            args.serial_port,
+            args.baudrate,
+            args.pc_host,
+            args.pc_port,
+            edge_config.mode,
+        )
+    else:
+        LOGGER.info(
+            "opening serial %s @ %d, sending UDP JSON to %s:%d, listening policy_action on %s:%d from %s",
+            args.serial_port,
+            args.baudrate,
+            args.pc_host,
+            args.pc_port,
+            args.action_bind_host,
+            args.action_bind_port,
+            allowed_action_host,
+        )
 
     ser = open_serial(args.serial_port, args.baudrate, timeout_s=STM32_TIMEOUT_S)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    action_sock = open_action_socket(args.action_bind_host, args.action_bind_port)
-    action_relay = ActionRelay(
-        action_sock=action_sock,
-        ser=ser,
-        allowed_action_host=allowed_action_host,
-        control_enabled=args.control_enabled,
-        estop=args.estop,
-    )
-    action_relay.start()
+    action_sock = None
+    action_relay = None
+    resident_motion_core = None
+    resident_data_link = None
+    resident_control_server = None
+    resident_initialized = False
+    resident_hardware_ready_logged = False
+    behavior_executor = None
+    if resident_action_transport:
+        resident_motion_core = ResidentMotionCore(
+            ser,
+            max_state_age_ms=DEFAULT_RESIDENT_STATE_AGE_MS,
+        )
+        resident_data_link = ResidentActDataLink(
+            args.resident_act_socket,
+            on_candidate=resident_motion_core.submit_act,
+            on_connection_lost=(
+                resident_motion_core.notify_act_worker_disconnected
+            ),
+        )
+        resident_control_server = ResidentMotionControlServer(
+            resident_motion_core,
+            socket_path=str(args.resident_control_socket),
+            act_worker_ready=lambda: resident_data_link.connected,
+            rl_behavior_idle=resident_rl_behavior_idle_probe(
+                lambda: behavior_executor
+            ),
+            activate_act_while_rl_idle=resident_act_activation_gate(
+                lambda: behavior_executor
+            ),
+        )
+    else:
+        action_sock = open_action_socket(args.action_bind_host, args.action_bind_port)
+        action_relay = ActionRelay(
+            action_sock=action_sock,
+            ser=ser,
+            allowed_action_host=allowed_action_host,
+            control_enabled=args.control_enabled,
+            estop=args.estop,
+        )
+        action_relay.start()
     edge_runner = None
     edge_action_sender = None
     remote_executor = None
@@ -1095,18 +1614,28 @@ def main() -> None:
         elif edge_config.mode == "control":
             from edge_runtime.control import EdgeControlRunner
 
-            edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            edge_action_sender.connect(("127.0.0.1", args.action_bind_port))
+            if resident_action_transport:
+                edge_action_sink = resident_motion_core.rl_action_sink
+            else:
+                edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                edge_action_sender.connect(("127.0.0.1", args.action_bind_port))
+                edge_action_sink = edge_action_sender
             edge_runner = EdgeControlRunner(
                 runtime=edge_runtime,
-                action_sink=edge_action_sender,
+                action_sink=edge_action_sink,
                 audit_path=edge_config.audit_path,
                 valid_for_ms=edge_config.action_valid_for_ms,
+                retain_action_authority=resident_action_transport,
             )
-            LOGGER.warning(
-                "EDGE CONTROL ARMED: local inference owns loopback action source on 127.0.0.1:%d",
-                args.action_bind_port,
-            )
+            if resident_action_transport:
+                LOGGER.warning(
+                    "EDGE CONTROL ARMED: local inference owns the resident STM32 command sink"
+                )
+            else:
+                LOGGER.warning(
+                    "EDGE CONTROL ARMED: local inference owns loopback action source on 127.0.0.1:%d",
+                    args.action_bind_port,
+                )
         else:
             from edge_runtime.control import (
                 ActionSequence,
@@ -1116,27 +1645,43 @@ def main() -> None:
             from edge_runtime.cycle import EdgeCycleCoordinator
             from edge_runtime.remote import EdgeBehaviorExecutor, RemoteBehaviorServer
 
-            edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            edge_action_sender.connect(("127.0.0.1", args.action_bind_port))
+            if not resident_action_transport:
+                edge_action_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                edge_action_sender.connect(("127.0.0.1", args.action_bind_port))
+                resident_rl_action_sink = None
+            else:
+                resident_rl_action_sink = resident_motion_core.rl_action_sink
             edge_action_sequence = ActionSequence()
+
+            def build_follow_sink():
+                if resident_action_transport:
+                    return resident_rl_action_sink
+                return edge_action_sender
+
+            def build_fixed_sink(_behavior: str):
+                if resident_action_transport:
+                    return resident_rl_action_sink
+                return edge_action_sender
 
             def build_remote_runner(runtime):
                 return EdgeControlRunner(
                     runtime=runtime,
-                    action_sink=edge_action_sender,
+                    action_sink=build_follow_sink(),
                     audit_path=edge_config.audit_path,
                     valid_for_ms=edge_config.action_valid_for_ms,
                     action_sequence=edge_action_sequence,
+                    retain_action_authority=resident_action_transport,
                 )
 
             def build_fixed_action_runner(runtime, behavior):
                 return FixedActionControlRunner(
                     runtime=runtime,
                     behavior=behavior,
-                    action_sink=edge_action_sender,
+                    action_sink=build_fixed_sink(behavior),
                     audit_path=edge_config.audit_path,
                     valid_for_ms=edge_config.action_valid_for_ms,
                     action_sequence=edge_action_sequence,
+                    retain_action_authority=resident_action_transport,
                 )
 
             remote = edge_config.remote_behavior
@@ -1147,6 +1692,10 @@ def main() -> None:
                 fixed_runner_factory=build_fixed_action_runner,
                 sender_constructed=True,
                 state_timeout_s=remote.status_timeout_s,
+                resident_rl_authorized=resident_rl_behavior_authorization(
+                    resident_action_transport,
+                    resident_motion_core,
+                ),
             )
             remote_executor = EdgeCycleCoordinator(behavior_executor)
             remote_server = RemoteBehaviorServer(
@@ -1159,78 +1708,187 @@ def main() -> None:
             try:
                 remote_server.start()
             except Exception:
-                edge_action_sender.close()
-                action_relay.close()
-                action_sock.close()
+                if edge_action_sender is not None:
+                    edge_action_sender.close()
+                if action_relay is not None:
+                    action_relay.close()
+                if action_sock is not None:
+                    action_sock.close()
                 sock.close()
                 ser.close()
                 raise
-            LOGGER.warning(
-                "REMOTE EDGE CONTROL ARMED IDLE: behavior RPC %s:%d from %s; "
-                "actions remain loopback-only on 127.0.0.1:%d",
-                remote.bind_host,
-                remote.bind_port,
-                remote.allowed_client_host,
-                args.action_bind_port,
-            )
+            if resident_action_transport:
+                LOGGER.warning(
+                    "REMOTE EDGE CONTROL ARMED IDLE: behavior RPC %s:%d from %s; "
+                    "actions use the resident STM32 command sink",
+                    remote.bind_host,
+                    remote.bind_port,
+                    remote.allowed_client_host,
+                )
+            else:
+                LOGGER.warning(
+                    "REMOTE EDGE CONTROL ARMED IDLE: behavior RPC %s:%d from %s; "
+                    "actions remain loopback-only on 127.0.0.1:%d",
+                    remote.bind_host,
+                    remote.bind_port,
+                    remote.allowed_client_host,
+                    args.action_bind_port,
+                )
 
     seq = 0
     last_receive_monotonic_s: Optional[float] = None
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_termination)
 
     try:
+        if resident_data_link is not None:
+            resident_data_link.start()
+        if resident_control_server is not None:
+            resident_control_server.start()
+        if resident_action_transport:
+            LOGGER.info(
+                "RESIDENT_CONTROL_READY control_socket=%s act_socket=%s",
+                args.resident_control_socket,
+                args.resident_act_socket,
+            )
         while True:
+            if resident_owner_tick_requests_exit(
+                resident_motion_core,
+                initialized=resident_initialized,
+                now_monotonic_ns=time.monotonic_ns(),
+            ):
+                break
             if args.input_format == "binary":
                 frame = read_exact(ser, STM32_FRAME_SIZE)
                 if frame is None:
                     LOGGER.warning("STM32 serial timeout, no complete %d-byte frame", STM32_FRAME_SIZE)
-                    action_relay.update_safety(sensor_valid=False, stm32_alive=False)
+                    if action_relay is not None:
+                        action_relay.update_safety(sensor_valid=False, stm32_alive=False)
+                    elif resident_motion_core is not None and resident_initialized:
+                        resident_motion_core.invalidate_telemetry(
+                            receive_monotonic_ns=time.monotonic_ns(),
+                            stm32_alive=False,
+                        )
                     continue
 
                 try:
                     state = parse_stm32_frame(frame)
                 except ValueError as exc:
                     LOGGER.warning("drop invalid STM32 frame: %s", exc)
-                    action_relay.update_safety(sensor_valid=False, stm32_alive=True)
+                    if action_relay is not None:
+                        action_relay.update_safety(sensor_valid=False, stm32_alive=True)
+                    elif resident_motion_core is not None and resident_initialized:
+                        resident_motion_core.invalidate_telemetry(
+                            receive_monotonic_ns=time.monotonic_ns(),
+                            stm32_alive=True,
+                        )
                     continue
             else:
                 raw_line = ser.readline()
                 if not raw_line:
                     LOGGER.warning("STM32 serial timeout, no CSV line")
-                    action_relay.update_safety(sensor_valid=False, stm32_alive=False)
+                    if action_relay is not None:
+                        action_relay.update_safety(sensor_valid=False, stm32_alive=False)
+                    elif resident_motion_core is not None and resident_initialized:
+                        resident_motion_core.invalidate_telemetry(
+                            receive_monotonic_ns=time.monotonic_ns(),
+                            stm32_alive=False,
+                        )
                     continue
 
                 try:
                     state = parse_stm32_csv_line(raw_line.decode("utf-8", errors="replace"))
                 except ValueError as exc:
                     LOGGER.warning("drop invalid STM32 CSV line: %s", exc)
-                    action_relay.update_safety(sensor_valid=False, stm32_alive=True)
+                    if action_relay is not None:
+                        action_relay.update_safety(sensor_valid=False, stm32_alive=True)
+                    elif resident_motion_core is not None and resident_initialized:
+                        resident_motion_core.invalidate_telemetry(
+                            receive_monotonic_ns=time.monotonic_ns(),
+                            stm32_alive=True,
+                        )
                     continue
 
                 if state is None:
-                    action_relay.update_safety(sensor_valid=False, stm32_alive=True)
+                    if action_relay is not None:
+                        action_relay.update_safety(sensor_valid=False, stm32_alive=True)
+                    elif resident_motion_core is not None and resident_initialized:
+                        resident_motion_core.invalidate_telemetry(
+                            receive_monotonic_ns=time.monotonic_ns(),
+                            stm32_alive=True,
+                        )
                     continue
 
             last_receive_monotonic_s = time.monotonic()
-            action_relay.synchronize_command_sequence(state)
+            stm32_alive, sensor_valid, _ = validate_state(
+                state,
+                last_receive_monotonic_s,
+            )
+            if resident_motion_core is not None:
+                receive_monotonic_ns = time.monotonic_ns()
+                resident_frame = resident_telemetry_from_state(
+                    state,
+                    receive_monotonic_ns=receive_monotonic_ns,
+                    runtime_control_enabled=args.control_enabled,
+                    runtime_estop=args.estop,
+                    sensor_valid=sensor_valid,
+                    stm32_alive=stm32_alive,
+                )
+                if not resident_initialized:
+                    resident_motion_core.initialize(resident_frame)
+                    resident_motion_core.activate_rl(
+                        now_monotonic_ns=resident_frame.receive_monotonic_ns
+                    )
+                    resident_motion_core.renew_mission_lease(
+                        lease_ms=DEFAULT_MISSION_LEASE_MS,
+                        now_monotonic_ns=resident_frame.receive_monotonic_ns,
+                    )
+                    resident_initialized = True
+                else:
+                    resident_motion_core.observe_telemetry(resident_frame)
+                if sensor_valid and not resident_hardware_ready_logged:
+                    LOGGER.info("RESIDENT_HARDWARE_READY sensor_valid=True")
+                    resident_hardware_ready_logged = True
+                publish_resident_act_state_if_active(
+                    state=state,
+                    receive_monotonic_ns=receive_monotonic_ns,
+                    core=resident_motion_core,
+                    data_link=resident_data_link,
+                    runtime_control_enabled=args.control_enabled,
+                    runtime_estop=args.estop,
+                    sensor_valid=sensor_valid,
+                    stm32_alive=stm32_alive,
+                )
+            else:
+                action_relay.synchronize_command_sequence(state)
             packet = build_machine_state_packet(
                 state=state,
                 seq=seq,
                 machine_id=args.machine_id,
-                control_enabled=args.control_enabled and action_relay.is_healthy,
+                control_enabled=(
+                    resident_machine_state_control_enabled(
+                        runtime_control_enabled=args.control_enabled,
+                        core=resident_motion_core,
+                    )
+                    if resident_motion_core is not None
+                    else args.control_enabled and action_relay.is_healthy
+                ),
                 estop=args.estop,
                 include_raw=args.include_raw,
                 last_receive_monotonic_s=last_receive_monotonic_s,
             )
-            action_relay.update_safety(
-                sensor_valid=packet["safety"]["sensor_valid"],
-                stm32_alive=packet["safety"]["stm32_alive"],
-            )
+            if action_relay is not None:
+                action_relay.update_safety(
+                    sensor_valid=packet["safety"]["sensor_valid"],
+                    stm32_alive=packet["safety"]["stm32_alive"],
+                )
             send_udp_json(sock, packet, args.pc_host, args.pc_port)
             if edge_runner is not None:
                 if edge_config.mode == "shadow":
                     edge_runner.observe(packet)
-                else:
+                elif (
+                    resident_motion_core is None
+                    or resident_motion_core.rl_is_active
+                ):
                     edge_runner.observe(
                         packet,
                         now_s=time.monotonic(),
@@ -1267,14 +1925,49 @@ def main() -> None:
                     elif edge_runner is not None:
                         edge_runner.close()
                 finally:
-                    action_relay.close()
+                    if action_relay is not None:
+                        action_relay.close()
+                    elif resident_motion_core is not None and resident_initialized:
+                        terminal_result = resident_motion_core.terminal_disarm(
+                            now_monotonic_ns=time.monotonic_ns()
+                        )
+                        if wait_for_resident_terminal_zero_ack(
+                            ser,
+                            terminal_result,
+                        ):
+                            LOGGER.info(
+                                "resident terminal zero acknowledged: command_seq=%s mode=%s",
+                                terminal_result.command_seq,
+                                (
+                                    None
+                                    if terminal_result.mode is None
+                                    else terminal_result.mode.value
+                                ),
+                            )
+                        else:
+                            LOGGER.warning(
+                                "resident terminal zero was not acknowledged before serial close: "
+                                "command_seq=%s mode=%s",
+                                terminal_result.command_seq,
+                                (
+                                    None
+                                    if terminal_result.mode is None
+                                    else terminal_result.mode.value
+                                ),
+                            )
+                            raise RuntimeError(
+                                "resident terminal zero was not acknowledged"
+                            )
         finally:
+            if resident_control_server is not None:
+                resident_control_server.close()
+            if resident_data_link is not None:
+                resident_data_link.close()
             if edge_action_sender is not None:
                 edge_action_sender.close()
-            action_sock.close()
+            if action_sock is not None:
+                action_sock.close()
             sock.close()
             ser.close()
-
-
 if __name__ == "__main__":
     main()

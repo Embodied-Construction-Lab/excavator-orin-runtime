@@ -61,7 +61,7 @@ serial `/dev/ttyTHS1` at `460800` and behavior RPC TCP `18083`. After the
 explicit start-pose/preposition check, start the Orin side first:
 
 ```bash
-cd ~/workspace_/excavator-orin-runtime
+cd /home/jetson16/workspace_excavator/excavator-orin-runtime
 conda activate excavator-orin
 
 mkdir -p deploy/logs
@@ -87,11 +87,19 @@ python orin_state_sender.py \
 RViz button order are maintained in the `AiryLidar/README.md` section
 “强化学习 Orin + PC 真机测试速查”.
 
+The hybrid Mission Adapter may additionally pass an absolute
+`--hardware-start-gate`. In that internal mode the process validates deployment
+assets and loads ONNX first, logs `RL prewarm ready`, and waits without opening
+the serial port, action socket, behavior RPC port, or publishing Machine State.
+The Adapter creates the one-shot gate only after the previous Runtime has sent
+terminal zero and `/dev/ttyTHS1` is confirmed released. This flag is an internal
+handoff mechanism; normal standalone RL commands do not need it.
+
 ## Installation on Orin
 
 ```bash
-git clone <your-private-remote> ~/excavator-orin-runtime
-cd ~/excavator-orin-runtime
+git clone <your-private-remote> /home/jetson16/workspace_excavator/excavator-orin-runtime
+cd /home/jetson16/workspace_excavator/excavator-orin-runtime
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -147,7 +155,7 @@ sha256sum /tmp/excavator-edge-assets/*
 Copy those six files to `<ORIN_REPO>/deploy/assets/`, then on Orin:
 
 ```bash
-cd ~/excavator-orin-runtime
+cd /home/jetson16/workspace_excavator/excavator-orin-runtime
 mkdir -p deploy/assets deploy/logs
 cp deploy/edge_runtime.example.json deploy/edge_runtime.json
 python3 -m json.tool deploy/edge_runtime.json >/dev/null
@@ -157,6 +165,28 @@ python3 -m unittest discover -s tests -v
 The trajectory snapshot must use `frame_id=machine_root_ros`. The URDF FK root
 is `fk_root`; the current deployed frame adapter is the explicit identity
 `machine_root_ros -> fk_root`.
+
+`trajectory_controller_backend` is the strict algorithm-selection seam. Keep
+the active field configuration explicit as `onnx_rl`. `cartesian_p` is a
+deterministic reference controller for controlled ablation experiments; it
+shares the same 38D input and normalized `[boom, stick, bucket, swing]` output
+contract, but it is not field-qualified merely by selecting the name. Shadow
+mode may select `cartesian_p` without motion authorization. In `control` or
+`remote_control`, it additionally requires this independent exact launch opt-in:
+
+```bash
+--trajectory-controller-commissioning-authorization \
+  ALLOW_CARTESIAN_P_MACHINE_MOTION
+```
+
+This literal is an auditable commissioning acknowledgement, not a secret. It
+does not replace `--control-enabled` or `--edge-motion-authorization`; a missing
+or incorrect value is rejected before controller construction or serial
+ownership. The `onnx_rl` launch contract is unchanged. Legacy configs without
+the backend field continue to mean `onnx_rl`; unknown names fail at
+configuration load. `onnx_path` is mandatory for `onnx_rl` and may be omitted
+for `cartesian_p`, so the classical ablation does not depend on an unrelated
+model artifact.
 
 The execution waypoint tolerance and Follow deadline have one authoritative
 source:
@@ -176,7 +206,7 @@ Mission asset.
 Keep `mode` set to `shadow` in `deploy/edge_runtime.json`, then start:
 
 ```bash
-cd ~/excavator-orin-runtime
+cd /home/jetson16/workspace_excavator/excavator-orin-runtime
 source .venv/bin/activate
 
 python3 orin_state_sender.py \
@@ -373,7 +403,7 @@ PC live actions and local CSV replay must not be enabled at the same time.
 Stop the running bridge before changing code, then update to an intentional commit:
 
 ```bash
-cd ~/excavator-orin-runtime
+cd /home/jetson16/workspace_excavator/excavator-orin-runtime
 git pull --ff-only
 source .venv/bin/activate
 python3 -m unittest discover -s tests -v

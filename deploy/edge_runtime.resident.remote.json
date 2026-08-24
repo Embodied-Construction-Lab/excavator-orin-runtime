@@ -1,13 +1,21 @@
 {
   "schema_version": "orin_edge_runtime.v1",
-  "mode": "shadow",
+  "mode": "remote_control",
+  "action_transport": "resident_sink",
   "machine_profile_path": "assets/machine_profile.json",
   "urdf_path": "assets/waji.urdf",
   "onnx_path": "assets/policy.onnx",
   "trajectory_controller_backend": "onnx_rl",
-  "trajectory_path": "assets/trajectory_command.json",
   "mission_path": "assets/excavation_cycle.json",
+  "fixed_action_profile_path": "assets/fixed_actions.json",
   "audit_path": "logs/edge_runtime.jsonl",
   "action_valid_for_ms": 300,
-  "follow_action_slew_rate_per_s": 2.0
+  "follow_action_slew_rate_per_s": 2.0,
+  "remote_behavior": {
+    "bind_host": "0.0.0.0",
+    "bind_port": 18083,
+    "allowed_client_host": "192.168.50.1",
+    "status_hz": 5.0,
+    "status_timeout_s": 0.3
+  }
 }
