@@ -420,19 +420,22 @@ class ResidentCommandSink:
             self._cancel_handoff_measurement_locked()
 
         snapshot = self._authority.snapshot()
-        if snapshot.active_binding is None or self._pending_ack is not None:
+        if snapshot.active_binding is None:
             return
-        if self._safety_permits_locked(
+        safety_permits = self._safety_permits_locked(
             now_monotonic_ns=frame.receive_monotonic_ns,
             expected_mode=snapshot.active_binding.mode,
-        ):
-            self._unsafe_zero_latched = False
+        )
+        if not safety_permits:
+            if not self._unsafe_zero_latched:
+                self._revoke_for_safety_locked(
+                    frame.receive_monotonic_ns,
+                    reason="unsafe_telemetry",
+                )
             return
-        if not self._unsafe_zero_latched:
-            self._revoke_for_safety_locked(
-                frame.receive_monotonic_ns,
-                reason="unsafe_telemetry",
-            )
+        if self._pending_ack is not None:
+            return
+        self._unsafe_zero_latched = False
 
     def submit_candidate(
         self,
@@ -725,12 +728,20 @@ class ResidentCommandSink:
         pending = self._pending_ack
         if pending is None:
             return False
-        return (
+        command_matches = (
             frame.command_rx_seq == pending.command_seq
             and frame.command_valid
             and not frame.command_timed_out
             and frame.control_mode is pending.mode
             and frame.command_action == ZERO_ACTION
+        )
+        if not command_matches:
+            return False
+        if pending.purpose != "target_mode_claim":
+            return True
+        return self._safety_permits_locked(
+            now_monotonic_ns=frame.receive_monotonic_ns,
+            expected_mode=pending.mode,
         )
 
     def _first_nonzero_ack_matches_locked(

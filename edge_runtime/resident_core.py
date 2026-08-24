@@ -44,6 +44,18 @@ class ActSegmentSnapshot:
 
 
 @dataclass(frozen=True)
+class ResidentControlSnapshot:
+    """One coherent control-plane view from a single core lock boundary."""
+
+    motion: ResidentMotionSnapshot
+    act_segment: ActSegmentSnapshot
+    rl_is_active: bool
+    act_is_active: bool
+    mission_lease_active: bool
+    is_operational: bool
+
+
+@dataclass(frozen=True)
 class _ActSegmentTracker:
     generation: int | None = None
     max_steps: int | None = None
@@ -170,6 +182,45 @@ class ResidentMotionCore:
 
     def snapshot(self) -> ResidentMotionSnapshot:
         return self._sink.snapshot()
+
+    def control_status_snapshot(self) -> ResidentControlSnapshot:
+        """Return motion authority and ACT progress from the same instant.
+
+        ACT completion automatically starts the ACT-to-RL handoff while holding
+        ``_control_lock``.  Reading authority and segment progress separately can
+        therefore combine the pre-handoff authority with post-handoff progress.
+        The control wire must use this atomic view instead.
+        """
+
+        with self._control_lock:
+            motion = self._sink.snapshot()
+            segment = self._act_segment
+            is_operational = self._sink.is_operational
+            deadline = self._mission_lease_deadline_ns
+            mission_lease_active = (
+                deadline is not None
+                and is_operational
+                and self._monotonic_ns() < deadline
+            )
+            return ResidentControlSnapshot(
+                motion=motion,
+                act_segment=ActSegmentSnapshot(
+                    generation=segment.generation,
+                    max_steps=segment.max_steps,
+                    completed_steps=segment.completed_steps,
+                    complete=segment.complete,
+                ),
+                rl_is_active=(
+                    motion.phase is HandoffPhase.ACTIVE
+                    and motion.active_binding == RL_BINDING
+                ),
+                act_is_active=(
+                    motion.phase is HandoffPhase.ACTIVE
+                    and motion.active_binding == ACT_BINDING
+                ),
+                mission_lease_active=mission_lease_active,
+                is_operational=is_operational,
+            )
 
     def _binding_is_active(self, binding: PolicyBinding) -> bool:
         snapshot = self._sink.snapshot()

@@ -472,8 +472,24 @@ def _validate_request(value: Any) -> tuple[str, int | None]:
 
 
 def _status(core: Any, *, act_worker_ready: bool) -> dict[str, Any]:
-    snapshot = core.snapshot()
-    act_segment = core.act_segment_snapshot()
+    atomic_snapshot = getattr(core, "control_status_snapshot", None)
+    if callable(atomic_snapshot):
+        control_snapshot = atomic_snapshot()
+        snapshot = control_snapshot.motion
+        act_segment = control_snapshot.act_segment
+        rl_is_active = control_snapshot.rl_is_active
+        act_is_active = control_snapshot.act_is_active
+        mission_lease_active = control_snapshot.mission_lease_active
+        is_operational = control_snapshot.is_operational
+    else:
+        # Compatibility for small injected test doubles.  Production cores
+        # always expose the atomic control_status_snapshot boundary.
+        snapshot = core.snapshot()
+        act_segment = core.act_segment_snapshot()
+        rl_is_active = core.rl_is_active
+        act_is_active = core.act_is_active
+        mission_lease_active = core.mission_lease_is_active
+        is_operational = core.is_operational
     phase = HandoffPhase(snapshot.phase)
     generation = _uint64("control_generation", snapshot.generation)
     latency = snapshot.last_handoff_latency_ms
@@ -500,8 +516,8 @@ def _status(core: Any, *, act_worker_ready: bool) -> dict[str, Any]:
         "active": _binding(snapshot.active_binding),
         "target": _binding(snapshot.target_binding),
         "last_handoff_latency_ms": latency,
-        "rl_is_active": _boolean("rl_is_active", core.rl_is_active),
-        "act_is_active": _boolean("act_is_active", core.act_is_active),
+        "rl_is_active": _boolean("rl_is_active", rl_is_active),
+        "act_is_active": _boolean("act_is_active", act_is_active),
         "act_worker_ready": _boolean("act_worker_ready", act_worker_ready),
         "act_segment_generation": _optional_uint64(
             "act_segment_generation", act_segment.generation
@@ -512,9 +528,9 @@ def _status(core: Any, *, act_worker_ready: bool) -> dict[str, Any]:
             "act_segment_complete", act_segment.complete
         ),
         "mission_lease_active": _boolean(
-            "mission_lease_active", core.mission_lease_is_active
+            "mission_lease_active", mission_lease_active
         ),
-        "is_operational": _boolean("is_operational", core.is_operational),
+        "is_operational": _boolean("is_operational", is_operational),
     }
 
 

@@ -644,6 +644,32 @@ class ResidentCommandSinkTest(unittest.TestCase):
         self.assertEqual(packet["schema_version"], "stm32_manual_command.v1")
         self.assertEqual(packet["Y2"], 0.0)
 
+    def test_unsafe_telemetry_cancels_a_pending_act_to_rl_handoff(self) -> None:
+        self.activate(self.act)
+        handoff_generation = self.sink.request_handoff(
+            self.rl,
+            now_monotonic_ns=1_030_000_000,
+        )
+        writes_before = len(self.serial.writes)
+
+        self.sink.observe_telemetry(
+            telemetry(
+                receive_ns=1_040_000_000,
+                command_rx_seq=0,
+                command_valid=False,
+                mode=ControlMode.MANUAL_ACTION,
+                sensor_valid=False,
+            )
+        )
+
+        snapshot = self.sink.snapshot()
+        self.assertGreater(snapshot.generation, handoff_generation)
+        self.assertEqual(snapshot.phase.value, "terminal_zero_pending")
+        self.assertEqual(snapshot.active_binding, self.act)
+        self.assertIsNone(snapshot.target_binding)
+        self.assertEqual(len(self.serial.writes), writes_before + 1)
+        self.assertEqual(self.packets()[-1]["Y2"], 0.0)
+
     def test_invalid_input_immediately_zeros_without_waiting_for_state_age(self) -> None:
         self.activate(self.rl)
         count_before = len(self.serial.writes)
