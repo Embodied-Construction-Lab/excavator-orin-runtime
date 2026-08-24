@@ -29,7 +29,7 @@ _MAX_UNIX_PATH_BYTES = 107
 _COMMANDS = frozenset(
     {"status", "renew_lease", "activate_rl", "activate_act", "terminal_disarm"}
 )
-DEFAULT_MISSION_LEASE_MS = 1500
+DEFAULT_MISSION_LEASE_MS = 3000
 _REQUEST_FIELDS = frozenset({"schema_version", "command"})
 _ACTIVATE_ACT_REQUEST_FIELDS = frozenset(
     {"schema_version", "command", "max_steps"}

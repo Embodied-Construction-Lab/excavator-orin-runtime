@@ -489,6 +489,34 @@ class EdgeFollowRuntimeTest(unittest.TestCase):
         self.assertEqual(after_gap.observation[29], 1.0 / 60.0)
         self.assertEqual(len(policy.observations), 2)
 
+    def test_active_follow_reports_structured_no_progress_diagnostics(self):
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=RecordingPolicy([0.5, -0.5, 0.1, -0.2]),
+            trajectory=trajectory(),
+            mission=mission(),
+        )
+
+        with self.assertLogs("edge_runtime.follow", level="WARNING") as captured:
+            runtime.step(machine_state(sequence=80), now_s=100.0)
+            runtime.step(machine_state(sequence=81), now_s=101.0)
+            runtime.step(machine_state(sequence=82), now_s=102.0)
+
+        self.assertEqual(len(captured.output), 1)
+        message = captured.output[0]
+        self.assertIn("RL Follow no progress", message)
+        self.assertIn("waypoint=1/3", message)
+        self.assertIn("window_s=2.000", message)
+        self.assertIn("distance_start_m=", message)
+        self.assertIn("distance_now_m=", message)
+        self.assertIn("bucket_tip_ros_m=(", message)
+        self.assertIn("target_waypoint_ros_m=(1.2, -0.2, -0.2)", message)
+        self.assertIn("normalized_action=(0.5, -0.5, 0.1, -0.2)", message)
+        self.assertIn("commanded_action=(0.5, -0.5, 0.1, -0.2)", message)
+        self.assertIn("physical_action=(0.02, -0.025, 0.003, -0.12)", message)
+        self.assertIn("backend=onnx_rl", message)
+
     def test_invalid_first_state_does_not_start_follow_clock(self):
         policy = RecordingPolicy([0.5, -0.5, 0.1, -0.2])
         runtime = EdgeFollowRuntime(

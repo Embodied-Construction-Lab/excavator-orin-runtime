@@ -13,6 +13,7 @@ from unittest import mock
 from types import SimpleNamespace
 
 from edge_runtime.resident_control import (
+    DEFAULT_MISSION_LEASE_MS,
     MAX_CONTROL_FRAME_BYTES,
     ResidentMotionControlServer,
     main,
@@ -20,6 +21,10 @@ from edge_runtime.resident_control import (
 )
 from edge_runtime.resident_core import ResidentMotionCore
 from edge_runtime.resident_motion import ControlMode, HandoffPhase, PolicyBinding
+
+
+def test_default_mission_lease_tolerates_one_transient_control_rpc_delay() -> None:
+    assert DEFAULT_MISSION_LEASE_MS == 3000
 
 
 SCHEMA_VERSION = "resident_motion_control.v1"
@@ -181,7 +186,10 @@ class ResidentMotionControlTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["status"]["control_generation"], 0)
         self.assertTrue(response["status"]["mission_lease_active"])
-        self.assertEqual(self.core.calls, [("renew_lease", 1500)])
+        self.assertEqual(
+            self.core.calls,
+            [("renew_lease", DEFAULT_MISSION_LEASE_MS)],
+        )
 
     def test_motion_activation_arms_the_same_bounded_mission_lease(self) -> None:
         self.start()
@@ -192,7 +200,7 @@ class ResidentMotionControlTest(unittest.TestCase):
         self.assertTrue(response["status"]["mission_lease_active"])
         self.assertEqual(
             self.core.calls[:2],
-            [("renew_lease", 1500), "activate_act"],
+            [("renew_lease", DEFAULT_MISSION_LEASE_MS), "activate_act"],
         )
 
     def test_status_reads_real_core_segment_snapshot_atomically(self) -> None:
@@ -261,7 +269,7 @@ class ResidentMotionControlTest(unittest.TestCase):
         self.assertTrue(activated["status"]["act_worker_ready"])
         self.assertEqual(
             self.core.calls,
-            [("renew_lease", 1500), "activate_act"],
+            [("renew_lease", DEFAULT_MISSION_LEASE_MS), "activate_act"],
         )
         self.assertEqual(activated["status"]["control_generation"], 1)
         self.assertEqual(activated["status"]["act_segment_generation"], 1)
@@ -304,7 +312,7 @@ class ResidentMotionControlTest(unittest.TestCase):
         self.assertTrue(activated["ok"])
         self.assertEqual(
             self.core.calls,
-            [("renew_lease", 1500), "activate_act"],
+            [("renew_lease", DEFAULT_MISSION_LEASE_MS), "activate_act"],
         )
         self.assertEqual(self.core.generation, 1)
 
@@ -336,7 +344,7 @@ class ResidentMotionControlTest(unittest.TestCase):
         self.assertEqual(events, ["gate_enter", "gate_exit"])
         self.assertEqual(
             self.core.calls,
-            [("renew_lease", 1500), "activate_act"],
+            [("renew_lease", DEFAULT_MISSION_LEASE_MS), "activate_act"],
         )
 
     def test_atomic_rl_idle_gate_rejection_never_renews_or_mutates_core(self) -> None:
@@ -734,7 +742,7 @@ class ResidentMotionControlTest(unittest.TestCase):
         self.assertEqual(response["status"]["act_segment_max_steps"], 130)
         self.assertEqual(
             self.core.calls,
-            [("renew_lease", 1500), "activate_act"],
+            [("renew_lease", DEFAULT_MISSION_LEASE_MS), "activate_act"],
         )
 
     def test_cli_connection_and_invalid_response_errors_are_sanitized(self) -> None:

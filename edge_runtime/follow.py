@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Tuple
@@ -23,6 +24,18 @@ from .trajectory_controller import (
     OnnxRlTrajectoryControllerAdapter,
     TrajectoryController,
 )
+
+
+LOGGER = logging.getLogger("edge_runtime.follow")
+_NO_PROGRESS_WINDOW_S = 2.0
+_MEANINGFUL_PROGRESS_M = 0.01
+
+
+@dataclass(frozen=True)
+class _FollowProgressWindow:
+    waypoint_index: int
+    started_at_s: float
+    anchor_distance_m: float
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,7 @@ class EdgeFollowRuntime:
         self._follow_started_monotonic = None
         self._last_monotonic = None
         self._terminal_result = None
+        self._progress_window: Optional[_FollowProgressWindow] = None
 
     def step(
         self,
@@ -209,6 +223,15 @@ class EdgeFollowRuntime:
             physical = (0.0, 0.0, 0.0, 0.0)
             inference_ms = None
             result_status = self._terminal_result
+        self._observe_progress(
+            now_s=float(now_s),
+            bucket_tip_ros_m=bucket_tip_ros,
+            waypoint_distance_m=waypoint_distance_m,
+            normalized_action=normalized,
+            commanded_action=commanded_normalized,
+            physical_action=physical,
+            active=result_status == "ACTIVE",
+        )
         result = EdgeFollowStep(
             source_seq=source_seq,
             source_stamp_ms=int(machine_state["stamp_ms"]),
@@ -238,6 +261,60 @@ class EdgeFollowRuntime:
         self._last_source_seq = source_seq
         self._last_monotonic = float(now_s)
         return result
+
+    def _observe_progress(
+        self,
+        *,
+        now_s: float,
+        bucket_tip_ros_m: Tuple[float, float, float],
+        waypoint_distance_m: float,
+        normalized_action: Tuple[float, float, float, float],
+        commanded_action: Tuple[float, float, float, float],
+        physical_action: Tuple[float, float, float, float],
+        active: bool,
+    ) -> None:
+        waypoint_index = self._tracker.current_index
+        window = self._progress_window
+        if not active:
+            self._progress_window = None
+            return
+        if (
+            window is None
+            or window.waypoint_index != waypoint_index
+            or waypoint_distance_m
+            <= window.anchor_distance_m - _MEANINGFUL_PROGRESS_M
+        ):
+            self._progress_window = _FollowProgressWindow(
+                waypoint_index=waypoint_index,
+                started_at_s=now_s,
+                anchor_distance_m=waypoint_distance_m,
+            )
+            return
+        window_s = now_s - window.started_at_s
+        if window_s < _NO_PROGRESS_WINDOW_S:
+            return
+        LOGGER.warning(
+            "RL Follow no progress: waypoint=%d/%d window_s=%.3f "
+            "distance_start_m=%.4f distance_now_m=%.4f "
+            "bucket_tip_ros_m=%s target_waypoint_ros_m=%s "
+            "normalized_action=%s commanded_action=%s physical_action=%s backend=%s",
+            waypoint_index + 1,
+            len(self._tracker.snapshot.waypoints),
+            window_s,
+            window.anchor_distance_m,
+            waypoint_distance_m,
+            bucket_tip_ros_m,
+            self._tracker.snapshot.waypoints[waypoint_index],
+            normalized_action,
+            commanded_action,
+            physical_action,
+            self._controller.descriptor.backend_id,
+        )
+        self._progress_window = _FollowProgressWindow(
+            waypoint_index=waypoint_index,
+            started_at_s=now_s,
+            anchor_distance_m=waypoint_distance_m,
+        )
 
     def _validate_state(self, state: Mapping[str, Any]) -> None:
         if state.get("type") != "machine_state_v1":
