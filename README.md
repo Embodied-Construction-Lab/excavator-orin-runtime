@@ -326,6 +326,27 @@ environment-dependent planning on PC while removing the network round trip
 between Follow and its fixed action. An active-leg connection loss remains
 fail-closed and stops that local behavior.
 
+### V3-A resident fixed cycle（开发中，尚未授权真机）
+
+V3-A 从标签 `icra2027-v2-freeze-20260824` 分支。新增
+`edge_runtime.resident_fixed_cycle`，把固定 `dig_01`、`dig_02`、`dig_03` 与 `dump`
+trajectory artifact 组织为严格的 `resident_fixed_cycle_plan.v1`，并用一个纯 Orin 状态机自动
+推进：
+
+```text
+FollowDig → ACT Dig → FollowDump → ExecuteDump → next FollowDig
+```
+
+状态机只发出本地 `Follow`、`activate_act(max_steps)` 和 `ExecuteDump` directive；真正动作仍
+必须通过现有 Resident Motion Core、generation、Mission lease 和唯一 STM32 Command Sink。
+plan 只能引用绝对路径、非符号链接、SHA-256 匹配且明确标记为 `field_validated` 的 artifact，
+并在任何相机、模型或串口资源打开前一次性读入内存。
+
+当前 V3-A 分支只完成 transport-independent plan、状态机、driver Seam 与 host fake
+integration，没有接入活动真机 launcher，也没有新增运动授权入口。因此不要在现场把该 Module
+当作可运动命令；V2 采集和演示继续使用冻结标签。下一纵切才会把它接入 owner 的本地
+observation loop，并用发动机关闭 HIL 验证 terminal-zero ACK 和切换延迟。
+
 The fixed-action asset is loaded once before the serial port is opened. Its
 machine-profile and URDF SHA-256 bindings must match the deployed assets.
 Fixed-action feedback is closed locally from the same high-rate Machine State
