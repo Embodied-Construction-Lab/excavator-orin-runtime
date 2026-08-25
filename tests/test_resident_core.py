@@ -244,6 +244,26 @@ class ResidentMotionCoreTest(unittest.TestCase):
         self.assertEqual(repeated, first)
         self.assertEqual(len(self.serial.writes), writes_after_first)
 
+    def test_terminal_zero_ack_is_remembered_after_core_is_disarmed(self) -> None:
+        self.core.activate_rl(now_monotonic_ns=1_000_000_000)
+        self.acknowledge_latest_zero(
+            mode=ControlMode.VELOCITY_REFERENCE,
+            receive_ns=1_020_000_000,
+        )
+        terminal = self.core.terminal_disarm(now_monotonic_ns=1_040_000_000)
+
+        self.assertFalse(self.core.terminal_zero_acknowledged)
+        self.core.observe_telemetry(
+            telemetry(
+                receive_ns=1_060_000_000,
+                command_seq=terminal.command_seq,
+                valid=True,
+                mode=ControlMode.VELOCITY_REFERENCE,
+            )
+        )
+
+        self.assertTrue(self.core.terminal_zero_acknowledged)
+
     def test_act_candidate_lease_expiry_zeros_and_revokes_the_generation(self) -> None:
         generation = self.core.activate_act(now_monotonic_ns=1_000_000_000)
         self.acknowledge_latest_zero(

@@ -204,6 +204,31 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         )
         serial.readline.assert_not_called()
 
+    def test_terminal_zero_shutdown_reuses_ack_observed_by_the_main_loop(self):
+        result = ResidentWriteResult(
+            accepted=False,
+            write_performed=True,
+            reason="terminal_disarm",
+            command_seq=42,
+            mode=ControlMode.VELOCITY_REFERENCE,
+            effective_action=(0.0, 0.0, 0.0, 0.0),
+        )
+        core = SimpleNamespace(terminal_zero_acknowledged=True)
+        serial = mock.Mock()
+
+        with mock.patch.object(
+            orin,
+            "wait_for_resident_terminal_zero_ack",
+        ) as wait_for_ack:
+            acknowledged = orin.resident_terminal_zero_is_acknowledged(
+                core,
+                serial,
+                result,
+            )
+
+        self.assertTrue(acknowledged)
+        wait_for_ack.assert_not_called()
+
     def test_hardware_start_gate_waits_until_one_shot_file_arrives(self):
         with tempfile.TemporaryDirectory() as directory:
             gate = Path(directory) / "rl.start"

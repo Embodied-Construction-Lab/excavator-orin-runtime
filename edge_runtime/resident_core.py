@@ -102,6 +102,7 @@ class ResidentMotionCore:
         self._act_segment = _ActSegmentTracker()
         self._mission_lease_deadline_ns: int | None = None
         self._terminal_disarm_result: ResidentWriteResult | None = None
+        self._terminal_zero_acknowledged = False
         self._control_lock = threading.RLock()
 
     @property
@@ -121,6 +122,11 @@ class ResidentMotionCore:
     @property
     def act_is_active(self) -> bool:
         return self._binding_is_active(ACT_BINDING)
+
+    @property
+    def terminal_zero_acknowledged(self) -> bool:
+        with self._control_lock:
+            return self._terminal_zero_acknowledged
 
     @property
     def mission_lease_is_active(self) -> bool:
@@ -150,6 +156,9 @@ class ResidentMotionCore:
     def observe_telemetry(self, frame: ResidentTelemetry) -> None:
         self._sink.observe_telemetry(frame)
         with self._control_lock:
+            terminal = self._terminal_disarm_result
+            if terminal is not None and _terminal_zero_ack_matches(terminal, frame):
+                self._terminal_zero_acknowledged = True
             segment = self._act_segment
             if not self._act_segment_acknowledged(segment, frame):
                 return
@@ -396,6 +405,13 @@ class ResidentMotionCore:
             )
             result = self._sink.terminal_disarm(now_monotonic_ns=now)
             self._terminal_disarm_result = result
+            self._terminal_zero_acknowledged = (
+                not result.write_performed
+                and result.reason == "terminal_disarm"
+                and result.command_seq is None
+                and result.mode is None
+                and result.effective_action == ZERO_ACTION
+            )
             return result
 
     @staticmethod
@@ -427,3 +443,20 @@ def _optional_act_step_budget(value: int | None) -> int | None:
             f"max_steps must be an integer in [1, {MAX_ACT_SEGMENT_STEPS}]"
         )
     return value
+
+
+def _terminal_zero_ack_matches(
+    result: ResidentWriteResult,
+    frame: ResidentTelemetry,
+) -> bool:
+    return (
+        result.write_performed
+        and result.command_seq is not None
+        and result.mode is not None
+        and result.effective_action == ZERO_ACTION
+        and frame.command_rx_seq == result.command_seq
+        and frame.command_valid
+        and not frame.command_timed_out
+        and frame.control_mode is result.mode
+        and frame.command_action == ZERO_ACTION
+    )

@@ -512,6 +512,18 @@ def wait_for_resident_terminal_zero_ack(
     return False
 
 
+def resident_terminal_zero_is_acknowledged(
+    core: ResidentMotionCore,
+    serial_reader,
+    result: ResidentWriteResult,
+) -> bool:
+    """Reuse a strict ACK already consumed by the main telemetry loop."""
+
+    if getattr(core, "terminal_zero_acknowledged", False) is True:
+        return True
+    return wait_for_resident_terminal_zero_ack(serial_reader, result)
+
+
 def resident_act_state_from_state(
     state: Stm32State,
     *,
@@ -2077,7 +2089,8 @@ def main() -> None:
                         terminal_result = resident_motion_core.terminal_disarm(
                             now_monotonic_ns=time.monotonic_ns()
                         )
-                        if wait_for_resident_terminal_zero_ack(
+                        if resident_terminal_zero_is_acknowledged(
+                            resident_motion_core,
                             ser,
                             terminal_result,
                         ):
