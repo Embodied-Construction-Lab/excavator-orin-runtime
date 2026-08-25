@@ -8,6 +8,8 @@ an actuator command directly.
 
 from __future__ import annotations
 
+import logging
+import math
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
@@ -22,6 +24,9 @@ from .resident_fixed_cycle import (
     FixedTrajectoryTemplate,
     ResidentFixedCycleCoordinator,
 )
+
+
+LOGGER = logging.getLogger("edge_runtime.resident_fixed_cycle")
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,8 @@ class ResidentFixedCycleRuntime:
         self._session_id = ""
         self._request_sequence = 0
         self._active_act_generation: int | None = None
+        self._active_follow_target_id = ""
+        self._visualization: dict[str, Any] | None = None
         self._act_activation_started_s: float | None = None
         self._act_was_active = False
         self._terminal_disarmed_s: float | None = None
@@ -100,6 +107,13 @@ class ResidentFixedCycleRuntime:
     def snapshot(self) -> FixedCycleSnapshot:
         with self._lock:
             return self._coordinator.snapshot
+
+    @property
+    def visualization_snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            if self._visualization is None:
+                return None
+            return dict(self._visualization)
 
     @property
     def owner_release_ready(self) -> bool:
@@ -126,6 +140,8 @@ class ResidentFixedCycleRuntime:
             self._request_sequence = 0
             self._pending = None
             self._active_act_generation = None
+            self._active_follow_target_id = ""
+            self._visualization = None
             self._act_activation_started_s = None
             self._act_was_active = False
             self._terminal_disarmed_s = None
@@ -157,8 +173,10 @@ class ResidentFixedCycleRuntime:
 
         with self._lock:
             snapshot = self._coordinator.snapshot
-            if snapshot.stage == "IDLE" or snapshot.terminal:
+            if snapshot.stage == "IDLE":
                 raise RuntimeError("no active resident fixed cycle can be renewed")
+            if snapshot.terminal:
+                return snapshot
             if not self._core.is_operational:
                 raise RuntimeError("resident motion core is not operational")
             self._core.renew_mission_lease(lease_ms=self._mission_lease_ms)
@@ -167,6 +185,8 @@ class ResidentFixedCycleRuntime:
     def cancel(self) -> None:
         with self._lock:
             self._pending = None
+            self._active_follow_target_id = ""
+            self._visualization = None
             self._coordinator.cancel()
 
     # ResidentFixedCycleDriver implementation.
@@ -187,6 +207,8 @@ class ResidentFixedCycleRuntime:
         self._active_act_generation = self._behavior_executor.run_when_idle(
             claim_act
         )
+        self._active_follow_target_id = ""
+        self._visualization = None
         self._act_activation_started_s = self._monotonic_clock()
         self._act_was_active = bool(self._core.act_is_active)
 
@@ -194,12 +216,16 @@ class ResidentFixedCycleRuntime:
         if behavior != "ExecuteDump":
             raise ValueError("V3-A fixed cycle only permits ExecuteDump")
         self._queue_behavior("fixed_action", behavior)
+        self._active_follow_target_id = ""
+        self._visualization = None
         if not self._core.rl_is_active:
             self._core.activate_rl()
         self._dispatch_pending_if_ready()
 
     def terminal_disarm(self) -> None:
         self._pending = None
+        self._active_follow_target_id = ""
+        self._visualization = None
         self._core.terminal_disarm()
         self._terminal_disarmed_s = self._monotonic_clock()
 
@@ -258,6 +284,7 @@ class ResidentFixedCycleRuntime:
                 self._registry[pending.target_id],
                 sequence=self._request_sequence,
             )
+            self._active_follow_target_id = pending.target_id
         else:
             request = self._fixed_action_request(
                 pending.target_id,
@@ -268,7 +295,22 @@ class ResidentFixedCycleRuntime:
     def _on_behavior_event(self, event: Mapping[str, Any]) -> None:
         with self._lock:
             event_type = event.get("type")
-            if event_type in {"accepted", "feedback", "status"}:
+            if event_type == "feedback":
+                if not self._active_follow_target_id:
+                    return
+                try:
+                    self._visualization = _visualization_snapshot(
+                        event,
+                        target_id=self._active_follow_target_id,
+                    )
+                except (TypeError, ValueError) as exc:
+                    self._visualization = None
+                    LOGGER.warning(
+                        "ignoring invalid read-only trajectory visualization: %s",
+                        exc,
+                    )
+                return
+            if event_type in {"accepted", "status"}:
                 return
             snapshot = self._coordinator.snapshot
             if snapshot.terminal:
@@ -277,6 +319,8 @@ class ResidentFixedCycleRuntime:
                 "fixed_action" if snapshot.stage == "EXECUTE_DUMP" else "follow"
             )
             if event_type == "result":
+                self._active_follow_target_id = ""
+                self._visualization = None
                 self._coordinator.record_child_result(
                     child=child,
                     outcome=event.get("outcome", "FAILED"),
@@ -322,6 +366,9 @@ class ResidentFixedCycleRuntime:
             waypoint_tolerance_m=template.waypoint_tolerance_m,
             waypoint_dwell_s=template.waypoint_dwell_s,
             tracking_timeout_s=template.tracking_timeout_s,
+            intermediate_waypoint_tolerance_m=(
+                template.intermediate_waypoint_tolerance_m
+            ),
         )
         snapshot = replace(snapshot, trajectory_sha256=snapshot.computed_sha256())
         trajectory = asdict(snapshot)
@@ -355,4 +402,42 @@ class ResidentFixedCycleRuntime:
         if self._coordinator.snapshot.terminal:
             return
         self._pending = None
+        self._active_follow_target_id = ""
+        self._visualization = None
         self._coordinator.fail(reason_code=reason_code)
+
+
+def _visualization_snapshot(
+    event: Mapping[str, Any],
+    *,
+    target_id: str,
+) -> dict[str, Any]:
+    raw_waypoints = event.get("trajectory_waypoints")
+    if not isinstance(raw_waypoints, list) or not 1 <= len(raw_waypoints) <= 12:
+        raise ValueError("trajectory visualization waypoints are invalid")
+    waypoints: list[tuple[float, float, float]] = []
+    for point in raw_waypoints:
+        if not isinstance(point, list) or len(point) != 3:
+            raise ValueError("trajectory visualization point is invalid")
+        parsed = tuple(float(axis) for axis in point)
+        if not all(math.isfinite(axis) for axis in parsed):
+            raise ValueError("trajectory visualization point must be finite")
+        waypoints.append(parsed)
+    current = event.get("waypoint_index")
+    if isinstance(current, bool) or not isinstance(current, int):
+        raise ValueError("trajectory visualization index is invalid")
+    if not 0 <= current < len(waypoints):
+        raise ValueError("trajectory visualization index is out of range")
+    tolerance = event.get("waypoint_tolerance_m")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("trajectory visualization tolerance is invalid")
+    tolerance = float(tolerance)
+    if not math.isfinite(tolerance) or not 0.0 < tolerance <= 5.0:
+        raise ValueError("trajectory visualization tolerance is invalid")
+    return {
+        "frame_id": "machine_root_ros",
+        "target_id": target_id,
+        "waypoints": tuple(waypoints),
+        "current_waypoint_index": current,
+        "waypoint_tolerance_m": tolerance,
+    }

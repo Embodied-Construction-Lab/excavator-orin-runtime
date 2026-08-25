@@ -52,6 +52,22 @@ class _Runtime:
     def heartbeat(self):
         self.calls.append(("heartbeat",))
 
+    @property
+    def visualization_snapshot(self):
+        if self.snapshot.stage != "FOLLOW_DIG":
+            return None
+        return {
+            "frame_id": "machine_root_ros",
+            "target_id": self.snapshot.current_dig_point_id,
+            "waypoints": (
+                (0.8, 0.2, -0.1),
+                (0.9, 0.1, -0.05),
+                (1.0, 0.0, 0.0),
+            ),
+            "current_waypoint_index": 1,
+            "waypoint_tolerance_m": 0.40,
+        }
+
 
 def test_start_status_and_cancel_use_one_strict_local_control_socket(tmp_path) -> None:
     runtime = _Runtime()
@@ -73,6 +89,17 @@ def test_start_status_and_cancel_use_one_strict_local_control_socket(tmp_path) -
 
     assert started["ok"] is True
     assert started["status"]["stage"] == "FOLLOW_DIG"
+    assert started["status"]["active_trajectory"] == {
+        "frame_id": "machine_root_ros",
+        "target_id": "dig_02",
+        "waypoints": [
+            [0.8, 0.2, -0.1],
+            [0.9, 0.1, -0.05],
+            [1.0, 0.0, 0.0],
+        ],
+        "current_waypoint_index": 1,
+        "waypoint_tolerance_m": 0.40,
+    }
     assert status["status"]["current_dig_point_id"] == "dig_02"
     assert cancelled["status"]["stage"] == "CANCELLED"
     assert runtime.calls == [

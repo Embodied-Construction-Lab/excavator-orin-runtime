@@ -58,6 +58,9 @@ _SNAPSHOT_FIELDS = {
     "waypoint_dwell_s",
     "tracking_timeout_s",
 }
+_TWO_LEVEL_SNAPSHOT_FIELDS = _SNAPSHOT_FIELDS | {
+    "intermediate_waypoint_tolerance_m"
+}
 _DIGEST_FIELDS = _SNAPSHOT_FIELDS - {"trajectory_id", "trajectory_sha256"}
 _MAX_CLOCK_SKEW_S = 0.5
 
@@ -126,6 +129,7 @@ class FollowTrajectorySnapshot:
     waypoint_tolerance_m: float
     waypoint_dwell_s: float
     tracking_timeout_s: float
+    intermediate_waypoint_tolerance_m: float | None = None
 
     @classmethod
     def from_mapping(
@@ -134,7 +138,10 @@ class FollowTrajectorySnapshot:
         *,
         now_s: float,
     ) -> "FollowTrajectorySnapshot":
-        if not isinstance(value, Mapping) or set(value) != _SNAPSHOT_FIELDS:
+        if not isinstance(value, Mapping) or set(value) not in {
+            frozenset(_SNAPSHOT_FIELDS),
+            frozenset(_TWO_LEVEL_SNAPSHOT_FIELDS),
+        }:
             raise ValueError("trajectory snapshot fields are invalid")
         snapshot = cls(
             trajectory_id=_text("trajectory_id", value["trajectory_id"]),
@@ -180,6 +187,14 @@ class FollowTrajectorySnapshot:
             tracking_timeout_s=_positive(
                 "tracking_timeout_s", value["tracking_timeout_s"]
             ),
+            intermediate_waypoint_tolerance_m=(
+                _positive(
+                    "intermediate_waypoint_tolerance_m",
+                    value["intermediate_waypoint_tolerance_m"],
+                )
+                if "intermediate_waypoint_tolerance_m" in value
+                else None
+            ),
         )
         snapshot._validate_for_execution(now_s=now_s)
         if snapshot.computed_sha256() != snapshot.trajectory_sha256:
@@ -189,13 +204,16 @@ class FollowTrajectorySnapshot:
         return snapshot
 
     def computed_sha256(self) -> str:
+        digest_fields = set(_DIGEST_FIELDS)
+        if self.intermediate_waypoint_tolerance_m is not None:
+            digest_fields.add("intermediate_waypoint_tolerance_m")
         payload = {
             name: (
                 [list(point) for point in self.waypoints]
                 if name == "waypoints"
                 else getattr(self, name)
             )
-            for name in _DIGEST_FIELDS
+            for name in digest_fields
         }
         encoded = json.dumps(
             payload,
@@ -389,6 +407,10 @@ class EdgeFollowRuntimeFactory:
                 "tracking_timeout_s": snapshot.tracking_timeout_s,
             },
         }
+        if snapshot.intermediate_waypoint_tolerance_m is not None:
+            runtime_mission["limits"]["intermediate_waypoint_tolerance_m"] = (
+                snapshot.intermediate_waypoint_tolerance_m
+            )
         if self._controller_builder is not None:
             controller_arguments = {"controller": self._controller_builder()}
         elif self._controller is not None:

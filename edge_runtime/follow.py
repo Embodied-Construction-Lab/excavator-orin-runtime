@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Tuple
 
 from .actions import (
@@ -29,6 +29,29 @@ from .trajectory_controller import (
 LOGGER = logging.getLogger("edge_runtime.follow")
 _NO_PROGRESS_WINDOW_S = 2.0
 _MEANINGFUL_PROGRESS_M = 0.01
+
+
+def _cylindrical_arc_midpoint(
+    start: Tuple[float, float, float],
+    target: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """Interpolate a look-ahead point around the machine-root swing axis."""
+
+    start_radius = math.hypot(start[0], start[1])
+    target_radius = math.hypot(target[0], target[1])
+    start_angle = math.atan2(start[1], start[0])
+    target_angle = math.atan2(target[1], target[0])
+    angle_delta = math.atan2(
+        math.sin(target_angle - start_angle),
+        math.cos(target_angle - start_angle),
+    )
+    midpoint_angle = start_angle + angle_delta / 2.0
+    midpoint_radius = (start_radius + target_radius) / 2.0
+    return (
+        midpoint_radius * math.cos(midpoint_angle),
+        midpoint_radius * math.sin(midpoint_angle),
+        (start[2] + target[2]) / 2.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -63,6 +86,7 @@ class EdgeFollowStep:
         float,
     ] = (0.0, 0.0, 0.0, 0.0)
     trajectory_controller_backend: str = "unknown"
+    trajectory_waypoints_ros_m: Tuple[Tuple[float, float, float], ...] = ()
 
 
 class EdgeFollowRuntime:
@@ -107,9 +131,14 @@ class EdgeFollowRuntime:
             raise ValueError(
                 "nonzero mission limits.waypoint_dwell_s is not supported"
             )
+        trajectory_snapshot = TrajectorySnapshot.from_mapping(trajectory)
+        self._expand_fixed_endpoint = len(trajectory_snapshot.waypoints) == 1
         self._tracker = WaypointTracker(
-            TrajectorySnapshot.from_mapping(trajectory),
+            trajectory_snapshot,
             waypoint_tolerance_m=self._follow_limits.waypoint_tolerance_m,
+            intermediate_waypoint_tolerance_m=(
+                self._follow_limits.intermediate_waypoint_tolerance_m
+            ),
         )
         self._previous_tip = None
         self._previous_action = (0.0, 0.0, 0.0, 0.0)
@@ -160,6 +189,7 @@ class EdgeFollowRuntime:
         # machine_root_ros -> fk_root. No Unity handedness transform is a TF.
         bucket_tip_ros = pose.position_m
         if self._terminal_result is None:
+            self._expand_fixed_endpoint_from(bucket_tip_ros)
             self._tracker = self._tracker.advance(bucket_tip_ros)
             if self._tracker.completed:
                 self._terminal_result = "COMPLETED"
@@ -246,11 +276,12 @@ class EdgeFollowRuntime:
             waypoint_distance_m=waypoint_distance_m,
             follow_elapsed_s=elapsed_s,
             tracking_timeout_s=self._follow_limits.tracking_timeout_s,
-            waypoint_tolerance_m=self._follow_limits.waypoint_tolerance_m,
+            waypoint_tolerance_m=self._tracker.current_tolerance_m,
             inference_ms=inference_ms,
             result=result_status,
             commanded_normalized_action=commanded_normalized,
             trajectory_controller_backend=self._controller.descriptor.backend_id,
+            trajectory_waypoints_ros_m=self._tracker.snapshot.waypoints,
         )
         self._previous_tip = tip
         if result_status == "ACTIVE":
@@ -261,6 +292,61 @@ class EdgeFollowRuntime:
         self._last_source_seq = source_seq
         self._last_monotonic = float(now_s)
         return result
+
+    def _expand_fixed_endpoint_from(
+        self,
+        bucket_tip_ros: Tuple[float, float, float],
+    ) -> None:
+        """Resolve a fixed endpoint into the controller's 3-point lookahead."""
+
+        if not self._expand_fixed_endpoint:
+            return
+        target = self._tracker.snapshot.waypoints[0]
+        if (
+            math.dist(bucket_tip_ros, target)
+            <= self._follow_limits.waypoint_tolerance_m
+        ):
+            self._expand_fixed_endpoint = False
+            return
+        midpoint = _cylindrical_arc_midpoint(bucket_tip_ros, target)
+        waypoints = (bucket_tip_ros, midpoint, target)
+        if self._tracker.snapshot.task_mode == "CarryMaterial":
+            midpoint_floor_z_m = target[2]
+            midpoint = (
+                midpoint[0],
+                midpoint[1],
+                max(midpoint[2], midpoint_floor_z_m),
+            )
+            waypoints = (bucket_tip_ros, midpoint, target)
+            log_message = (
+                "RL Follow CarryMaterial endpoint expanded as clearance arc: "
+                "start=%s midpoint=%s target=%s midpoint_floor_z_m=%.4f"
+            )
+            log_arguments = (
+                bucket_tip_ros,
+                midpoint,
+                target,
+                midpoint_floor_z_m,
+            )
+        else:
+            log_message = (
+                "RL Follow fixed endpoint expanded as swing arc: "
+                "start=%s midpoint=%s target=%s"
+            )
+            log_arguments = (bucket_tip_ros, midpoint, target)
+        snapshot = replace(
+            self._tracker.snapshot,
+            waypoints=waypoints,
+        )
+        self._tracker = WaypointTracker(
+            snapshot,
+            waypoint_tolerance_m=self._follow_limits.waypoint_tolerance_m,
+            intermediate_waypoint_tolerance_m=(
+                self._follow_limits.intermediate_waypoint_tolerance_m
+            ),
+        )
+        LOGGER.info(log_message, *log_arguments)
+        self._expand_fixed_endpoint = False
 
     def _observe_progress(
         self,
@@ -295,7 +381,7 @@ class EdgeFollowRuntime:
             return
         LOGGER.warning(
             "RL Follow no progress: waypoint=%d/%d window_s=%.3f "
-            "distance_start_m=%.4f distance_now_m=%.4f "
+            "distance_start_m=%.4f distance_now_m=%.4f tolerance_m=%.4f "
             "bucket_tip_ros_m=%s target_waypoint_ros_m=%s "
             "normalized_action=%s commanded_action=%s physical_action=%s backend=%s",
             waypoint_index + 1,
@@ -303,6 +389,7 @@ class EdgeFollowRuntime:
             window_s,
             window.anchor_distance_m,
             waypoint_distance_m,
+            self._tracker.current_tolerance_m,
             bucket_tip_ros_m,
             self._tracker.snapshot.waypoints[waypoint_index],
             normalized_action,

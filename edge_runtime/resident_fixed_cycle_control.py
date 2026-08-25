@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,7 +22,7 @@ from .resident_control import (
 )
 
 
-SCHEMA_VERSION = "resident_fixed_cycle_control.v1"
+SCHEMA_VERSION = "resident_fixed_cycle_control.v2"
 _COMMANDS = frozenset({"status", "start", "heartbeat", "cancel"})
 _REQUEST_FIELDS = frozenset({"schema_version", "command"})
 _START_FIELDS = frozenset(
@@ -43,6 +44,7 @@ _STATUS_FIELDS = frozenset(
         "terminal",
         "outcome",
         "reason_code",
+        "active_trajectory",
     }
 )
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
@@ -172,7 +174,13 @@ class ResidentFixedCycleControlServer:
             self._runtime.cancel()
         elif command != "status":
             raise ValueError("unsupported command")
-        return _success_response(command, _status(self._runtime.snapshot))
+        return _success_response(
+            command,
+            _status(
+                self._runtime.snapshot,
+                active_trajectory=self._runtime.visualization_snapshot,
+            ),
+        )
 
     def _remove_stale_socket(self) -> None:
         try:
@@ -342,11 +350,16 @@ def _validate_request(value: Any) -> tuple[str, dict[str, Any]]:
     }
 
 
-def _status(snapshot: Any) -> dict[str, Any]:
+def _status(
+    snapshot: Any,
+    *,
+    active_trajectory: Any = None,
+) -> dict[str, Any]:
     value = {
         name: getattr(snapshot, name)
-        for name in _STATUS_FIELDS
+        for name in _STATUS_FIELDS - {"active_trajectory"}
     }
+    value["active_trajectory"] = _active_trajectory(active_trajectory)
     if set(value) != _STATUS_FIELDS:
         raise ValueError("invalid fixed cycle status")
     for name in (
@@ -367,6 +380,52 @@ def _status(snapshot: Any) -> dict[str, Any]:
     if not isinstance(value["terminal"], bool):
         raise ValueError("terminal must be boolean")
     return value
+
+
+def _active_trajectory(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    fields = {
+        "frame_id",
+        "target_id",
+        "waypoints",
+        "current_waypoint_index",
+        "waypoint_tolerance_m",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("active trajectory fields are invalid")
+    if value["frame_id"] != "machine_root_ros":
+        raise ValueError("active trajectory frame is invalid")
+    target_id = _identifier("active trajectory target_id", value["target_id"])
+    raw_waypoints = value["waypoints"]
+    if not isinstance(raw_waypoints, (list, tuple)) or not 1 <= len(raw_waypoints) <= 12:
+        raise ValueError("active trajectory waypoints are invalid")
+    waypoints: list[list[float]] = []
+    for point in raw_waypoints:
+        if not isinstance(point, (list, tuple)) or len(point) != 3:
+            raise ValueError("active trajectory point is invalid")
+        parsed = [float(axis) for axis in point]
+        if not all(math.isfinite(axis) for axis in parsed):
+            raise ValueError("active trajectory point must be finite")
+        waypoints.append(parsed)
+    current = value["current_waypoint_index"]
+    if isinstance(current, bool) or not isinstance(current, int):
+        raise ValueError("active trajectory index is invalid")
+    if not 0 <= current < len(waypoints):
+        raise ValueError("active trajectory index is out of range")
+    tolerance = value["waypoint_tolerance_m"]
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("active trajectory tolerance is invalid")
+    tolerance = float(tolerance)
+    if not math.isfinite(tolerance) or not 0.0 < tolerance <= 5.0:
+        raise ValueError("active trajectory tolerance is invalid")
+    return {
+        "frame_id": "machine_root_ros",
+        "target_id": target_id,
+        "waypoints": waypoints,
+        "current_waypoint_index": current,
+        "waypoint_tolerance_m": tolerance,
+    }
 
 
 def _success_response(command: str, status: Mapping[str, Any]) -> dict[str, Any]:
@@ -410,7 +469,12 @@ def _validate_response(value: Any) -> dict[str, Any]:
     if value["ok"]:
         if value["error"] is not None or not isinstance(value["status"], Mapping):
             raise ValueError("invalid successful fixed cycle response")
-        status = _status(type("Snapshot", (), dict(value["status"]))())
+        status_value = dict(value["status"])
+        active_trajectory = status_value.pop("active_trajectory", None)
+        status = _status(
+            type("Snapshot", (), status_value)(),
+            active_trajectory=active_trajectory,
+        )
         return {**value, "status": status}
     error = value["error"]
     if value["status"] is not None or not isinstance(error, Mapping) or set(error) != {

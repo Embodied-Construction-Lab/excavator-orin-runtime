@@ -51,6 +51,9 @@ _TEMPLATE_FIELDS = frozenset(
         "tracking_timeout_s",
     }
 )
+_TWO_LEVEL_TEMPLATE_FIELDS = _TEMPLATE_FIELDS | {
+    "intermediate_waypoint_tolerance_m"
+}
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -119,6 +122,7 @@ class FixedTrajectoryTemplate:
     workspace_constraint: str
     waypoints: tuple[tuple[float, float, float], ...]
     waypoint_tolerance_m: float
+    intermediate_waypoint_tolerance_m: float
     waypoint_dwell_s: float
     tracking_timeout_s: float
 
@@ -130,7 +134,10 @@ class FixedTrajectoryTemplate:
         artifact: FixedTrajectoryArtifact,
         expected_validation_status: str = "field_validated",
     ) -> "FixedTrajectoryTemplate":
-        if not isinstance(value, Mapping) or set(value) != _TEMPLATE_FIELDS:
+        if not isinstance(value, Mapping) or set(value) not in {
+            _TEMPLATE_FIELDS,
+            frozenset(_TWO_LEVEL_TEMPLATE_FIELDS),
+        }:
             raise ValueError("fixed trajectory template fields are invalid")
         if value["schema_version"] != "resident_fixed_trajectory.v1":
             raise ValueError("unsupported fixed trajectory template schema")
@@ -168,6 +175,9 @@ class FixedTrajectoryTemplate:
         digest = value["mission_sha256"]
         if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
             raise ValueError("mission_sha256 must be lowercase hexadecimal")
+        waypoint_tolerance_m = _positive_float(
+            "waypoint_tolerance_m", value["waypoint_tolerance_m"]
+        )
         return cls(
             trajectory_id=trajectory_id,
             validation_status=validation_status,
@@ -179,8 +189,13 @@ class FixedTrajectoryTemplate:
             control_stage=control_stage,
             workspace_constraint=workspace_constraint,
             waypoints=_fixed_waypoints(value["waypoints"]),
-            waypoint_tolerance_m=_positive_float(
-                "waypoint_tolerance_m", value["waypoint_tolerance_m"]
+            waypoint_tolerance_m=waypoint_tolerance_m,
+            intermediate_waypoint_tolerance_m=_positive_float(
+                "intermediate_waypoint_tolerance_m",
+                value.get(
+                    "intermediate_waypoint_tolerance_m",
+                    waypoint_tolerance_m,
+                ),
             ),
             waypoint_dwell_s=_nonnegative_float(
                 "waypoint_dwell_s", value["waypoint_dwell_s"]
@@ -398,6 +413,18 @@ class ResidentFixedCycle:
 
         stage = self._snapshot.stage
         if stage == "FOLLOW_DIG" and child == "follow" and reason_code == "SUCCEEDED":
+            if (
+                self._snapshot.completed_cycles
+                == self._snapshot.requested_cycles
+            ):
+                self._snapshot = replace(
+                    self._snapshot,
+                    stage="COMPLETED",
+                    terminal=True,
+                    outcome="SUCCEEDED",
+                    reason_code="SEQUENCE_COMPLETED",
+                )
+                return None
             self._snapshot = replace(self._snapshot, stage="ACT_DIG")
             return FixedCycleDirective(
                 stage="ACT_DIG",
@@ -425,7 +452,7 @@ class ResidentFixedCycle:
             and child == "fixed_action"
             and reason_code == "SEQUENCE_COMPLETED"
         ):
-            return self._complete_or_start_next_dig()
+            return self._return_to_dig_after_dump()
         self._fail("UNEXPECTED_CHILD_RESULT")
         return None
 
@@ -441,21 +468,12 @@ class ResidentFixedCycle:
             raise RuntimeError("no active resident fixed cycle can be failed")
         self._fail(_identifier("reason_code", reason_code))
 
-    def _complete_or_start_next_dig(self) -> FixedCycleDirective | None:
+    def _return_to_dig_after_dump(self) -> FixedCycleDirective:
         completed = self._snapshot.completed_cycles + 1
-        if completed >= self._snapshot.requested_cycles:
-            self._snapshot = replace(
-                self._snapshot,
-                stage="COMPLETED",
-                completed_cycles=completed,
-                terminal=True,
-                outcome="SUCCEEDED",
-                reason_code="SEQUENCE_COMPLETED",
-            )
-            return None
-        self._dig_sequence_index = (
-            self._dig_sequence_index + 1
-        ) % len(self._plan.dig_sequence)
+        if completed < self._snapshot.requested_cycles:
+            self._dig_sequence_index = (
+                self._dig_sequence_index + 1
+            ) % len(self._plan.dig_sequence)
         target_id = self._plan.dig_sequence[self._dig_sequence_index]
         self._snapshot = replace(
             self._snapshot,

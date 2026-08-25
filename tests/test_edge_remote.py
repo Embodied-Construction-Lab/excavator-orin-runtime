@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import socket
@@ -261,6 +262,38 @@ class FollowTrajectorySnapshotTest(unittest.TestCase):
                 trajectory_snapshot(),
                 now_s=99.4,
             )
+
+    def test_two_level_tolerance_is_digest_bound_and_legacy_snapshot_falls_back(self):
+        legacy = FollowTrajectorySnapshot.from_mapping(
+            trajectory_snapshot(),
+            now_s=101.0,
+        )
+        self.assertIsNone(legacy.intermediate_waypoint_tolerance_m)
+
+        payload = trajectory_snapshot()
+        payload["intermediate_waypoint_tolerance_m"] = 0.40
+        digest_fields = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"trajectory_id", "trajectory_sha256"}
+        }
+        payload["trajectory_sha256"] = hashlib.sha256(
+            json.dumps(
+                digest_fields,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        snapshot = FollowTrajectorySnapshot.from_mapping(payload, now_s=101.0)
+        self.assertEqual(snapshot.waypoint_tolerance_m, 0.25)
+        self.assertEqual(snapshot.intermediate_waypoint_tolerance_m, 0.40)
+
+        payload["intermediate_waypoint_tolerance_m"] = 0.41
+        with self.assertRaisesRegex(ValueError, "sha256"):
+            FollowTrajectorySnapshot.from_mapping(payload, now_s=101.0)
 
 
 class EdgeFollowRuntimeFactoryTest(unittest.TestCase):
@@ -629,6 +662,11 @@ def follow_step(*, result="ACTIVE"):
         follow_elapsed_s=2.5,
         result=result,
         trajectory_controller_backend="test_controller",
+        trajectory_waypoints_ros_m=(
+            (0.11, 0.22, 0.33),
+            (0.5, 0.1, 0.2),
+            (1.0, 0.0, 0.0),
+        ),
     )
 
 
@@ -902,6 +940,11 @@ class EdgeBehaviorExecutorTest(unittest.TestCase):
         self.assertEqual(feedback["bucket_tip"], [0.11, 0.22, 0.33])
         self.assertEqual(feedback["tracking_state"], "ACTIVE")
         self.assertEqual(feedback["action_datagrams"], 3)
+        self.assertEqual(
+            feedback["trajectory_waypoints"],
+            [[0.11, 0.22, 0.33], [0.5, 0.1, 0.2], [1.0, 0.0, 0.0]],
+        )
+        self.assertEqual(feedback["waypoint_tolerance_m"], 0.0)
         self.assertEqual(
             feedback["trajectory_controller_backend"],
             "test_controller",

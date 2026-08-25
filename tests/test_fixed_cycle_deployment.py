@@ -71,6 +71,8 @@ def test_build_candidate_uses_fixed_endpoints_and_stays_uncommissioned(
     assert registry["dig_01"].waypoints == ((1.0, 0.26, 0.0),)
     assert registry["dig_03"].waypoints == ((1.0, -0.26, 0.0),)
     assert registry["dump"].waypoints == ((-0.2, -0.9, 0.1),)
+    assert registry["dig_01"].waypoint_tolerance_m == 0.25
+    assert registry["dig_01"].intermediate_waypoint_tolerance_m == 0.40
 
 
 def test_promotion_requires_passed_record_and_rewrites_all_hashes(
@@ -123,6 +125,10 @@ def test_promotion_requires_passed_record_and_rewrites_all_hashes(
 
     assert plan.validation_status == "field_validated"
     assert all(item.validation_status == "field_validated" for item in registry.values())
+    assert all(
+        item.intermediate_waypoint_tolerance_m == 0.40
+        for item in registry.values()
+    )
     assert record_copy.is_file()
     assert hashlib.sha256(record_copy.read_bytes()).hexdigest() in plan.plan_id
 

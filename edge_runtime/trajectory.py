@@ -13,6 +13,7 @@ Point3 = Tuple[float, float, float]
 @dataclass(frozen=True)
 class MissionFollowLimits:
     waypoint_tolerance_m: float
+    intermediate_waypoint_tolerance_m: float
     waypoint_dwell_s: float
     tracking_timeout_s: float
 
@@ -25,10 +26,18 @@ class MissionFollowLimits:
         limits = value.get("limits")
         if not isinstance(limits, Mapping):
             raise ValueError("mission limits are missing")
+        waypoint_tolerance_m = _positive(
+            "mission limits.waypoint_tolerance_m",
+            limits.get("waypoint_tolerance_m"),
+        )
         return cls(
-            waypoint_tolerance_m=_positive(
-                "mission limits.waypoint_tolerance_m",
-                limits.get("waypoint_tolerance_m"),
+            waypoint_tolerance_m=waypoint_tolerance_m,
+            intermediate_waypoint_tolerance_m=_positive(
+                "mission limits.intermediate_waypoint_tolerance_m",
+                limits.get(
+                    "intermediate_waypoint_tolerance_m",
+                    waypoint_tolerance_m,
+                ),
             ),
             waypoint_dwell_s=_nonnegative(
                 "mission limits.waypoint_dwell_s",
@@ -79,18 +88,35 @@ class TrajectorySnapshot:
 class WaypointTracker:
     snapshot: TrajectorySnapshot
     waypoint_tolerance_m: float
+    intermediate_waypoint_tolerance_m: float | None = None
     current_index: int = 0
     completed: bool = False
 
     def __post_init__(self) -> None:
         _positive("waypoint_tolerance_m", self.waypoint_tolerance_m)
+        if self.intermediate_waypoint_tolerance_m is not None:
+            _positive(
+                "intermediate_waypoint_tolerance_m",
+                self.intermediate_waypoint_tolerance_m,
+            )
+
+    @property
+    def current_tolerance_m(self) -> float:
+        last_index = len(self.snapshot.waypoints) - 1
+        if self.current_index in (0, last_index):
+            return self.waypoint_tolerance_m
+        return (
+            self.waypoint_tolerance_m
+            if self.intermediate_waypoint_tolerance_m is None
+            else self.intermediate_waypoint_tolerance_m
+        )
 
     def advance(self, bucket_tip_ros_m: Sequence[float]) -> "WaypointTracker":
         point = _point(bucket_tip_ros_m)
         if self.completed:
             return self
         target = self.snapshot.waypoints[self.current_index]
-        if math.dist(point, target) > self.waypoint_tolerance_m:
+        if math.dist(point, target) > self.current_tolerance_m:
             return self
         if self.current_index == len(self.snapshot.waypoints) - 1:
             return replace(self, completed=True)

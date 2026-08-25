@@ -152,6 +152,7 @@ def test_registry_loads_strict_field_validated_trajectory_templates(
     assert tuple(registry) == ("dig_01", "dig_02", "dig_03", "dump")
     assert isinstance(registry["dig_01"], FixedTrajectoryTemplate)
     assert registry["dig_01"].waypoints[-1] == (1.0, 0.0, 0.0)
+    assert registry["dig_01"].intermediate_waypoint_tolerance_m == 0.25
     assert registry["dump"].task_mode == "CarryMaterial"
 
     invalid = json.loads(
@@ -263,6 +264,16 @@ def test_three_cycles_advance_locally_without_per_stage_external_commands() -> N
         if directive is not None:
             observed.append((directive.stage, directive.target_id))
 
+    assert directive is not None
+    assert directive.stage == "FOLLOW_DIG"
+    assert directive.target_id == "dig_03"
+    directive = cycle.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+
     assert directive is None
     assert cycle.snapshot.stage == "COMPLETED"
     assert cycle.snapshot.completed_cycles == 3
@@ -270,6 +281,7 @@ def test_three_cycles_advance_locally_without_per_stage_external_commands() -> N
     assert [item for item in observed if item[0] == "FOLLOW_DIG"] == [
         ("FOLLOW_DIG", "dig_01"),
         ("FOLLOW_DIG", "dig_02"),
+        ("FOLLOW_DIG", "dig_03"),
         ("FOLLOW_DIG", "dig_03"),
     ]
 
@@ -299,6 +311,46 @@ def test_requested_cycle_count_wraps_the_fixed_dig_sequence() -> None:
 
     assert directive.stage == "FOLLOW_DIG"
     assert directive.target_id == "dig_01"
+
+
+def test_final_cycle_returns_to_its_dig_point_before_completion() -> None:
+    cycle = ResidentFixedCycle(_plan())
+    directive = cycle.start(
+        run_id="run-final-return",
+        requested_cycles=1,
+        first_dig_point_id="dig_02",
+    )
+
+    for child, reason, steps in (
+        ("follow", "SUCCEEDED", None),
+        ("act", "STEP_BUDGET_REACHED", 130),
+        ("follow", "SUCCEEDED", None),
+        ("fixed_action", "SEQUENCE_COMPLETED", None),
+    ):
+        directive = cycle.record_child_result(
+            child=child,
+            outcome="SUCCEEDED",
+            reason_code=reason,
+            quiescence_confirmed=True,
+            completed_steps=steps,
+        )
+
+    assert directive is not None
+    assert directive.stage == "FOLLOW_DIG"
+    assert directive.target_id == "dig_02"
+    assert cycle.snapshot.completed_cycles == 1
+    assert cycle.snapshot.terminal is False
+
+    terminal = cycle.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+
+    assert terminal is None
+    assert cycle.snapshot.stage == "COMPLETED"
+    assert cycle.snapshot.terminal is True
 
 
 @pytest.mark.parametrize(
@@ -399,12 +451,19 @@ def test_coordinator_dispatches_the_whole_local_cycle_from_one_start() -> None:
         reason_code="SEQUENCE_COMPLETED",
         quiescence_confirmed=True,
     )
+    coordinator.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
 
     assert calls == [
         ("follow", "field-dig_01-v1"),
         ("act", 130),
         ("follow", "field-dump-v1"),
         ("fixed", "ExecuteDump"),
+        ("follow", "field-dig_01-v1"),
         ("disarm",),
     ]
     assert coordinator.snapshot.stage == "COMPLETED"

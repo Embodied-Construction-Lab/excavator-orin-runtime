@@ -250,7 +250,13 @@ class ResidentActDataLinkTest(unittest.TestCase):
         second.settimeout(1.0)
         self.addCleanup(second.close)
         second.connect(os.fspath(self.socket_path))
-        _send_frame(second, _candidate(first=0.9))
+        try:
+            _send_frame(second, _candidate(first=0.9))
+        except (BrokenPipeError, ConnectionResetError):
+            # The server deliberately rejects newcomers while one worker is
+            # active.  Under load it may close the socket before this optional
+            # probe reaches the kernel; both timings express the same contract.
+            pass
         self.assertTrue(_wait_until(lambda: self.link.rejected_connection_count == 1))
         time.sleep(0.02)
         self.assertEqual(self.received, [])

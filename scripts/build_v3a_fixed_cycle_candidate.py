@@ -19,6 +19,11 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--deployed-root", required=True)
     parser.add_argument("--act-max-steps", type=int, default=130)
+    parser.add_argument(
+        "--intermediate-waypoint-tolerance-m",
+        type=float,
+        default=0.40,
+    )
     args = parser.parse_args()
     result = build_candidate_deployment(
         mission_path=args.mission_config,
@@ -26,6 +31,9 @@ def main() -> None:
         output_dir=args.output_dir,
         deployed_root=args.deployed_root,
         act_max_steps=args.act_max_steps,
+        intermediate_waypoint_tolerance_m=(
+            args.intermediate_waypoint_tolerance_m
+        ),
     )
     print(result)
 

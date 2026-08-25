@@ -33,6 +33,7 @@ def _deployment(tmp_path: Path) -> tuple[FixedCyclePlan, object]:
             "workspace_constraint": "field_validated",
             "waypoints": [[0.2, 0.0, 0.1], [1.0, 0.0, 0.0]],
             "waypoint_tolerance_m": 0.25,
+            "intermediate_waypoint_tolerance_m": 0.40,
             "waypoint_dwell_s": 0.0,
             "tracking_timeout_s": 60.0,
         }
@@ -152,6 +153,76 @@ class _BehaviorExecutor:
             }
         )
 
+    def feedback(self) -> None:
+        self._sink(
+            {
+                "type": "feedback",
+                "trajectory_waypoints": [
+                    [0.8, 0.2, -0.1],
+                    [0.9, 0.1, -0.05],
+                    [1.0, 0.0, 0.0],
+                ],
+                "waypoint_index": 1,
+                "waypoint_tolerance_m": 0.40,
+            }
+        )
+
+    def fixed_action_feedback(self) -> None:
+        self._sink(
+            {
+                "type": "feedback",
+                "behavior": "ExecuteDump",
+                "step_index": 0,
+                "step_label": "open_bucket",
+                "phase": "ACTIVE",
+                "max_error": 0.01,
+            }
+        )
+
+    def malformed_follow_feedback(self) -> None:
+        self._sink(
+            {
+                "type": "feedback",
+                "trajectory_waypoints": [],
+                "waypoint_index": 0,
+                "waypoint_tolerance_m": 0.25,
+            }
+        )
+
+
+def test_follow_feedback_exposes_read_only_active_trajectory(tmp_path: Path) -> None:
+    plan, registry = _deployment(tmp_path)
+    behaviors = _BehaviorExecutor()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=_Core(),
+        behavior_executor=behaviors,
+        act_worker_ready=lambda: True,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    runtime.start(run_id="run-v3a-preview", requested_cycles=1)
+    assert runtime.visualization_snapshot is None
+
+    behaviors.feedback()
+
+    assert runtime.visualization_snapshot == {
+        "frame_id": "machine_root_ros",
+        "target_id": "dig_01",
+        "waypoints": (
+            (0.8, 0.2, -0.1),
+            (0.9, 0.1, -0.05),
+            (1.0, 0.0, 0.0),
+        ),
+        "current_waypoint_index": 1,
+        "waypoint_tolerance_m": 0.40,
+    }
+
+    behaviors.succeed(reason_code="SUCCEEDED")
+    assert runtime.visualization_snapshot is None
+
 
 def test_two_cycles_advance_on_orin_without_external_stage_commands(
     tmp_path: Path,
@@ -172,6 +243,11 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     runtime.start(run_id="run-v3a-001", requested_cycles=2)
     assert behaviors.requests[-1]["type"] == "start_follow"
     assert behaviors.requests[-1]["trajectory"]["mission_phase"] == "dig"
+    assert behaviors.requests[-1]["trajectory"]["waypoint_tolerance_m"] == 0.25
+    assert (
+        behaviors.requests[-1]["trajectory"]["intermediate_waypoint_tolerance_m"]
+        == 0.40
+    )
 
     behaviors.succeed(reason_code="SUCCEEDED")
     assert core.calls[-1] == ("activate_act", 130)
@@ -189,6 +265,11 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     runtime.tick()
     behaviors.succeed(reason_code="SUCCEEDED")
     behaviors.succeed(reason_code="SEQUENCE_COMPLETED")
+    assert behaviors.requests[-1]["trajectory"]["trajectory_id"] == "field-dig_02-v1"
+    assert runtime.snapshot.stage == "FOLLOW_DIG"
+    assert runtime.snapshot.completed_cycles == 2
+
+    behaviors.succeed(reason_code="SUCCEEDED")
 
     assert runtime.snapshot.stage == "COMPLETED"
     assert runtime.snapshot.completed_cycles == 2
@@ -197,6 +278,59 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
         ("activate_act", 130),
         ("activate_act", 130),
     ]
+
+
+def test_fixed_action_feedback_does_not_require_follow_visualization(
+    tmp_path: Path,
+) -> None:
+    plan, registry = _deployment(tmp_path)
+    core = _Core()
+    behaviors = _BehaviorExecutor()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=core,
+        behavior_executor=behaviors,
+        act_worker_ready=lambda: True,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    runtime.start(run_id="run-v3a-fixed-action-feedback", requested_cycles=1)
+    behaviors.succeed(reason_code="SUCCEEDED")
+    core.complete_act()
+    runtime.tick()
+    behaviors.succeed(reason_code="SUCCEEDED")
+    assert behaviors.requests[-1]["type"] == "start_fixed_action"
+
+    behaviors.fixed_action_feedback()
+
+    assert runtime.snapshot.stage == "EXECUTE_DUMP"
+    assert runtime.visualization_snapshot is None
+    behaviors.succeed(reason_code="SEQUENCE_COMPLETED")
+    assert behaviors.requests[-1]["type"] == "start_follow"
+
+
+def test_malformed_read_only_visualization_does_not_abort_follow(
+    tmp_path: Path,
+) -> None:
+    plan, registry = _deployment(tmp_path)
+    behaviors = _BehaviorExecutor()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=_Core(),
+        behavior_executor=behaviors,
+        act_worker_ready=lambda: True,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+    runtime.start(run_id="run-v3a-bad-preview", requested_cycles=1)
+
+    behaviors.malformed_follow_feedback()
+
+    assert runtime.snapshot.stage == "FOLLOW_DIG"
+    assert runtime.visualization_snapshot is None
 
 
 def test_act_to_rl_dispatch_waits_for_acknowledged_rl_authority(
@@ -305,6 +439,29 @@ def test_only_pc_heartbeat_renews_active_fixed_cycle_lease(tmp_path: Path) -> No
 
     runtime.heartbeat()
     assert core.calls[-1] == ("renew_mission_lease", 3000)
+
+
+def test_heartbeat_returns_terminal_receipt_without_renewing_lease(
+    tmp_path: Path,
+) -> None:
+    plan, registry = _deployment(tmp_path)
+    core = _Core()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=core,
+        behavior_executor=_BehaviorExecutor(),
+        act_worker_ready=lambda: True,
+    )
+    runtime.start(run_id="run-v3a-terminal-receipt", requested_cycles=1)
+    runtime.cancel()
+    calls_before_receipt = list(core.calls)
+
+    receipt = runtime.heartbeat()
+
+    assert receipt.stage == "CANCELLED"
+    assert receipt.terminal is True
+    assert core.calls == calls_before_receipt
 
 
 def test_materialized_fixed_template_passes_the_real_behavior_boundary(

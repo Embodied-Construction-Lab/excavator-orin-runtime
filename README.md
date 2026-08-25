@@ -188,8 +188,8 @@ configuration load. `onnx_path` is mandatory for `onnx_rl` and may be omitted
 for `cartesian_p`, so the classical ablation does not depend on an unrelated
 model artifact.
 
-The execution waypoint tolerance and Follow deadline have one authoritative
-source:
+The legacy execution waypoint tolerance and Follow deadline have one
+authoritative source:
 
 ```text
 excavation_cycle.json limits.waypoint_tolerance_m
@@ -200,6 +200,12 @@ excavation_cycle.json limits.tracking_timeout_s
 the execution waypoint tolerance. Startup rejects a trajectory whose Mission
 ID, SHA, phase, execution scope or eligibility does not match the deployed
 Mission asset.
+
+A Follow snapshot may additionally carry the digest-bound
+`intermediate_waypoint_tolerance_m`. When present, the first and final waypoint
+continue to use `waypoint_tolerance_m`, while only interior waypoints use the
+new value. Legacy snapshots without the field use `waypoint_tolerance_m` for
+every waypoint and therefore retain their original behavior.
 
 ## Edge shadow verification
 
@@ -351,7 +357,8 @@ PYTHONPATH=. python3 scripts/build_v3a_fixed_cycle_candidate.py \
   --mission-config ../AiryLidar/mission/config/excavation_cycle.json \
   --demo-config ../AiryLidar/mission/config/excavation_demo.json \
   --output-dir deploy/v3a/candidate \
-  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3a/candidate
+  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3a/candidate \
+  --intermediate-waypoint-tolerance-m 0.40
 
 # 候选启动必须额外携带独立 commissioning token。
 bash scripts/run_resident_mission_runtime.sh \
@@ -359,6 +366,18 @@ bash scripts/run_resident_mission_runtime.sh \
   --fixed-cycle-plan deploy/v3a/candidate/fixed_cycle.candidate.json \
   --commissioning-authorization ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING
 ```
+
+The checked-in V3-A candidate keeps `waypoint_tolerance_m=0.25` m for the
+generated start point and the final DIG/DUMP endpoint, and uses
+`intermediate_waypoint_tolerance_m=0.40` m only for the locally generated
+midpoint. Follow audit and no-progress logs report the tolerance used by the
+current waypoint.
+
+For each fixed endpoint, Orin expands the live Bucket Tip and target into a
+three-point swing-arc look-ahead. The midpoint interpolates the shortest polar
+angle around the `machine_root_ros` Z axis, the horizontal radius, and height.
+It is deterministic local geometry, not RRT*, and better matches the
+excavator's rotary motion than the former Cartesian straight-line midpoint.
 
 先发动机关闭验收启动、串口归零和安全停止，再在有人监护、急停可用时完成覆盖
 `dig_01/dig_02/dig_03/dump` 的三铲测试。只有测试通过并填写

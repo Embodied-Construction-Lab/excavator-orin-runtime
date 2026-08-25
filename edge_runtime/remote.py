@@ -31,12 +31,10 @@ from .remote_transport import (
 from .remote_validation import positive as _positive
 from .trajectory_controller import build_trajectory_controller_builder
 
-
 # Preserve the historical public import/pickle identity while keeping the
 # implementation in a focused private Module.
 FollowTrajectorySnapshot.__module__ = __name__
 EdgeFollowRuntimeFactory.__module__ = __name__
-
 
 def __getattr__(name: str) -> Any:
     if name != "OnnxPolicy":
@@ -437,6 +435,10 @@ class EdgeBehaviorExecutor:
                     elapsed_s=step.follow_elapsed_s,
                     bucket_tip_stamp_s=step.source_stamp_ms / 1000.0,
                     bucket_tip=list(step.bucket_tip_ros_m),
+                    trajectory_waypoints=[
+                        list(point) for point in step.trajectory_waypoints_ros_m
+                    ],
+                    waypoint_tolerance_m=step.waypoint_tolerance_m,
                     tracking_state="ACTIVE",
                     trajectory_controller_backend=(
                         active.trajectory_controller_backend

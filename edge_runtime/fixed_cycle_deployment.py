@@ -34,6 +34,7 @@ def build_candidate_deployment(
     output_dir: str | Path,
     deployed_root: str | Path,
     act_max_steps: int = 130,
+    intermediate_waypoint_tolerance_m: float = 0.40,
 ) -> Path:
     """Create candidate endpoint trajectories from authoritative Airy configs."""
 
@@ -56,6 +57,16 @@ def build_candidate_deployment(
     if dump != mission_dump:
         raise ValueError("mission and demo dump targets do not match")
     limits = _limits(mission.get("limits"), demo.get("limits"))
+    intermediate_tolerance = _positive(
+        "intermediate_waypoint_tolerance_m",
+        intermediate_waypoint_tolerance_m,
+    )
+    if intermediate_tolerance < limits["waypoint_tolerance_m"]:
+        raise ValueError(
+            "intermediate_waypoint_tolerance_m must be no smaller than "
+            "waypoint_tolerance_m"
+        )
+    limits["intermediate_waypoint_tolerance_m"] = intermediate_tolerance
     output = _new_directory(output_dir)
     deployed = Path(deployed_root)
     if not deployed.is_absolute():
@@ -139,6 +150,9 @@ def promote_candidate_deployment(
             position=item.waypoints[-1],
             limits={
                 "waypoint_tolerance_m": item.waypoint_tolerance_m,
+                "intermediate_waypoint_tolerance_m": (
+                    item.intermediate_waypoint_tolerance_m
+                ),
                 "waypoint_dwell_s": item.waypoint_dwell_s,
                 "tracking_timeout_s": item.tracking_timeout_s,
             },
@@ -187,6 +201,9 @@ def _trajectory_document(
         "workspace_constraint": "disabled_by_operator" if status == "candidate" else "field_validated",
         "waypoints": [list(position)],
         "waypoint_tolerance_m": limits["waypoint_tolerance_m"],
+        "intermediate_waypoint_tolerance_m": limits[
+            "intermediate_waypoint_tolerance_m"
+        ],
         "waypoint_dwell_s": limits["waypoint_dwell_s"],
         "tracking_timeout_s": limits["tracking_timeout_s"],
     }
