@@ -39,6 +39,9 @@ def test_resident_owner_launcher_owns_serial_and_wires_resident_motion_core():
     assert 'exec "${resident_python}" -u' in script
     assert '[[ -e "${resident_control_socket}"' not in script
     assert '[[ -e "${resident_act_socket}"' not in script
+    assert '"--commissioning-authorization"' in script
+    assert "ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING" in script
+    assert "--resident-fixed-cycle-commissioning-authorization" in script
 
 
 def test_resident_owner_example_config_uses_resident_sink_remote_control():

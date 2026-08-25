@@ -326,7 +326,7 @@ environment-dependent planning on PC while removing the network round trip
 between Follow and its fixed action. An active-leg connection loss remains
 fail-closed and stops that local behavior.
 
-### V3-A resident fixed cycle（开发中，尚未授权真机）
+### V3-A resident fixed cycle
 
 V3-A 从标签 `icra2027-v2-freeze-20260824` 分支。新增
 `edge_runtime.resident_fixed_cycle`，把固定 `dig_01`、`dig_02`、`dig_03` 与 `dump`
@@ -337,15 +337,45 @@ trajectory artifact 组织为严格的 `resident_fixed_cycle_plan.v1`，并用�
 FollowDig → ACT Dig → FollowDump → ExecuteDump → next FollowDig
 ```
 
-状态机只发出本地 `Follow`、`activate_act(max_steps)` 和 `ExecuteDump` directive；真正动作仍
-必须通过现有 Resident Motion Core、generation、Mission lease 和唯一 STM32 Command Sink。
-plan 只能引用绝对路径、非符号链接、SHA-256 匹配且明确标记为 `field_validated` 的 artifact，
-并在任何相机、模型或串口资源打开前一次性读入内存。
+状态机通过现有 Resident Motion Core、generation、唯一 STM32 Command Sink 和本地
+`EdgeBehaviorExecutor` 闭环。PC 只发送一次 start/cancel，并以 400 ms 周期续 supervisory lease；
+轨迹跟踪、ACT step budget、固定倾倒和阶段切换均不经过 PC。PC/网络失联超过 3 秒时 Orin 会
+terminal-disarm 并释放串口、相机和 socket。
 
-当前 V3-A 分支只完成 transport-independent plan、状态机、driver Seam 与 host fake
-integration，没有接入活动真机 launcher，也没有新增运动授权入口。因此不要在现场把该 Module
-当作可运动命令；V2 采集和演示继续使用冻结标签。下一纵切才会把它接入 owner 的本地
-observation loop，并用发动机关闭 HIL 验证 terminal-zero ACK 和切换延迟。
+普通入口只加载绝对路径、非符号链接、SHA-256 匹配且标记为 `field_validated` 的 artifact。
+候选轨迹必须走独立 commissioning acknowledgement，不能仅修改 JSON 就进入普通 WebUI：
+
+```bash
+# PC 生成候选；输出文件可提交，但 validation_status 仍是 candidate。
+PYTHONPATH=. python3 scripts/build_v3a_fixed_cycle_candidate.py \
+  --mission-config ../AiryLidar/mission/config/excavation_cycle.json \
+  --demo-config ../AiryLidar/mission/config/excavation_demo.json \
+  --output-dir deploy/v3a/candidate \
+  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3a/candidate
+
+# 候选启动必须额外携带独立 commissioning token。
+bash scripts/run_resident_mission_runtime.sh \
+  --authorization ALLOW_HYBRID_MACHINE_MOTION \
+  --fixed-cycle-plan deploy/v3a/candidate/fixed_cycle.candidate.json \
+  --commissioning-authorization ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING
+```
+
+先发动机关闭验收启动、串口归零和安全停止，再在有人监护、急停可用时完成覆盖
+`dig_01/dig_02/dig_03/dump` 的三铲测试。只有测试通过并填写
+`v3a_fixed_cycle_validation.v1` 记录后，才执行：
+
+```bash
+PYTHONPATH=. python3 scripts/promote_v3a_fixed_cycle.py \
+  --candidate-plan deploy/v3a/candidate/fixed_cycle.candidate.json \
+  --validation-record /path/to/validation.json \
+  --output-dir deploy/v3a/field \
+  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3a/field \
+  --authorization PROMOTE_V3A_FIELD_VALIDATED_TRAJECTORIES
+```
+
+晋升会重写所有 trajectory ID、validation status 和 SHA，并把验收记录复制到 field 目录；
+`fixed_cycle.field.json` 才是正式 WebUI 使用的 plan。V2 冻结版本保留在
+`icra2027-v2-freeze-20260824`，不在 V3-A 上回改。
 
 The fixed-action asset is loaded once before the serial port is opened. Its
 machine-profile and URDF SHA-256 bindings must match the deployed assets.

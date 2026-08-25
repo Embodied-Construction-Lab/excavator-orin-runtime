@@ -6,9 +6,11 @@ import pytest
 
 from edge_runtime.resident_fixed_cycle import (
     FixedCyclePlan,
+    FixedTrajectoryTemplate,
     ResidentFixedCycle,
     ResidentFixedCycleCoordinator,
     load_fixed_cycle_plan,
+    load_fixed_cycle_registry,
     verify_fixed_cycle_artifacts,
 )
 
@@ -115,6 +117,97 @@ def test_artifact_preflight_rejects_symbolic_links(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="regular non-symbolic-link"):
         verify_fixed_cycle_artifacts(plan)
+
+
+def test_registry_loads_strict_field_validated_trajectory_templates(
+    tmp_path: Path,
+) -> None:
+    document = _plan_document()
+    for target_id, artifact in document["trajectories"].items():
+        phase = "dump" if target_id == "dump" else "dig"
+        template = {
+            "schema_version": "resident_fixed_trajectory.v1",
+            "trajectory_id": artifact["trajectory_id"],
+            "validation_status": "field_validated",
+            "phase": phase,
+            "frame_id": "machine_root_ros",
+            "mission_id": "field_cycle_001",
+            "mission_sha256": "c" * 64,
+            "task_mode": "CarryMaterial" if phase == "dump" else "MoveToDig",
+            "control_stage": "commissioning",
+            "workspace_constraint": "field_validated",
+            "waypoints": [[0.2, 0.0, 0.1], [1.0, 0.0, 0.0]],
+            "waypoint_tolerance_m": 0.25,
+            "waypoint_dwell_s": 0.0,
+            "tracking_timeout_s": 60.0,
+        }
+        payload = json.dumps(template, sort_keys=True).encode("utf-8")
+        path = tmp_path / f"{target_id}.json"
+        path.write_bytes(payload)
+        artifact["path"] = str(path)
+        artifact["sha256"] = hashlib.sha256(payload).hexdigest()
+
+    registry = load_fixed_cycle_registry(FixedCyclePlan.from_mapping(document))
+
+    assert tuple(registry) == ("dig_01", "dig_02", "dig_03", "dump")
+    assert isinstance(registry["dig_01"], FixedTrajectoryTemplate)
+    assert registry["dig_01"].waypoints[-1] == (1.0, 0.0, 0.0)
+    assert registry["dump"].task_mode == "CarryMaterial"
+
+    invalid = json.loads(
+        Path(document["trajectories"]["dig_02"]["path"]).read_text()
+    )
+    invalid["validation_status"] = "uncommissioned"
+    invalid_payload = json.dumps(invalid, sort_keys=True).encode("utf-8")
+    invalid_path = Path(document["trajectories"]["dig_02"]["path"])
+    invalid_path.write_bytes(invalid_payload)
+    document["trajectories"]["dig_02"]["sha256"] = hashlib.sha256(
+        invalid_payload
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="field_validated"):
+        load_fixed_cycle_registry(FixedCyclePlan.from_mapping(document))
+
+
+def test_candidate_plan_requires_explicit_commissioning_loader(
+    tmp_path: Path,
+) -> None:
+    document = _plan_document()
+    document["validation_status"] = "candidate"
+    for target_id, artifact in document["trajectories"].items():
+        phase = "dump" if target_id == "dump" else "dig"
+        template = {
+            "schema_version": "resident_fixed_trajectory.v1",
+            "trajectory_id": artifact["trajectory_id"],
+            "validation_status": "candidate",
+            "phase": phase,
+            "frame_id": "machine_root_ros",
+            "mission_id": "field_cycle_001",
+            "mission_sha256": "c" * 64,
+            "task_mode": "CarryMaterial" if phase == "dump" else "MoveToDig",
+            "control_stage": "commissioning",
+            "workspace_constraint": "disabled_by_operator",
+            "waypoints": [[1.0, 0.0, 0.0]],
+            "waypoint_tolerance_m": 0.25,
+            "waypoint_dwell_s": 0.0,
+            "tracking_timeout_s": 60.0,
+        }
+        payload = json.dumps(template, sort_keys=True).encode("utf-8")
+        path = tmp_path / f"{target_id}.json"
+        path.write_bytes(payload)
+        artifact["path"] = str(path)
+        artifact["sha256"] = hashlib.sha256(payload).hexdigest()
+    plan_path = tmp_path / "candidate-plan.json"
+    plan_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="field_validated"):
+        load_fixed_cycle_plan(plan_path)
+
+    plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
+    registry = load_fixed_cycle_registry(plan, allow_candidate=True)
+
+    assert plan.validation_status == "candidate"
+    assert all(item.validation_status == "candidate" for item in registry.values())
 
 
 def test_three_cycles_advance_locally_without_per_stage_external_commands() -> None:

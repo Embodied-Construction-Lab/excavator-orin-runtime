@@ -9,6 +9,8 @@ resident_runtime_root="${RESIDENT_RUNTIME_ROOT:-${HOME}/.local/run/excavator-res
 resident_act_socket="${RESIDENT_ACT_SOCKET:-${resident_runtime_root}/act.sock}"
 resident_control_socket="${RESIDENT_CONTROL_SOCKET:-${resident_runtime_root}/control.sock}"
 resident_python="${RESIDENT_PYTHON:-python3}"
+fixed_cycle_plan=""
+commissioning_authorization=""
 authorization=""
 
 while [[ $# -gt 0 ]]; do
@@ -38,6 +40,16 @@ while [[ $# -gt 0 ]]; do
       print_every="$2"
       shift 2
       ;;
+    "--fixed-cycle-plan")
+      [[ $# -ge 2 ]] || { echo "--fixed-cycle-plan 缺少值" >&2; exit 2; }
+      fixed_cycle_plan="$2"
+      shift 2
+      ;;
+    "--commissioning-authorization")
+      [[ $# -ge 2 ]] || { echo "--commissioning-authorization 缺少值" >&2; exit 2; }
+      commissioning_authorization="$2"
+      shift 2
+      ;;
     *)
       echo "未知参数：$1" >&2
       exit 2
@@ -55,6 +67,14 @@ if [[ ! "${print_every}" =~ ^[0-9]+$ ]]; then
 fi
 if [[ ! "${pc_host}" =~ ^[0-9A-Za-z._:-]+$ ]]; then
   echo "--pc-host 必须是安全的主机名或 IPv4 文本。" >&2
+  exit 2
+fi
+if [[ -n "${commissioning_authorization}" && "${commissioning_authorization}" != "ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING" ]]; then
+  echo "V3-A 候选轨迹需要精确授权：ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING" >&2
+  exit 1
+fi
+if [[ -n "${commissioning_authorization}" && -z "${fixed_cycle_plan}" ]]; then
+  echo "候选轨迹授权只能与 --fixed-cycle-plan 一起使用。" >&2
   exit 2
 fi
 
@@ -100,6 +120,21 @@ if value.get("action_transport") != "resident_sink":
     raise SystemExit("resident owner requires action_transport=resident_sink")
 PY
 
+fixed_cycle_args=()
+if [[ -n "${fixed_cycle_plan}" ]]; then
+  if [[ "${fixed_cycle_plan}" != /* ]]; then
+    fixed_cycle_plan="${repo_dir}/${fixed_cycle_plan}"
+  fi
+  test -f "${fixed_cycle_plan}"
+  fixed_cycle_args=(--resident-fixed-cycle-plan "${fixed_cycle_plan}")
+  if [[ -n "${commissioning_authorization}" ]]; then
+    fixed_cycle_args+=(
+      --resident-fixed-cycle-commissioning-authorization
+      "${commissioning_authorization}"
+    )
+  fi
+fi
+
 echo "启动 resident Mission owner：${serial_port} 将保持为唯一 STM32 owner。"
 echo "ACT worker 通过 ${resident_act_socket} 发送候选动作；低频控制命令走 ${resident_control_socket}。"
 
@@ -113,4 +148,5 @@ exec "${resident_python}" -u "${repo_dir}/orin_state_sender.py" \
   --resident-motion-core \
   --resident-act-socket "${resident_act_socket}" \
   --resident-control-socket "${resident_control_socket}" \
+  "${fixed_cycle_args[@]}" \
   --print-every "${print_every}"

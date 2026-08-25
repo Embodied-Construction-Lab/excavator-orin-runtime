@@ -251,6 +251,79 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         self.assertTrue(resident_args.resident_act_socket.is_absolute())
         self.assertTrue(resident_args.resident_control_socket.is_absolute())
 
+    def test_v3a_fixed_cycle_is_an_explicit_plan_and_local_control_socket(self):
+        default_args = orin.parse_args([])
+        fixed_args = orin.parse_args(
+            [
+                "--resident-fixed-cycle-plan",
+                "/opt/excavator-v3a/fixed-cycle.json",
+            ]
+        )
+
+        self.assertIsNone(default_args.resident_fixed_cycle_plan)
+        self.assertEqual(
+            fixed_args.resident_fixed_cycle_plan,
+            Path("/opt/excavator-v3a/fixed-cycle.json"),
+        )
+        self.assertTrue(
+            fixed_args.resident_fixed_cycle_control_socket.is_absolute()
+        )
+        self.assertEqual(
+            default_args.resident_fixed_cycle_commissioning_authorization,
+            "",
+        )
+
+    def test_v3a_candidate_commissioning_requires_exact_independent_token(self):
+        args = orin.parse_args(
+            [
+                "--resident-fixed-cycle-plan",
+                "/opt/excavator-v3a/candidate.json",
+                "--resident-fixed-cycle-commissioning-authorization",
+                "wrong",
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exact commissioning"):
+            orin.validate_resident_fixed_cycle_request(args, None)
+
+        args.resident_fixed_cycle_commissioning_authorization = (
+            orin.V3A_FIXED_TRAJECTORY_COMMISSIONING_AUTHORIZATION
+        )
+        args.resident_motion_core = True
+        edge = SimpleNamespace(
+            mode="remote_control",
+            action_transport=orin.RESIDENT_EDGE_ACTION_TRANSPORT,
+        )
+
+        orin.validate_resident_fixed_cycle_request(args, edge)
+
+    def test_v3a_fixed_cycle_requires_the_resident_remote_control_boundary(self):
+        args = orin.parse_args(
+            [
+                "--resident-fixed-cycle-plan",
+                "/opt/excavator-v3a/fixed-cycle.json",
+            ]
+        )
+        resident_edge = SimpleNamespace(
+            mode="remote_control",
+            action_transport=orin.RESIDENT_EDGE_ACTION_TRANSPORT,
+        )
+
+        with self.assertRaisesRegex(ValueError, "resident-motion-core"):
+            orin.validate_resident_fixed_cycle_request(args, resident_edge)
+
+        args.resident_motion_core = True
+        with self.assertRaisesRegex(ValueError, "remote_control"):
+            orin.validate_resident_fixed_cycle_request(
+                args,
+                SimpleNamespace(
+                    mode="shadow",
+                    action_transport=orin.RESIDENT_EDGE_ACTION_TRANSPORT,
+                ),
+            )
+
+        orin.validate_resident_fixed_cycle_request(args, resident_edge)
+
     def test_resident_state_publishes_every_act_telemetry_for_safety_updates(self):
         class Link:
             def __init__(self):

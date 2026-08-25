@@ -55,6 +55,14 @@ from edge_runtime.resident_control import (
 )
 from edge_runtime.resident_core import ResidentMotionCore
 from edge_runtime.resident_data_link import ResidentActDataLink
+from edge_runtime.resident_fixed_cycle import (
+    load_fixed_cycle_plan,
+    load_fixed_cycle_registry,
+)
+from edge_runtime.resident_fixed_cycle_control import (
+    ResidentFixedCycleControlServer,
+)
+from edge_runtime.resident_fixed_cycle_runtime import ResidentFixedCycleRuntime
 from edge_runtime.resident_sink import ResidentTelemetry, ResidentWriteResult
 from edge_runtime.resident_state import (
     ResidentActState,
@@ -79,6 +87,12 @@ DEFAULT_RESIDENT_TERMINAL_ACK_TIMEOUT_S = 0.6
 DEFAULT_RESIDENT_RUNTIME_ROOT = Path.home() / ".local/run/excavator-resident"
 DEFAULT_RESIDENT_ACT_SOCKET = DEFAULT_RESIDENT_RUNTIME_ROOT / "act.sock"
 DEFAULT_RESIDENT_CONTROL_SOCKET = DEFAULT_RESIDENT_RUNTIME_ROOT / "control.sock"
+DEFAULT_RESIDENT_FIXED_CYCLE_CONTROL_SOCKET = (
+    DEFAULT_RESIDENT_RUNTIME_ROOT / "fixed-cycle.sock"
+)
+V3A_FIXED_TRAJECTORY_COMMISSIONING_AUTHORIZATION = (
+    "ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING"
+)
 
 STM32_FRAME_FORMAT = "<I15f"
 STM32_FRAME_SIZE = struct.calcsize(STM32_FRAME_FORMAT)
@@ -650,6 +664,7 @@ def resident_owner_tick_requests_exit(
     *,
     initialized: bool,
     now_monotonic_ns: int,
+    release_allowed: bool = True,
 ) -> bool:
     """Run owner watchdogs independently of telemetry and detect terminal stop."""
 
@@ -657,6 +672,8 @@ def resident_owner_tick_requests_exit(
         return False
     core.tick(now_monotonic_ns=now_monotonic_ns)
     if core.is_operational:
+        return False
+    if not release_allowed:
         return False
     LOGGER.warning(
         "resident motion core disarmed; exiting owner to release serial, "
@@ -1282,6 +1299,43 @@ def validate_resident_motion_request(args: argparse.Namespace, edge_config: obje
         )
 
 
+def validate_resident_fixed_cycle_request(
+    args: argparse.Namespace,
+    edge_config: object | None,
+) -> None:
+    """Reject partial V3-A activation before model, serial, or sockets open."""
+
+    commissioning_authorization = getattr(
+        args,
+        "resident_fixed_cycle_commissioning_authorization",
+        "",
+    )
+    if (
+        commissioning_authorization
+        and commissioning_authorization
+        != V3A_FIXED_TRAJECTORY_COMMISSIONING_AUTHORIZATION
+    ):
+        raise RuntimeError(
+            "resident fixed cycle candidate requires exact commissioning "
+            "authorization: "
+            + V3A_FIXED_TRAJECTORY_COMMISSIONING_AUTHORIZATION
+        )
+    if getattr(args, "resident_fixed_cycle_plan", None) is None:
+        if commissioning_authorization:
+            raise ValueError(
+                "fixed cycle commissioning authorization requires a plan"
+            )
+        return
+    if not args.resident_motion_core:
+        raise ValueError("resident fixed cycle requires --resident-motion-core")
+    if edge_config is None or getattr(edge_config, "mode", None) != "remote_control":
+        raise ValueError("resident fixed cycle requires edge mode=remote_control")
+    if not edge_uses_resident_action_transport(edge_config):
+        raise ValueError("resident fixed cycle requires action_transport=resident_sink")
+    if not args.resident_fixed_cycle_control_socket.is_absolute():
+        raise ValueError("resident fixed cycle control socket must be absolute")
+
+
 def edge_uses_resident_action_transport(edge_config: object | None) -> bool:
     if edge_config is None:
         return False
@@ -1466,6 +1520,34 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
         help="Absolute Unix socket for low-rate resident policy handoff commands.",
     )
+    parser.add_argument(
+        "--resident-fixed-cycle-plan",
+        type=Path,
+        help=(
+            "Enable V3-A Orin-local fixed-target cycling with this strict, "
+            "field-validated resident_fixed_cycle_plan.v1 artifact."
+        ),
+    )
+    parser.add_argument(
+        "--resident-fixed-cycle-control-socket",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "RESIDENT_FIXED_CYCLE_CONTROL_SOCKET",
+                str(DEFAULT_RESIDENT_FIXED_CYCLE_CONTROL_SOCKET),
+            )
+        ),
+        help="Absolute Unix socket for V3-A start/status/cancel commands.",
+    )
+    parser.add_argument(
+        "--resident-fixed-cycle-commissioning-authorization",
+        default="",
+        help=(
+            "Independent exact acknowledgement required to load candidate "
+            "V3-A trajectories. Normal operation accepts field_validated "
+            "artifacts only."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1518,6 +1600,28 @@ def main() -> None:
         else:
             edge_runtime = build_edge_follow_runtime(edge_config)
     validate_resident_motion_request(args, edge_config)
+    validate_resident_fixed_cycle_request(args, edge_config)
+    resident_fixed_cycle_plan = None
+    resident_fixed_cycle_registry = None
+    fixed_cycle_plan_path = getattr(args, "resident_fixed_cycle_plan", None)
+    if fixed_cycle_plan_path is not None:
+        allow_candidate = (
+            args.resident_fixed_cycle_commissioning_authorization
+            == V3A_FIXED_TRAJECTORY_COMMISSIONING_AUTHORIZATION
+        )
+        resident_fixed_cycle_plan = load_fixed_cycle_plan(
+            fixed_cycle_plan_path,
+            allow_candidate=allow_candidate,
+        )
+        resident_fixed_cycle_registry = load_fixed_cycle_registry(
+            resident_fixed_cycle_plan,
+            allow_candidate=allow_candidate,
+        )
+        if resident_fixed_cycle_plan.validation_status == "candidate":
+            LOGGER.warning(
+                "V3-A FIXED TRAJECTORY COMMISSIONING: candidate plan=%s",
+                resident_fixed_cycle_plan.plan_id,
+            )
 
     if args.hardware_start_gate is not None:
         signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_termination)
@@ -1559,6 +1663,8 @@ def main() -> None:
     resident_motion_core = None
     resident_data_link = None
     resident_control_server = None
+    resident_fixed_cycle_runtime = None
+    resident_fixed_cycle_control_server = None
     resident_initialized = False
     resident_hardware_ready_logged = False
     behavior_executor = None
@@ -1574,17 +1680,18 @@ def main() -> None:
                 resident_motion_core.notify_act_worker_disconnected
             ),
         )
-        resident_control_server = ResidentMotionControlServer(
-            resident_motion_core,
-            socket_path=str(args.resident_control_socket),
-            act_worker_ready=lambda: resident_data_link.connected,
-            rl_behavior_idle=resident_rl_behavior_idle_probe(
-                lambda: behavior_executor
-            ),
-            activate_act_while_rl_idle=resident_act_activation_gate(
-                lambda: behavior_executor
-            ),
-        )
+        if resident_fixed_cycle_plan is None:
+            resident_control_server = ResidentMotionControlServer(
+                resident_motion_core,
+                socket_path=str(args.resident_control_socket),
+                act_worker_ready=lambda: resident_data_link.connected,
+                rl_behavior_idle=resident_rl_behavior_idle_probe(
+                    lambda: behavior_executor
+                ),
+                activate_act_while_rl_idle=resident_act_activation_gate(
+                    lambda: behavior_executor
+                ),
+            )
     else:
         action_sock = open_action_socket(args.action_bind_host, args.action_bind_port)
         action_relay = ActionRelay(
@@ -1697,27 +1804,50 @@ def main() -> None:
                     resident_motion_core,
                 ),
             )
-            remote_executor = EdgeCycleCoordinator(behavior_executor)
-            remote_server = RemoteBehaviorServer(
-                bind_host=remote.bind_host,
-                bind_port=remote.bind_port,
-                allowed_client_host=remote.allowed_client_host,
-                executor=remote_executor,
-                status_interval_s=1.0 / remote.status_hz,
-            )
-            try:
-                remote_server.start()
-            except Exception:
-                if edge_action_sender is not None:
-                    edge_action_sender.close()
-                if action_relay is not None:
-                    action_relay.close()
-                if action_sock is not None:
-                    action_sock.close()
-                sock.close()
-                ser.close()
-                raise
-            if resident_action_transport:
+            if resident_fixed_cycle_plan is not None:
+                resident_fixed_cycle_runtime = ResidentFixedCycleRuntime(
+                    plan=resident_fixed_cycle_plan,
+                    registry=resident_fixed_cycle_registry,
+                    core=resident_motion_core,
+                    behavior_executor=behavior_executor,
+                    act_worker_ready=lambda: resident_data_link.connected,
+                )
+                resident_fixed_cycle_control_server = (
+                    ResidentFixedCycleControlServer(
+                        resident_fixed_cycle_runtime,
+                        socket_path=str(
+                            args.resident_fixed_cycle_control_socket
+                        ),
+                    )
+                )
+                remote_executor = behavior_executor
+                LOGGER.warning(
+                    "V3-A RESIDENT FIXED CYCLE ARMED IDLE: plan=%s; "
+                    "external behavior RPC disabled",
+                    resident_fixed_cycle_plan.plan_id,
+                )
+            else:
+                remote_executor = EdgeCycleCoordinator(behavior_executor)
+                remote_server = RemoteBehaviorServer(
+                    bind_host=remote.bind_host,
+                    bind_port=remote.bind_port,
+                    allowed_client_host=remote.allowed_client_host,
+                    executor=remote_executor,
+                    status_interval_s=1.0 / remote.status_hz,
+                )
+                try:
+                    remote_server.start()
+                except Exception:
+                    if edge_action_sender is not None:
+                        edge_action_sender.close()
+                    if action_relay is not None:
+                        action_relay.close()
+                    if action_sock is not None:
+                        action_sock.close()
+                    sock.close()
+                    ser.close()
+                    raise
+            if resident_action_transport and resident_fixed_cycle_plan is None:
                 LOGGER.warning(
                     "REMOTE EDGE CONTROL ARMED IDLE: behavior RPC %s:%d from %s; "
                     "actions use the resident STM32 command sink",
@@ -1744,17 +1874,30 @@ def main() -> None:
             resident_data_link.start()
         if resident_control_server is not None:
             resident_control_server.start()
+        if resident_fixed_cycle_control_server is not None:
+            resident_fixed_cycle_control_server.start()
         if resident_action_transport:
-            LOGGER.info(
-                "RESIDENT_CONTROL_READY control_socket=%s act_socket=%s",
-                args.resident_control_socket,
-                args.resident_act_socket,
-            )
+            if resident_fixed_cycle_control_server is not None:
+                LOGGER.info(
+                    "RESIDENT_FIXED_CYCLE_READY control_socket=%s act_socket=%s",
+                    args.resident_fixed_cycle_control_socket,
+                    args.resident_act_socket,
+                )
+            else:
+                LOGGER.info(
+                    "RESIDENT_CONTROL_READY control_socket=%s act_socket=%s",
+                    args.resident_control_socket,
+                    args.resident_act_socket,
+                )
         while True:
             if resident_owner_tick_requests_exit(
                 resident_motion_core,
                 initialized=resident_initialized,
                 now_monotonic_ns=time.monotonic_ns(),
+                release_allowed=(
+                    resident_fixed_cycle_runtime is None
+                    or resident_fixed_cycle_runtime.owner_release_ready
+                ),
             ):
                 break
             if args.input_format == "binary":
@@ -1835,13 +1978,14 @@ def main() -> None:
                 )
                 if not resident_initialized:
                     resident_motion_core.initialize(resident_frame)
-                    resident_motion_core.activate_rl(
-                        now_monotonic_ns=resident_frame.receive_monotonic_ns
-                    )
-                    resident_motion_core.renew_mission_lease(
-                        lease_ms=DEFAULT_MISSION_LEASE_MS,
-                        now_monotonic_ns=resident_frame.receive_monotonic_ns,
-                    )
+                    if resident_fixed_cycle_runtime is None:
+                        resident_motion_core.activate_rl(
+                            now_monotonic_ns=resident_frame.receive_monotonic_ns
+                        )
+                        resident_motion_core.renew_mission_lease(
+                            lease_ms=DEFAULT_MISSION_LEASE_MS,
+                            now_monotonic_ns=resident_frame.receive_monotonic_ns,
+                        )
                     resident_initialized = True
                 else:
                     resident_motion_core.observe_telemetry(resident_frame)
@@ -1896,6 +2040,8 @@ def main() -> None:
                     )
             if remote_executor is not None:
                 remote_executor.observe(packet)
+            if resident_fixed_cycle_runtime is not None:
+                resident_fixed_cycle_runtime.tick()
 
             if args.print_every and seq % args.print_every == 0:
                 LOGGER.info(
@@ -1959,6 +2105,8 @@ def main() -> None:
                                 "resident terminal zero was not acknowledged"
                             )
         finally:
+            if resident_fixed_cycle_control_server is not None:
+                resident_fixed_cycle_control_server.close()
             if resident_control_server is not None:
                 resident_control_server.close()
             if resident_data_link is not None:
