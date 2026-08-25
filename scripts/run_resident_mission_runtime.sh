@@ -8,6 +8,7 @@ edge_config="${EDGE_CONFIG:-deploy/edge_runtime.resident.remote.json}"
 resident_runtime_root="${RESIDENT_RUNTIME_ROOT:-${HOME}/.local/run/excavator-resident}"
 resident_act_socket="${RESIDENT_ACT_SOCKET:-${resident_runtime_root}/act.sock}"
 resident_control_socket="${RESIDENT_CONTROL_SOCKET:-${resident_runtime_root}/control.sock}"
+resident_fixed_cycle_control_socket="${RESIDENT_FIXED_CYCLE_CONTROL_SOCKET:-${resident_runtime_root}/fixed-cycle.sock}"
 resident_python="${RESIDENT_PYTHON:-python3}"
 fixed_cycle_plan=""
 commissioning_authorization=""
@@ -148,5 +149,6 @@ exec "${resident_python}" -u "${repo_dir}/orin_state_sender.py" \
   --resident-motion-core \
   --resident-act-socket "${resident_act_socket}" \
   --resident-control-socket "${resident_control_socket}" \
+  --resident-fixed-cycle-control-socket "${resident_fixed_cycle_control_socket}" \
   "${fixed_cycle_args[@]}" \
   --print-every "${print_every}"
