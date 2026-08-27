@@ -29,6 +29,7 @@ from .trajectory_controller import (
 LOGGER = logging.getLogger("edge_runtime.follow")
 _NO_PROGRESS_WINDOW_S = 2.0
 _MEANINGFUL_PROGRESS_M = 0.01
+_INITIAL_SLEW_ELAPSED_CAP_S = 0.05
 
 
 def _cylindrical_arc_midpoint(
@@ -102,6 +103,7 @@ class EdgeFollowRuntime:
         trajectory: Mapping[str, Any],
         mission: Mapping[str, Any],
         action_slew_rate_per_s: Optional[float] = None,
+        slew_started_monotonic_s: Optional[float] = None,
     ) -> None:
         if machine_profile.get("machine_id") != "scale_excavator_v1":
             raise ValueError("unsupported machine profile")
@@ -126,6 +128,14 @@ class EdgeFollowRuntime:
             self._action_slew_rate_per_s: Optional[float] = rate
         else:
             self._action_slew_rate_per_s = None
+        if slew_started_monotonic_s is not None:
+            if isinstance(slew_started_monotonic_s, bool):
+                raise ValueError("slew_started_monotonic_s must be finite")
+            slew_started = float(slew_started_monotonic_s)
+            if not math.isfinite(slew_started) or slew_started < 0.0:
+                raise ValueError("slew_started_monotonic_s must be finite")
+        else:
+            slew_started = None
         self._follow_limits = MissionFollowLimits.from_mapping(mission)
         if self._follow_limits.waypoint_dwell_s != 0.0:
             raise ValueError(
@@ -145,7 +155,8 @@ class EdgeFollowRuntime:
         self._previous_commanded_action = (0.0, 0.0, 0.0, 0.0)
         self._last_source_seq = None
         self._follow_started_monotonic = None
-        self._last_monotonic = None
+        self._last_monotonic = slew_started
+        self._has_commanded_action = False
         self._terminal_result = None
         self._progress_window: Optional[_FollowProgressWindow] = None
 
@@ -235,6 +246,11 @@ class EdgeFollowRuntime:
                     if self._last_monotonic is None
                     else float(now_s) - self._last_monotonic
                 )
+                if not self._has_commanded_action:
+                    elapsed_since_command_s = min(
+                        elapsed_since_command_s,
+                        _INITIAL_SLEW_ELAPSED_CAP_S,
+                    )
                 commanded_normalized = slew_limited_normalized_action(
                     normalized,
                     self._previous_commanded_action,
@@ -289,6 +305,7 @@ class EdgeFollowRuntime:
             # raw policy action, not the actuator controller's ramped speed.
             self._previous_action = normalized
             self._previous_commanded_action = commanded_normalized
+            self._has_commanded_action = True
         self._last_source_seq = source_seq
         self._last_monotonic = float(now_s)
         return result

@@ -269,12 +269,13 @@ lease expiry, trajectory completion and shutdown all produce a zero command.
 
 `follow_action_slew_rate_per_s` limits only how quickly the command sent to the
 actuator can approach a new ONNX target. It does not scale, negate or clip the
-steady-state ONNX target. With the deployed value `2.0`, a 10 Hz state stream
-allows at most about `0.2` normalized command change per update. Direction
-reversals therefore pass through zero instead of jumping directly from `+1` to
-`-1`. The first Follow sample is zero so a new behavior ramps from rest.
-Terminal, cancellation, rejected-state and shutdown zeros bypass the limiter
-and remain immediate.
+steady-state ONNX target. The ACT-A2 resident candidate uses `3.0`; a 10 Hz
+state stream therefore permits at most about `0.3` normalized command change
+per steady update. Direction reversals still pass through zero instead of
+jumping directly from `+1` to `-1`. A new Follow starts from zero authority,
+but its first command now uses at most 50 ms of measured activation time rather
+than emitting an additional unconditional zero frame. Terminal, cancellation,
+rejected-state and shutdown zeros bypass the limiter and remain immediate.
 
 This static control mode remains available for the existing staged rollout.
 

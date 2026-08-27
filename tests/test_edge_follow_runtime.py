@@ -501,6 +501,25 @@ class EdgeFollowRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(second.physical_action[2], -0.012)
         self.assertAlmostEqual(second.physical_action[3], 0.12)
 
+    def test_follow_slew_uses_bounded_activation_elapsed_on_first_command(self):
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=RecordingPolicy([1.0, -1.0, 0.5, -0.5]),
+            trajectory=trajectory(),
+            mission=mission(),
+            action_slew_rate_per_s=2.0,
+            slew_started_monotonic_s=10.0,
+        )
+
+        first = runtime.step(machine_state(sequence=10), now_s=10.2)
+
+        for actual, expected in zip(
+            first.commanded_normalized_action,
+            (0.1, -0.1, 0.1, -0.1),
+        ):
+            self.assertAlmostEqual(actual, expected)
+
     def test_bucket_pitch_error_matches_unity_delta_angle_for_each_task_mode(self):
         observations = {}
         for task_mode in ("MoveToDig", "CarryMaterial"):
