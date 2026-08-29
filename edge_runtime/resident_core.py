@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 import threading
 import time
 from typing import Callable
 
+from .resident_action_audit import (
+    ResidentActionAuditSink,
+    emit_action_audit,
+)
 from .resident_ingress import (
     ResidentPolicyCandidateAdapter,
     ResidentVelocityActionAdapter,
 )
+from .resident_protocol import decode_motion_candidate
 from .resident_motion import (
     ControlMode,
     HandoffPhase,
@@ -31,6 +37,45 @@ ACT_BINDING = PolicyBinding("act_dig", ControlMode.MANUAL_ACTION)
 MAX_ACT_SEGMENT_STEPS = 2000
 MIN_MISSION_LEASE_MS = 500
 MAX_MISSION_LEASE_MS = 5000
+ACT_NOMINAL_STEP_PERIOD_MS = 100.0
+DEFAULT_ACT_ACTION_CHUNK_STEPS = 10
+DEFAULT_ACT_EARLY_COMPLETION_MIN_STEPS = 100
+
+
+@dataclass(frozen=True)
+class AxisManualActionDeadzone:
+    positive_abs: float
+    negative_abs: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "positive_abs", _manual_action_deadzone_component(self.positive_abs)
+        )
+        object.__setattr__(
+            self, "negative_abs", _manual_action_deadzone_component(self.negative_abs)
+        )
+
+    def contains(self, value: float) -> bool:
+        threshold = self.positive_abs if float(value) >= 0.0 else self.negative_abs
+        return abs(float(value)) <= threshold
+
+
+@dataclass(frozen=True)
+class ManualActionDeadzoneContract:
+    axes: tuple[AxisManualActionDeadzone, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.axes) != 4:
+            raise ValueError("manual action deadzone contract must contain four axes")
+        if not all(isinstance(axis, AxisManualActionDeadzone) for axis in self.axes):
+            raise ValueError(
+                "manual action deadzone contract axes must be AxisManualActionDeadzone"
+            )
+
+    def contains_action(self, action: tuple[float, float, float, float]) -> bool:
+        return all(
+            axis.contains(value) for axis, value in zip(self.axes, action, strict=True)
+        )
 
 
 @dataclass(frozen=True)
@@ -41,6 +86,7 @@ class ActSegmentSnapshot:
     max_steps: int | None
     completed_steps: int
     complete: bool
+    completion_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -64,6 +110,15 @@ class _ActSegmentTracker:
     final_command_seq: int | None = None
     final_action: tuple[float, float, float, float] | None = None
     handoff_due: bool = False
+    last_effective_step: int | None = None
+    trailing_deadzone_steps: int = 0
+    completion_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _ActStepUpdate:
+    tracker: _ActSegmentTracker
+    all_axes_in_deadzone: bool
 
 
 class ResidentMotionCore:
@@ -80,13 +135,30 @@ class ResidentMotionCore:
         serial_writer: SerialWriter,
         *,
         max_state_age_ms: float,
+        manual_action_deadzone_contract: ManualActionDeadzoneContract | None,
+        act_early_completion_chunk_steps: int = DEFAULT_ACT_ACTION_CHUNK_STEPS,
+        act_early_completion_min_steps: int = DEFAULT_ACT_EARLY_COMPLETION_MIN_STEPS,
         wall_time_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        action_audit: ResidentActionAuditSink | None = None,
     ) -> None:
+        self._manual_action_deadzone_contract = _manual_action_deadzone_contract(
+            manual_action_deadzone_contract
+        )
+        self._act_early_completion_chunk_steps = _positive_integer(
+            "act_early_completion_chunk_steps",
+            act_early_completion_chunk_steps,
+        )
+        self._act_early_completion_min_steps = _positive_integer(
+            "act_early_completion_min_steps",
+            act_early_completion_min_steps,
+        )
         self._monotonic_ns = monotonic_ns
+        self._action_audit = action_audit
         self._sink = ResidentCommandSink(
             serial_writer,
             max_state_age_ms=max_state_age_ms,
+            action_audit=action_audit,
         )
         self._rl = ResidentVelocityActionAdapter(
             self._sink,
@@ -218,6 +290,7 @@ class ResidentMotionCore:
                     max_steps=segment.max_steps,
                     completed_steps=segment.completed_steps,
                     complete=segment.complete,
+                    completion_reason=segment.completion_reason,
                 ),
                 rl_is_active=(
                     motion.phase is HandoffPhase.ACTIVE
@@ -276,10 +349,15 @@ class ResidentMotionCore:
     def submit_act(self, payload: bytes) -> ResidentWriteResult:
         with self._control_lock:
             if self._act_segment.handoff_due:
+                reason = (
+                    "act_segment_early_complete"
+                    if self._act_segment.completion_reason == "deadzone_chunk"
+                    else "act_segment_budget_reached"
+                )
                 return ResidentWriteResult(
                     accepted=False,
                     write_performed=False,
-                    reason="act_segment_budget_reached",
+                    reason=reason,
                     command_seq=None,
                     mode=ControlMode.MANUAL_ACTION,
                     effective_action=ZERO_ACTION,
@@ -288,23 +366,66 @@ class ResidentMotionCore:
             segment = self._act_segment
             if not result.accepted or segment.generation is None:
                 return result
-            completed_steps = segment.completed_steps + 1
-            handoff_due = (
-                segment.max_steps is not None
-                and completed_steps >= segment.max_steps
-            )
-            self._act_segment = replace(
+            candidate = decode_motion_candidate(payload)
+            update = _advance_act_segment(
                 segment,
-                completed_steps=completed_steps,
-                final_command_seq=(
-                    result.command_seq if handoff_due else None
+                result,
+                action_chunk=candidate.action_chunk,
+                manual_action_deadzone_contract=self._manual_action_deadzone_contract,
+                early_completion_chunk_steps=(
+                    self._act_early_completion_chunk_steps
                 ),
-                final_action=(
-                    result.effective_action if handoff_due else None
+                early_completion_min_steps=(
+                    self._act_early_completion_min_steps
                 ),
-                handoff_due=handoff_due,
             )
+            self._act_segment = update.tracker
+            self._audit_act_step(update, result)
             return result
+
+    def _audit_act_step(
+        self,
+        update: _ActStepUpdate,
+        result: ResidentWriteResult,
+    ) -> None:
+        segment = update.tracker
+        common = {
+            "runtime_id": self._sink.runtime_id,
+            "generation": segment.generation,
+            "completed_steps": segment.completed_steps,
+            "max_steps": segment.max_steps,
+            "manual_deadzone_contract_enabled": (
+                self._manual_action_deadzone_contract is not None
+            ),
+        }
+        emit_action_audit(
+            self._action_audit,
+            "act_step",
+            monotonic_ns=self._monotonic_ns(),
+            command_seq=result.command_seq,
+            action=list(result.effective_action),
+            all_axes_in_deadzone=update.all_axes_in_deadzone,
+            **common,
+        )
+        if segment.handoff_due:
+            emit_action_audit(
+                self._action_audit,
+                "act_segment_summary",
+                monotonic_ns=self._monotonic_ns(),
+                last_effective_step=segment.last_effective_step,
+                trailing_deadzone_steps=segment.trailing_deadzone_steps,
+                estimated_trailing_deadzone_ms=(
+                    segment.trailing_deadzone_steps * ACT_NOMINAL_STEP_PERIOD_MS
+                ),
+                completion_reason=segment.completion_reason,
+                deadzone_chunk_steps=self._act_early_completion_chunk_steps,
+                skipped_budget_steps=(
+                    max(0, segment.max_steps - segment.completed_steps)
+                    if segment.max_steps is not None
+                    else 0
+                ),
+                **common,
+            )
 
     def act_segment_snapshot(self) -> ActSegmentSnapshot:
         with self._control_lock:
@@ -314,6 +435,7 @@ class ResidentMotionCore:
                 max_steps=segment.max_steps,
                 completed_steps=segment.completed_steps,
                 complete=segment.complete,
+                completion_reason=segment.completion_reason,
             )
 
     def notify_act_worker_disconnected(
@@ -429,6 +551,106 @@ class ResidentMotionCore:
             and not frame.command_timed_out
             and frame.control_mode is ControlMode.MANUAL_ACTION
         )
+
+
+def _advance_act_segment(
+    segment: _ActSegmentTracker,
+    result: ResidentWriteResult,
+    *,
+    action_chunk: tuple[tuple[float, float, float, float], ...] | None,
+    manual_action_deadzone_contract: ManualActionDeadzoneContract | None,
+    early_completion_chunk_steps: int,
+    early_completion_min_steps: int,
+) -> _ActStepUpdate:
+    completed_steps = segment.completed_steps + 1
+    all_axes_in_deadzone = _action_within_manual_deadzone_contract(
+        result.effective_action,
+        manual_action_deadzone_contract,
+    )
+    trailing_deadzone_steps = (
+        segment.trailing_deadzone_steps + 1 if all_axes_in_deadzone else 0
+    )
+    budget_due = (
+        segment.max_steps is not None and completed_steps >= segment.max_steps
+    )
+    deadzone_chunk_due = (
+        manual_action_deadzone_contract is not None
+        and segment.max_steps is not None
+        and completed_steps < segment.max_steps
+        and segment.completed_steps >= early_completion_min_steps
+        and action_chunk is not None
+        and len(action_chunk) == early_completion_chunk_steps
+        and all(
+            _action_within_manual_deadzone_contract(
+                action,
+                manual_action_deadzone_contract,
+            )
+            for action in action_chunk
+        )
+    )
+    handoff_due = budget_due or deadzone_chunk_due
+    completion_reason = (
+        "step_budget"
+        if budget_due
+        else "deadzone_chunk" if deadzone_chunk_due else None
+    )
+    return _ActStepUpdate(
+        tracker=replace(
+            segment,
+            completed_steps=completed_steps,
+            final_command_seq=result.command_seq if handoff_due else None,
+            final_action=result.effective_action if handoff_due else None,
+            handoff_due=handoff_due,
+            last_effective_step=(
+                segment.last_effective_step
+                if all_axes_in_deadzone
+                else completed_steps
+            ),
+            trailing_deadzone_steps=trailing_deadzone_steps,
+            completion_reason=completion_reason,
+        ),
+        all_axes_in_deadzone=all_axes_in_deadzone,
+    )
+
+
+def _manual_action_deadzone_component(value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0.0 <= float(value) < 1.0
+    ):
+        raise ValueError(
+            "manual action deadzone components must be finite and in [0, 1)"
+        )
+    return float(value)
+
+
+def _manual_action_deadzone_contract(
+    value: ManualActionDeadzoneContract | None,
+) -> ManualActionDeadzoneContract | None:
+    if value is None:
+        return None
+    if not isinstance(value, ManualActionDeadzoneContract):
+        raise ValueError(
+            "manual_action_deadzone_contract must be a ManualActionDeadzoneContract or None"
+        )
+    return value
+
+
+def _action_within_manual_deadzone_contract(
+    action: tuple[float, float, float, float],
+    contract: ManualActionDeadzoneContract | None,
+) -> bool:
+    if contract is None:
+        return False
+    return contract.contains_action(action)
+
+
+def _positive_integer(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def _optional_act_step_budget(value: int | None) -> int | None:

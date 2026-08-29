@@ -15,10 +15,12 @@ from edge_runtime.resident_fixed_cycle_control import (
 @dataclass(frozen=True)
 class _Snapshot:
     run_id: str = ""
+    mission_profile: str = "act_full_cycle"
     stage: str = "IDLE"
     requested_cycles: int = 0
     completed_cycles: int = 0
     current_dig_point_id: str = ""
+    dig_group_id: str = "all"
     terminal: bool = False
     outcome: str = ""
     reason_code: str = ""
@@ -29,13 +31,23 @@ class _Runtime:
         self.snapshot = _Snapshot()
         self.calls = []
 
-    def start(self, *, run_id, requested_cycles, first_dig_point_id=None):
-        self.calls.append(("start", run_id, requested_cycles, first_dig_point_id))
+    def start(
+        self,
+        *,
+        run_id,
+        requested_cycles,
+        first_dig_point_id=None,
+        dig_group_id=None,
+    ):
+        self.calls.append(
+            ("start", run_id, requested_cycles, first_dig_point_id, dig_group_id)
+        )
         self.snapshot = _Snapshot(
             run_id=run_id,
             stage="FOLLOW_DIG",
             requested_cycles=requested_cycles,
             current_dig_point_id=first_dig_point_id or "dig_01",
+            dig_group_id=dig_group_id or "all",
         )
         return self.snapshot
 
@@ -81,6 +93,7 @@ def test_start_status_and_cancel_use_one_strict_local_control_socket(tmp_path) -
             run_id="field-run-001",
             requested_cycles=3,
             first_dig_point_id="dig_02",
+            dig_group_id="near",
         )
         status = request_resident_fixed_cycle_control(str(path), "status")
         cancelled = request_resident_fixed_cycle_control(str(path), "cancel")
@@ -89,6 +102,7 @@ def test_start_status_and_cancel_use_one_strict_local_control_socket(tmp_path) -
 
     assert started["ok"] is True
     assert started["status"]["stage"] == "FOLLOW_DIG"
+    assert started["status"]["mission_profile"] == "act_full_cycle"
     assert started["status"]["active_trajectory"] == {
         "frame_id": "machine_root_ros",
         "target_id": "dig_02",
@@ -101,9 +115,10 @@ def test_start_status_and_cancel_use_one_strict_local_control_socket(tmp_path) -
         "waypoint_tolerance_m": 0.40,
     }
     assert status["status"]["current_dig_point_id"] == "dig_02"
+    assert status["status"]["dig_group_id"] == "near"
     assert cancelled["status"]["stage"] == "CANCELLED"
     assert runtime.calls == [
-        ("start", "field-run-001", 3, "dig_02"),
+        ("start", "field-run-001", 3, "dig_02", "near"),
         ("cancel",),
     ]
     assert not path.exists()

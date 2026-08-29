@@ -48,15 +48,116 @@ def _write_sources(root: Path) -> tuple[Path, Path]:
     return mission_path, demo_path
 
 
-def test_build_candidate_uses_fixed_endpoints_and_stays_uncommissioned(
-    tmp_path: Path,
-) -> None:
+def _write_eight_point_catalog(root: Path) -> Path:
+    points = {
+        "dig_near_01": [1.0, 0.40, 0.0],
+        "dig_near_02": [1.0, 0.15, 0.0],
+        "dig_near_03": [1.0, -0.10, 0.0],
+        "dig_near_04": [1.0, -0.35, 0.0],
+        "dig_far_01": [1.3, 0.40, 0.0],
+        "dig_far_02": [1.3, 0.15, 0.0],
+        "dig_far_03": [1.3, -0.10, 0.0],
+        "dig_far_04": [1.3, -0.35, 0.0],
+    }
+    path = root / "dig_point_catalog.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "excavation_dig_point_catalog.v1",
+                "frame_id": "machine_root_ros",
+                "dig_points": points,
+                "default_dig_group": "all",
+                "dig_groups": {
+                    "all": list(points),
+                    "near": list(points)[:4],
+                    "far": list(points)[4:],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_build_candidate_uses_one_catalog_for_points_and_groups(tmp_path: Path) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    catalog_path = _write_eight_point_catalog(tmp_path)
     output = tmp_path / "candidate"
 
     plan_path = build_candidate_deployment(
         mission_path=mission_path,
         demo_path=demo_path,
+        dig_point_catalog_path=catalog_path,
+        output_dir=output,
+        deployed_root=output,
+        act_max_steps=130,
+    )
+
+    plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
+    registry = load_fixed_cycle_registry(plan, allow_candidate=True)
+    assert plan.default_dig_group == "all"
+    assert plan.dig_groups["near"] == tuple(list(plan.dig_sequence)[:4])
+    assert plan.dig_groups["far"] == tuple(list(plan.dig_sequence)[4:])
+    assert registry["dig_far_04"].waypoints == ((1.3, -0.35, 0.0),)
+
+
+@pytest.mark.parametrize("point_count", [4, 5, 8])
+def test_candidate_deployment_uses_one_catalog_snapshot_for_any_point_count(
+    tmp_path: Path,
+    point_count: int,
+) -> None:
+    mission_path, demo_path = _write_sources(tmp_path)
+    point_ids = [f"dig_dynamic_{index:02d}" for index in range(1, point_count + 1)]
+    catalog_path = tmp_path / "dynamic-catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "excavation_dig_point_catalog.v1",
+                "frame_id": "machine_root_ros",
+                "dig_points": {
+                    point_id: [1.0 + index * 0.05, 0.4 - index * 0.1, 0.0]
+                    for index, point_id in enumerate(point_ids)
+                },
+                "default_dig_group": "all",
+                "dig_groups": {"all": point_ids},
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "candidate"
+
+    plan_path = build_candidate_deployment(
+        mission_path=mission_path,
+        demo_path=demo_path,
+        dig_point_catalog_path=catalog_path,
+        output_dir=output,
+        deployed_root=output,
+    )
+
+    plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
+    registry = load_fixed_cycle_registry(plan, allow_candidate=True)
+    assert plan.dig_sequence == tuple(point_ids)
+    assert tuple(registry) == (*tuple(point_ids), "dump")
+    assert registry[point_ids[-1]].waypoints[-1] == pytest.approx(
+        (1.0 + (point_count - 1) * 0.05, 0.4 - (point_count - 1) * 0.1, 0.0)
+    )
+    assert sorted(path.name for path in output.iterdir()) == [
+        "fixed_cycle.candidate.json",
+        "target_catalog.candidate.json",
+    ]
+
+
+def test_build_candidate_uses_fixed_endpoints_and_stays_uncommissioned(
+    tmp_path: Path,
+) -> None:
+    mission_path, demo_path = _write_sources(tmp_path)
+    catalog_path = _write_eight_point_catalog(tmp_path)
+    output = tmp_path / "candidate"
+
+    plan_path = build_candidate_deployment(
+        mission_path=mission_path,
+        demo_path=demo_path,
+        dig_point_catalog_path=catalog_path,
         output_dir=output,
         deployed_root=output,
         act_max_steps=130,
@@ -67,22 +168,98 @@ def test_build_candidate_uses_fixed_endpoints_and_stays_uncommissioned(
     plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
     registry = load_fixed_cycle_registry(plan, allow_candidate=True)
     assert plan.validation_status == "candidate"
-    assert plan.dig_sequence == ("dig_01", "dig_02", "dig_03")
-    assert registry["dig_01"].waypoints == ((1.0, 0.26, 0.0),)
-    assert registry["dig_03"].waypoints == ((1.0, -0.26, 0.0),)
+    assert len(plan.dig_sequence) == 8
+    assert registry["dig_near_01"].waypoints == ((1.0, 0.4, 0.0),)
+    assert registry["dig_far_04"].waypoints == ((1.3, -0.35, 0.0),)
     assert registry["dump"].waypoints == ((-0.2, -0.9, 0.1),)
-    assert registry["dig_01"].waypoint_tolerance_m == 0.25
-    assert registry["dig_01"].intermediate_waypoint_tolerance_m == 0.40
+    assert registry["dig_near_01"].waypoint_tolerance_m == 0.25
+    assert registry["dig_near_01"].intermediate_waypoint_tolerance_m == 0.40
+
+
+def test_build_act_full_cycle_candidate_omits_dump_trajectory(tmp_path: Path) -> None:
+    mission_path, demo_path = _write_sources(tmp_path)
+    catalog_path = _write_eight_point_catalog(tmp_path)
+    output = tmp_path / "candidate"
+
+    plan_path = build_candidate_deployment(
+        mission_path=mission_path,
+        demo_path=demo_path,
+        dig_point_catalog_path=catalog_path,
+        output_dir=output,
+        deployed_root=output,
+        act_max_steps=260,
+        mission_profile="act_full_cycle",
+    )
+
+    plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
+    registry = load_fixed_cycle_registry(plan, allow_candidate=True)
+    document = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert document["schema_version"] == "resident_fixed_cycle_plan.v4"
+    assert document["source_catalog_sha256"] == hashlib.sha256(
+        catalog_path.read_bytes()
+    ).hexdigest()
+    assert plan.mission_profile == "act_full_cycle"
+    assert plan.act_max_steps == 260
+    assert tuple(registry) == tuple(plan.dig_sequence)
+    assert len(registry) == 8
+    assert not (output / "trajectory.dump.candidate.json").exists()
+
+
+def test_promote_act_full_cycle_requires_only_dig_targets(tmp_path: Path) -> None:
+    mission_path, demo_path = _write_sources(tmp_path)
+    catalog_path = _write_eight_point_catalog(tmp_path)
+    candidate = tmp_path / "candidate"
+    candidate_plan = build_candidate_deployment(
+        mission_path=mission_path,
+        demo_path=demo_path,
+        dig_point_catalog_path=catalog_path,
+        output_dir=candidate,
+        deployed_root=candidate,
+        act_max_steps=260,
+        mission_profile="act_full_cycle",
+    )
+    record = tmp_path / "validation.json"
+    record.write_text(
+        json.dumps(
+            {
+                "schema_version": "v3a_fixed_cycle_validation.v1",
+                "run_id": "engine-off-full-cycle-001",
+                "operator_id": "zhaoshuai",
+                "tested_at": "2026-08-28T10:00:00+08:00",
+                "result": "passed",
+                "validated_targets": list(
+                    json.loads(candidate_plan.read_text(encoding="utf-8"))[
+                        "dig_sequence"
+                    ]
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan_path = promote_candidate_deployment(
+        candidate_plan_path=candidate_plan,
+        validation_record_path=record,
+        output_dir=tmp_path / "field",
+        deployed_root=tmp_path / "field",
+        authorization=PROMOTION_AUTHORIZATION,
+    )
+
+    promoted = load_fixed_cycle_plan(plan_path)
+    assert promoted.mission_profile == "act_full_cycle"
+    assert not (tmp_path / "field" / "trajectory.dump.field.json").exists()
 
 
 def test_promotion_requires_passed_record_and_rewrites_all_hashes(
     tmp_path: Path,
 ) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    catalog_path = _write_eight_point_catalog(tmp_path)
     candidate = tmp_path / "candidate"
     candidate_plan = build_candidate_deployment(
         mission_path=mission_path,
         demo_path=demo_path,
+        dig_point_catalog_path=catalog_path,
         output_dir=candidate,
         deployed_root=candidate,
         act_max_steps=130,
@@ -96,7 +273,12 @@ def test_promotion_requires_passed_record_and_rewrites_all_hashes(
                 "operator_id": "zhaoshuai",
                 "tested_at": "2026-08-25T10:00:00+08:00",
                 "result": "passed",
-                "validated_targets": ["dig_01", "dig_02", "dig_03", "dump"],
+                "validated_targets": [
+                    *json.loads(candidate_plan.read_text(encoding="utf-8"))[
+                        "dig_sequence"
+                    ],
+                    "dump",
+                ],
             }
         ),
         encoding="utf-8",

@@ -10,6 +10,10 @@ from unittest import mock
 
 import orin_state_sender as orin
 from edge_runtime.follow import EdgeFollowStep
+from edge_runtime.resident_core import (
+    AxisManualActionDeadzone,
+    ManualActionDeadzoneContract,
+)
 from edge_runtime.resident_motion import ControlMode
 from edge_runtime.resident_sink import ResidentWriteResult
 
@@ -23,7 +27,99 @@ LIVE_ROW = (
 )
 
 
+def _uniform_deadzone_contract(value: float) -> ManualActionDeadzoneContract:
+    axis = AxisManualActionDeadzone(value, value)
+    return ManualActionDeadzoneContract((axis, axis, axis, axis))
+
+
 class Stm32CsvSafetyFlagsTest(unittest.TestCase):
+    def test_resident_manual_deadzone_contract_is_loaded_from_its_own_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            contract_path = Path(directory) / "manual_deadzone.json"
+            contract_path.write_text(
+                (
+                    '{"schema_version":"resident_manual_action_deadzone.v1",'
+                    '"action_order":["boom","stick","bucket","swing"],'
+                    '"axes":{"boom":{"positive_normalized":0.12,'
+                    '"negative_normalized":0.08},'
+                    '"stick":{"positive_normalized":0.11,'
+                    '"negative_normalized":0.07},'
+                    '"bucket":{"positive_normalized":0.10,'
+                    '"negative_normalized":0.06},'
+                    '"swing":{"positive_normalized":0.09,'
+                    '"negative_normalized":0.05}},'
+                    '"source":"F407 test"}'
+                ),
+                encoding="utf-8",
+            )
+
+            contract = orin.load_resident_manual_action_deadzone_contract(
+                contract_path
+            )
+
+            self.assertIsNotNone(contract)
+            assert contract is not None
+            self.assertEqual(contract.axes[0].positive_abs, 0.12)
+            self.assertEqual(contract.axes[0].negative_abs, 0.08)
+            self.assertEqual(contract.axes[3].positive_abs, 0.09)
+            self.assertEqual(contract.axes[3].negative_abs, 0.05)
+
+    def test_resident_manual_deadzone_contract_is_disabled_when_path_is_missing(self):
+        self.assertIsNone(
+            orin.load_resident_manual_action_deadzone_contract(None)
+        )
+
+    def test_resident_manual_deadzone_contract_rejects_invalid_numeric_values(self):
+        invalid_contracts = (
+            {
+                "schema_version": "resident_manual_action_deadzone.v1",
+                "action_order": ["boom", "stick", "bucket", "swing"],
+                "axes": {
+                    "boom": {
+                        "positive_normalized": True,
+                        "negative_normalized": 0.1,
+                    },
+                    "stick": {
+                        "positive_normalized": 0.1,
+                        "negative_normalized": 0.1,
+                    },
+                    "bucket": {
+                        "positive_normalized": 0.1,
+                        "negative_normalized": 0.1,
+                    },
+                    "swing": {
+                        "positive_normalized": 0.1,
+                        "negative_normalized": 0.1,
+                    },
+                },
+                "source": "test",
+            },
+            {
+                "schema_version": "resident_manual_action_deadzone.v1",
+                "action_order": ["boom", "stick", "bucket", "swing"],
+                "axes": {
+                    name: {
+                        "positive_normalized": 0.1,
+                        "negative_normalized": 1.0,
+                    }
+                    for name in ("boom", "stick", "bucket", "swing")
+                },
+                "source": "test",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            contract_path = Path(directory) / "manual_deadzone.json"
+            for value in invalid_contracts:
+                with self.subTest(value=value):
+                    contract_path.write_text(
+                        __import__("json").dumps(value),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, "deadzone"):
+                        orin.load_resident_manual_action_deadzone_contract(
+                            contract_path
+                        )
+
     def test_resident_rl_behavior_probe_tracks_the_mission_authority(self):
         core = SimpleNamespace(
             rl_is_active=False,
@@ -275,6 +371,7 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         self.assertTrue(resident_args.resident_motion_core)
         self.assertTrue(resident_args.resident_act_socket.is_absolute())
         self.assertTrue(resident_args.resident_control_socket.is_absolute())
+        self.assertTrue(resident_args.resident_action_audit_path.is_absolute())
 
     def test_v3a_fixed_cycle_is_an_explicit_plan_and_local_control_socket(self):
         default_args = orin.parse_args([])
@@ -348,6 +445,15 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
             )
 
         orin.validate_resident_fixed_cycle_request(args, resident_edge)
+
+    def test_fixed_cycle_rejects_a_stale_pc_catalog_digest(self):
+        plan = SimpleNamespace(source_catalog_sha256="a" * 64)
+
+        orin.validate_resident_fixed_cycle_catalog_digest(plan, "a" * 64)
+        with self.assertRaisesRegex(RuntimeError, "catalog.*does not match"):
+            orin.validate_resident_fixed_cycle_catalog_digest(plan, "b" * 64)
+        with self.assertRaisesRegex(RuntimeError, "lowercase SHA-256"):
+            orin.validate_resident_fixed_cycle_catalog_digest(plan, "bad")
 
     def test_resident_state_publishes_every_act_telemetry_for_safety_updates(self):
         class Link:
@@ -723,6 +829,7 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         config = SimpleNamespace(
             mode="control",
             action_transport="resident_sink",
+            machine_profile_path=Path("/tmp/machine_profile.json"),
             audit_path=Path(audit_directory.name) / "resident-edge.jsonl",
             action_valid_for_ms=100,
         )
@@ -738,6 +845,15 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
             mock.patch.object(orin, "open_action_socket") as open_action_socket,
             mock.patch.object(orin.socket, "socket", return_value=UdpSocket()),
             mock.patch.object(orin, "send_udp_json"),
+            mock.patch.object(
+                orin,
+                "load_resident_manual_action_deadzone_contract",
+                return_value=_uniform_deadzone_contract(0.15),
+            ),
+            mock.patch.object(
+                orin,
+                "AsyncResidentActionAudit",
+            ) as action_audit_factory,
             mock.patch("edge_runtime.shadow.load_edge_runtime_config", return_value=config),
             mock.patch("edge_runtime.shadow.build_edge_follow_runtime", return_value=runtime),
             mock.patch.object(
@@ -797,6 +913,10 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         control_server.close.assert_called_once_with()
         data_link.close.assert_called_once_with()
         wait_for_terminal_ack.assert_called_once()
+        action_audit_factory.assert_called_once_with(
+            args.resident_action_audit_path
+        )
+        action_audit_factory.return_value.close.assert_called_once_with()
 
     def test_resident_main_fails_when_terminal_zero_is_not_acknowledged(self):
         values = {field: "0" for field in orin.STM32_V2_FIELDS}
@@ -859,6 +979,7 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         config = SimpleNamespace(
             mode="control",
             action_transport="resident_sink",
+            machine_profile_path=Path("/tmp/machine_profile.json"),
             audit_path=Path("/tmp/resident-edge.jsonl"),
             action_valid_for_ms=100,
         )
@@ -870,6 +991,11 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
             mock.patch.object(orin, "open_serial", return_value=OneFrameSerial()),
             mock.patch.object(orin.socket, "socket", return_value=UdpSocket()),
             mock.patch.object(orin, "send_udp_json"),
+            mock.patch.object(
+                orin,
+                "load_resident_manual_action_deadzone_contract",
+                return_value=_uniform_deadzone_contract(0.15),
+            ),
             mock.patch(
                 "edge_runtime.shadow.load_edge_runtime_config",
                 return_value=config,
@@ -1021,6 +1147,7 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
         config = SimpleNamespace(
             mode="control",
             action_transport="resident_sink",
+            machine_profile_path=Path("/tmp/machine_profile.json"),
             audit_path=Path("/tmp/resident-edge.jsonl"),
             action_valid_for_ms=100,
         )
@@ -1033,6 +1160,11 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
             mock.patch.object(orin, "open_serial", return_value=serial),
             mock.patch.object(orin.socket, "socket", return_value=UdpSocket()),
             mock.patch.object(orin, "send_udp_json"),
+            mock.patch.object(
+                orin,
+                "load_resident_manual_action_deadzone_contract",
+                return_value=_uniform_deadzone_contract(0.15),
+            ),
             mock.patch(
                 "edge_runtime.shadow.load_edge_runtime_config",
                 return_value=config,

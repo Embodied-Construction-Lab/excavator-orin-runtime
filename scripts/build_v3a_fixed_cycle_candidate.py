@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an uncommissioned V3-A fixed-cycle deployment."""
+"""Build an uncommissioned catalog-driven fixed-cycle deployment."""
 
 from __future__ import annotations
 
@@ -16,9 +16,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mission-config", required=True)
     parser.add_argument("--demo-config", required=True)
+    parser.add_argument("--dig-point-catalog", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--deployed-root", required=True)
     parser.add_argument("--act-max-steps", type=int, default=130)
+    parser.add_argument(
+        "--mission-profile",
+        choices=("regime_factorized", "act_full_cycle"),
+        default="regime_factorized",
+    )
     parser.add_argument(
         "--intermediate-waypoint-tolerance-m",
         type=float,
@@ -28,9 +34,11 @@ def main() -> None:
     result = build_candidate_deployment(
         mission_path=args.mission_config,
         demo_path=args.demo_config,
+        dig_point_catalog_path=args.dig_point_catalog,
         output_dir=args.output_dir,
         deployed_root=args.deployed_root,
         act_max_steps=args.act_max_steps,
+        mission_profile=args.mission_profile,
         intermediate_waypoint_tolerance_m=(
             args.intermediate_waypoint_tolerance_m
         ),

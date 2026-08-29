@@ -44,6 +44,129 @@ def _plan() -> FixedCyclePlan:
     return FixedCyclePlan.from_mapping(_plan_document())
 
 
+def _act_full_cycle_plan() -> FixedCyclePlan:
+    document = _plan_document()
+    document["schema_version"] = "resident_fixed_cycle_plan.v2"
+    document["mission_profile"] = "act_full_cycle"
+    del document["trajectories"]["dump"]
+    document["act_max_steps"] = 240
+    return FixedCyclePlan.from_mapping(document)
+
+
+def _eight_point_plan() -> FixedCyclePlan:
+    document = _plan_document()
+    point_ids = [
+        *(f"dig_near_{index:02d}" for index in range(1, 5)),
+        *(f"dig_far_{index:02d}" for index in range(1, 5)),
+    ]
+    document.update(
+        {
+            "schema_version": "resident_fixed_cycle_plan.v3",
+            "mission_profile": "regime_factorized",
+            "dig_sequence": point_ids,
+            "default_dig_group": "all",
+            "dig_groups": {
+                "all": point_ids,
+                "near": point_ids[:4],
+                "far": point_ids[4:],
+            },
+            "trajectories": {
+                **{target_id: _artifact(target_id, "dig") for target_id in point_ids},
+                "dump": _artifact("dump", "dump"),
+            },
+        }
+    )
+    return FixedCyclePlan.from_mapping(document)
+
+
+def test_selected_dig_group_is_frozen_for_the_complete_cycle() -> None:
+    cycle = ResidentFixedCycle(_eight_point_plan())
+
+    directive = cycle.start(
+        run_id="run-near-only",
+        requested_cycles=5,
+        dig_group_id="near",
+    )
+    observed = [directive.target_id]
+    for _ in range(4):
+        for child, reason, steps in (
+            ("follow", "SUCCEEDED", None),
+            ("act", "STEP_BUDGET_REACHED", 130),
+            ("follow", "SUCCEEDED", None),
+            ("fixed_action", "SEQUENCE_COMPLETED", None),
+        ):
+            directive = cycle.record_child_result(
+                child=child,
+                outcome="SUCCEEDED",
+                reason_code=reason,
+                quiescence_confirmed=True,
+                completed_steps=steps,
+            )
+        observed.append(directive.target_id)
+
+    assert observed == [
+        "dig_near_01",
+        "dig_near_02",
+        "dig_near_03",
+        "dig_near_04",
+        "dig_near_01",
+    ]
+    assert cycle.snapshot.dig_group_id == "near"
+
+
+def test_act_full_cycle_is_parallel_to_regime_factorized_mission() -> None:
+    cycle = ResidentFixedCycle(_act_full_cycle_plan())
+
+    directive = cycle.start(
+        run_id="run-act-full-cycle",
+        requested_cycles=1,
+        first_dig_point_id="dig_01",
+    )
+    assert directive.stage == "FOLLOW_DIG"
+    assert directive.target_id == "dig_01"
+    assert cycle.snapshot.mission_profile == "act_full_cycle"
+
+    directive = cycle.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+    assert directive.stage == "ACT_FULL_CYCLE"
+    assert directive.child == "act"
+    assert directive.max_steps == 240
+
+    directive = cycle.record_child_result(
+        child="act",
+        outcome="SUCCEEDED",
+        reason_code="STEP_BUDGET_REACHED",
+        quiescence_confirmed=True,
+        completed_steps=240,
+    )
+    assert directive.stage == "FOLLOW_DIG"
+    assert directive.target_id == "dig_01"
+
+    terminal = cycle.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+    assert terminal is None
+    assert cycle.snapshot.stage == "COMPLETED"
+    assert cycle.snapshot.completed_cycles == 1
+
+    primary = ResidentFixedCycle(_plan())
+    primary.start(run_id="run-primary", requested_cycles=1)
+    primary_act = primary.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+    assert primary_act.stage == "ACT_DIG"
+
+
 def test_plan_loader_is_strict_and_requires_field_validated_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -405,6 +528,29 @@ def test_act_requires_the_exact_acknowledged_step_budget() -> None:
     assert directive is None
     assert cycle.snapshot.stage == "FAILED"
     assert cycle.snapshot.reason_code == "ACT_STEP_BUDGET_MISMATCH"
+
+
+def test_act_accepts_a_confirmed_deadzone_chunk_before_the_step_budget() -> None:
+    cycle = ResidentFixedCycle(_plan())
+    cycle.start(run_id="run-act-early", requested_cycles=1)
+    cycle.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+
+    directive = cycle.record_child_result(
+        child="act",
+        outcome="SUCCEEDED",
+        reason_code="DEADZONE_CHUNK_REACHED",
+        quiescence_confirmed=True,
+        completed_steps=121,
+    )
+
+    assert directive is not None
+    assert directive.stage == "FOLLOW_DUMP"
+    assert cycle.snapshot.stage == "FOLLOW_DUMP"
 
 
 def test_coordinator_dispatches_the_whole_local_cycle_from_one_start() -> None:

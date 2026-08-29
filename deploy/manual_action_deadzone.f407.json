@@ -1,0 +1,11 @@
+{
+  "schema_version": "resident_manual_action_deadzone.v1",
+  "action_order": ["boom", "stick", "bucket", "swing"],
+  "axes": {
+    "boom": {"positive_normalized": 0.15, "negative_normalized": 0.15},
+    "stick": {"positive_normalized": 0.15, "negative_normalized": 0.15},
+    "bucket": {"positive_normalized": 0.15, "negative_normalized": 0.15},
+    "swing": {"positive_normalized": 0.15, "negative_normalized": 0.15}
+  },
+  "source": "F407/data_celect/Core/Inc/manual_action.h:MANUAL_ACTION_DEAD_ZONE"
+}

@@ -10,7 +10,11 @@ from edge_runtime.resident_control import (
     ResidentMotionControlServer,
     request_resident_motion_control,
 )
-from edge_runtime.resident_core import ResidentMotionCore
+from edge_runtime.resident_core import (
+    AxisManualActionDeadzone,
+    ManualActionDeadzoneContract,
+    ResidentMotionCore,
+)
 from edge_runtime.resident_motion import ControlMode, MotionCandidate, ZERO_ACTION
 from edge_runtime.resident_protocol import encode_motion_candidate
 from edge_runtime.resident_sink import ResidentTelemetry
@@ -49,6 +53,9 @@ def active_act_at_final_step():
     core = ResidentMotionCore(
         serial,
         max_state_age_ms=200.0,
+        manual_action_deadzone_contract=ManualActionDeadzoneContract(
+            (AxisManualActionDeadzone(0.15, 0.15),) * 4
+        ),
         wall_time_ms=lambda: 10_000,
         monotonic_ns=lambda: 1_090_000_000,
     )

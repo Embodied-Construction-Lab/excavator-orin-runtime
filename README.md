@@ -267,15 +267,18 @@ longer crosses the PC network. The PC link carries monitoring and future
 low-rate trajectory/mission updates only. Ctrl+C, invalid sensor state, action
 lease expiry, trajectory completion and shutdown all produce a zero command.
 
-`follow_action_slew_rate_per_s` limits only how quickly the command sent to the
-actuator can approach a new ONNX target. It does not scale, negate or clip the
-steady-state ONNX target. The V3-B resident candidate uses `3.0`; a 10 Hz
-state stream therefore permits at most about `0.3` normalized command change
-per steady update. Direction reversals still pass through zero instead of
-jumping directly from `+1` to `-1`. A new Follow starts from zero authority,
-but its first command now uses at most 50 ms of measured activation time rather
-than emitting an additional unconditional zero frame. Terminal, cancellation,
-rejected-state and shutdown zeros bypass the limiter and remain immediate.
+`follow_action_startup_slew_rate_per_s` and
+`follow_action_slew_rate_per_s` limit only how quickly the command sent to the
+actuator can approach a new ONNX target. They do not scale, negate or clip the
+steady-state ONNX target. The V3-B resident candidate uses `4.0` while each axis
+approaches its first non-zero target, then `3.0` for later changes and direction
+reversals. At a 20 Hz command cadence these permit about `0.2` and `0.15`
+normalized command change per update respectively. Direction reversals still
+pass through zero instead of jumping directly from `+1` to `-1`. A new Follow
+starts from zero authority, but its first command uses at most 50 ms of measured
+activation time rather than emitting an additional unconditional zero frame.
+Terminal, cancellation, rejected-state and shutdown zeros bypass both limiters
+and remain immediate.
 
 This static control mode remains available for the existing staged rollout.
 
@@ -333,11 +336,11 @@ environment-dependent planning on PC while removing the network round trip
 between Follow and its fixed action. An active-leg connection loss remains
 fail-closed and stops that local behavior.
 
-### V3-A resident fixed cycle
+### V3-B catalog-driven resident fixed cycle
 
-V3-A 从标签 `icra2027-v2-freeze-20260824` 分支。新增
-`edge_runtime.resident_fixed_cycle`，把固定 `dig_01`、`dig_02`、`dig_03` 与 `dump`
-trajectory artifact 组织为严格的 `resident_fixed_cycle_plan.v1`，并用一个纯 Orin 状态机自动
+V3-A 从标签 `icra2027-v2-freeze-20260824` 分支。当前 V3-B 的
+`edge_runtime.resident_fixed_cycle` 接受经过哈希绑定的非空 Dig Point Catalog，并将其组织为严格的
+`resident_fixed_cycle_plan.v4`。点数不是代码常量；4、5、8 点使用同一纯 Orin 状态机自动
 推进：
 
 ```text
@@ -349,26 +352,34 @@ FollowDig → ACT Dig → FollowDump → ExecuteDump → next FollowDig
 轨迹跟踪、ACT step budget、固定倾倒和阶段切换均不经过 PC。PC/网络失联超过 3 秒时 Orin 会
 terminal-disarm 并释放串口、相机和 socket。
 
-普通入口只加载绝对路径、非符号链接、SHA-256 匹配且标记为 `field_validated` 的 artifact。
-候选轨迹必须走独立 commissioning acknowledgement，不能仅修改 JSON 就进入普通 WebUI：
+当前 V3-B WebUI 默认入口明确运行 `candidate` commissioning 快照，而不是声称已经
+`field_validated`。它仍要求独立 commissioning acknowledgement、UI/owner 两层运动授权和
+`control_enabled`；仅修改源 JSON 不能绕过门禁。PC 活动入口还会传入源 Dig Point Catalog 的
+SHA-256；若 PC 源目录与 Orin 部署计划不一致，owner 会在串口、相机和运动 socket 打开前拒绝
+启动。完成发动机关闭与逐点真机验收后，才可按下述流程晋升为正式 field 快照。
+
+ACT 提前结束使用独立的 `deploy/manual_action_deadzone.f407.json`，其 0.15 阈值绑定
+F407 `MANUAL_ACTION_DEAD_ZONE` 杆量语义；不得复用 RL normalized-velocity 的
+`command_deadzone_*`。该文件缺失时只禁用提前结束，ACT 仍运行完整 step budget。
 
 ```bash
 # PC 生成候选；输出文件可提交，但 validation_status 仍是 candidate。
 PYTHONPATH=. python3 scripts/build_v3a_fixed_cycle_candidate.py \
   --mission-config ../AiryLidar/mission/config/excavation_cycle.json \
   --demo-config ../AiryLidar/mission/config/excavation_demo.json \
-  --output-dir deploy/v3a/candidate \
-  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3a/candidate \
+  --dig-point-catalog ../AiryLidar/mission/config/excavation_dig_point_catalog.v1.json \
+  --output-dir deploy/v3b/catalog/candidate \
+  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3b/catalog/candidate \
   --intermediate-waypoint-tolerance-m 0.40
 
 # 候选启动必须额外携带独立 commissioning token。
 bash scripts/run_resident_mission_runtime.sh \
   --authorization ALLOW_HYBRID_MACHINE_MOTION \
-  --fixed-cycle-plan deploy/v3a/candidate/fixed_cycle.candidate.json \
+  --fixed-cycle-plan deploy/v3b/catalog/candidate/fixed_cycle.candidate.json \
   --commissioning-authorization ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING
 ```
 
-The checked-in V3-A candidate keeps `waypoint_tolerance_m=0.25` m for the
+The checked-in V3-B candidate keeps `waypoint_tolerance_m=0.25` m for the
 generated start point and the final DIG/DUMP endpoint, and uses
 `intermediate_waypoint_tolerance_m=0.40` m only for the locally generated
 midpoint. Follow audit and no-progress logs report the tolerance used by the
@@ -380,20 +391,20 @@ angle around the `machine_root_ros` Z axis, the horizontal radius, and height.
 It is deterministic local geometry, not RRT*, and better matches the
 excavator's rotary motion than the former Cartesian straight-line midpoint.
 
-先发动机关闭验收启动、串口归零和安全停止，再在有人监护、急停可用时完成覆盖
-`dig_01/dig_02/dig_03/dump` 的三铲测试。只有测试通过并填写
+先发动机关闭验收启动、串口归零和安全停止，再在有人监护、急停可用时逐点覆盖
+Catalog 中全部挖掘点与 `dump`。只有测试通过并填写
 `v3a_fixed_cycle_validation.v1` 记录后，才执行：
 
 ```bash
 PYTHONPATH=. python3 scripts/promote_v3a_fixed_cycle.py \
-  --candidate-plan deploy/v3a/candidate/fixed_cycle.candidate.json \
+  --candidate-plan deploy/v3b/catalog/candidate/fixed_cycle.candidate.json \
   --validation-record /path/to/validation.json \
-  --output-dir deploy/v3a/field \
-  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3a/field \
+  --output-dir deploy/v3b/catalog/field \
+  --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3b/catalog/field \
   --authorization PROMOTE_V3A_FIELD_VALIDATED_TRAJECTORIES
 ```
 
-晋升会重写所有 trajectory ID、validation status 和 SHA，并把验收记录复制到 field 目录；
+晋升会重写 Catalog ID、validation status 和 SHA，并把验收记录复制到 field 目录；
 `fixed_cycle.field.json` 才是正式 WebUI 使用的 plan。V2 冻结版本保留在
 `icra2027-v2-freeze-20260824`，不在 V3-A 上回改。
 

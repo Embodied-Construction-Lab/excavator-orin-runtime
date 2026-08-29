@@ -16,7 +16,11 @@ from edge_runtime.resident_fixed_cycle_runtime import ResidentFixedCycleRuntime
 from edge_runtime.remote import EdgeBehaviorExecutor
 
 
-def _deployment(tmp_path: Path) -> tuple[FixedCyclePlan, object]:
+def _deployment(
+    tmp_path: Path,
+    *,
+    mission_profile: str = "regime_factorized",
+) -> tuple[FixedCyclePlan, object]:
     trajectories = {}
     for target_id in ("dig_01", "dig_02", "dig_03", "dump"):
         phase = "dump" if target_id == "dump" else "dig"
@@ -46,11 +50,14 @@ def _deployment(tmp_path: Path) -> tuple[FixedCyclePlan, object]:
             "path": str(path),
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
+    if mission_profile == "act_full_cycle":
+        del trajectories["dump"]
     plan = FixedCyclePlan.from_mapping(
         {
-            "schema_version": "resident_fixed_cycle_plan.v1",
+            "schema_version": "resident_fixed_cycle_plan.v2",
             "plan_id": "field-cycle-v3a",
             "validation_status": "field_validated",
+            "mission_profile": mission_profile,
             "dig_sequence": ["dig_01", "dig_02", "dig_03"],
             "act_max_steps": 130,
             "trajectories": trajectories,
@@ -65,6 +72,7 @@ class _ActSegment:
     max_steps: int | None = None
     completed_steps: int = 0
     complete: bool = False
+    completion_reason: str | None = None
 
 
 class _Core:
@@ -104,14 +112,24 @@ class _Core:
         self.rl_is_active = False
         self.act_is_active = False
 
-    def complete_act(self) -> None:
+    def complete_act(
+        self,
+        *,
+        completed_steps: int | None = None,
+        completion_reason: str = "step_budget",
+    ) -> None:
         self.act_is_active = False
         self.rl_is_active = True
         self.segment = _ActSegment(
             self.segment.generation,
             self.segment.max_steps,
-            self.segment.max_steps or 0,
+            (
+                self.segment.max_steps or 0
+                if completed_steps is None
+                else completed_steps
+            ),
             True,
+            completion_reason,
         )
 
 
@@ -280,6 +298,62 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     ]
 
 
+def test_deadzone_chunk_completion_advances_to_dump_before_budget(
+    tmp_path: Path,
+) -> None:
+    plan, registry = _deployment(tmp_path)
+    core = _Core()
+    behaviors = _BehaviorExecutor()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=core,
+        behavior_executor=behaviors,
+        act_worker_ready=lambda: True,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    runtime.start(run_id="run-v3a-early-act", requested_cycles=1)
+    behaviors.succeed(reason_code="SUCCEEDED")
+    core.complete_act(completed_steps=121, completion_reason="deadzone_chunk")
+
+    runtime.tick()
+
+    assert runtime.snapshot.stage == "FOLLOW_DUMP"
+    assert behaviors.requests[-1]["trajectory"]["mission_phase"] == "dump"
+
+
+def test_act_full_cycle_runtime_skips_dump_follow_and_fixed_action(
+    tmp_path: Path,
+) -> None:
+    plan, registry = _deployment(tmp_path, mission_profile="act_full_cycle")
+    core = _Core()
+    behaviors = _BehaviorExecutor()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=core,
+        behavior_executor=behaviors,
+        act_worker_ready=lambda: True,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    runtime.start(run_id="run-full-policy", requested_cycles=1)
+    behaviors.succeed(reason_code="SUCCEEDED")
+    assert runtime.snapshot.stage == "ACT_FULL_CYCLE"
+    assert core.calls[-1] == ("activate_act", 130)
+
+    core.complete_act()
+    runtime.tick()
+
+    assert runtime.snapshot.stage == "FOLLOW_DIG"
+    assert behaviors.requests[-1]["type"] == "start_follow"
+    assert behaviors.requests[-1]["trajectory"]["mission_phase"] == "dig"
+    assert all(request["type"] != "start_fixed_action" for request in behaviors.requests)
+
+
 def test_fixed_action_feedback_does_not_require_follow_visualization(
     tmp_path: Path,
 ) -> None:
@@ -351,7 +425,7 @@ def test_act_to_rl_dispatch_waits_for_acknowledged_rl_authority(
     runtime.start(run_id="run-v3a-ack", requested_cycles=1)
     behaviors.succeed(reason_code="SUCCEEDED")
 
-    core.segment = _ActSegment(11, 130, 130, True)
+    core.segment = _ActSegment(11, 130, 130, True, "step_budget")
     core.act_is_active = False
     core.rl_is_active = False
     runtime.tick()

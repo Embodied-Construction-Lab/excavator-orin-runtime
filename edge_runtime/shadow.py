@@ -55,6 +55,8 @@ class EdgeRuntimeConfig:
     audit_path: Path
     action_valid_for_ms: int
     follow_action_slew_rate_per_s: Optional[float] = None
+    follow_action_startup_slew_rate_per_s: Optional[float] = None
+    manual_action_deadzone_path: Optional[Path] = None
     remote_behavior: Optional[RemoteBehaviorConfig] = None
 
 
@@ -76,8 +78,10 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
     }
     optional = {
         "follow_action_slew_rate_per_s",
+        "follow_action_startup_slew_rate_per_s",
         "trajectory_controller_backend",
         "onnx_path",
+        "manual_action_deadzone_path",
     }
     if (
         not isinstance(value, dict)
@@ -163,6 +167,32 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         follow_action_slew_rate_per_s = float(
             follow_action_slew_rate_per_s
         )
+    follow_action_startup_slew_rate_per_s = value.get(
+        "follow_action_startup_slew_rate_per_s"
+    )
+    if follow_action_startup_slew_rate_per_s is not None:
+        if (
+            isinstance(follow_action_startup_slew_rate_per_s, bool)
+            or not isinstance(
+                follow_action_startup_slew_rate_per_s,
+                (int, float),
+            )
+            or not math.isfinite(
+                float(follow_action_startup_slew_rate_per_s)
+            )
+            or float(follow_action_startup_slew_rate_per_s) <= 0.0
+        ):
+            raise ValueError(
+                "follow_action_startup_slew_rate_per_s must be finite and positive"
+            )
+        if follow_action_slew_rate_per_s is None:
+            raise ValueError(
+                "follow_action_startup_slew_rate_per_s requires "
+                "follow_action_slew_rate_per_s"
+            )
+        follow_action_startup_slew_rate_per_s = float(
+            follow_action_startup_slew_rate_per_s
+        )
     root = config_path.parent
     return EdgeRuntimeConfig(
         mode=mode,
@@ -189,6 +219,14 @@ def load_edge_runtime_config(path: Path) -> EdgeRuntimeConfig:
         audit_path=_relative_path(root, value["audit_path"]),
         action_valid_for_ms=action_valid_for_ms,
         follow_action_slew_rate_per_s=follow_action_slew_rate_per_s,
+        follow_action_startup_slew_rate_per_s=(
+            follow_action_startup_slew_rate_per_s
+        ),
+        manual_action_deadzone_path=(
+            _relative_path(root, value["manual_action_deadzone_path"])
+            if "manual_action_deadzone_path" in value
+            else None
+        ),
         remote_behavior=remote_behavior,
     )
 
@@ -220,6 +258,9 @@ def build_edge_follow_runtime(config: EdgeRuntimeConfig) -> EdgeFollowRuntime:
         trajectory=trajectory,
         mission=mission,
         action_slew_rate_per_s=config.follow_action_slew_rate_per_s,
+        action_startup_slew_rate_per_s=(
+            config.follow_action_startup_slew_rate_per_s
+        ),
     )
 
 
@@ -280,7 +321,11 @@ class EdgeShadowObserver:
                 "loop_elapsed_ms": loop_elapsed_ms,
             }
             self._append(record)
-            LOGGER.warning("edge shadow rejected state seq=%s: %s", machine_state.get("seq"), exc)
+            LOGGER.warning(
+                "edge shadow rejected state seq=%s: %s",
+                machine_state.get("seq"),
+                exc,
+            )
             return None
 
         self._consecutive_rejections = 0

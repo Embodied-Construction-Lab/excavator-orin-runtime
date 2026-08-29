@@ -3,6 +3,7 @@
   "mode": "remote_control",
   "action_transport": "resident_sink",
   "machine_profile_path": "assets/machine_profile.json",
+  "manual_action_deadzone_path": "manual_action_deadzone.f407.json",
   "urdf_path": "assets/waji.urdf",
   "onnx_path": "assets/policy.onnx",
   "trajectory_controller_backend": "onnx_rl",
@@ -10,6 +11,7 @@
   "fixed_action_profile_path": "assets/fixed_actions.json",
   "audit_path": "logs/edge_runtime.jsonl",
   "action_valid_for_ms": 300,
+  "follow_action_startup_slew_rate_per_s": 4.0,
   "follow_action_slew_rate_per_s": 3.0,
   "remote_behavior": {
     "bind_host": "0.0.0.0",

@@ -44,6 +44,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from edge_runtime.resident_action_audit import AsyncResidentActionAudit
 from edge_runtime.resident_motion import ControlMode, ZERO_ACTION
 from edge_runtime.resident_commands import (
     Stm32ResidentCommandEncoder,
@@ -53,7 +54,11 @@ from edge_runtime.resident_control import (
     DEFAULT_MISSION_LEASE_MS,
     ResidentMotionControlServer,
 )
-from edge_runtime.resident_core import ResidentMotionCore
+from edge_runtime.resident_core import (
+    AxisManualActionDeadzone,
+    ManualActionDeadzoneContract,
+    ResidentMotionCore,
+)
 from edge_runtime.resident_data_link import ResidentActDataLink
 from edge_runtime.resident_fixed_cycle import (
     load_fixed_cycle_plan,
@@ -90,9 +95,94 @@ DEFAULT_RESIDENT_CONTROL_SOCKET = DEFAULT_RESIDENT_RUNTIME_ROOT / "control.sock"
 DEFAULT_RESIDENT_FIXED_CYCLE_CONTROL_SOCKET = (
     DEFAULT_RESIDENT_RUNTIME_ROOT / "fixed-cycle.sock"
 )
+DEFAULT_RESIDENT_ACTION_AUDIT_PATH = (
+    Path.home() / ".local/state/excavator-resident/resident-action-audit.jsonl"
+)
 V3A_FIXED_TRAJECTORY_COMMISSIONING_AUTHORIZATION = (
     "ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING"
 )
+
+
+def load_resident_manual_action_deadzone_contract(
+    contract_path: Path | None,
+) -> ManualActionDeadzoneContract | None:
+    """Load directional ACT/manual deadzones from their own contract.
+
+    A missing contract disables ACT early completion. An existing malformed
+    contract fails closed before serial ownership.
+    """
+
+    if contract_path is None:
+        return None
+    try:
+        document = json.loads(
+            Path(contract_path).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"cannot read resident manual action deadzone contract: {exc}"
+        ) from exc
+    expected_fields = {
+        "schema_version",
+        "action_order",
+        "axes",
+        "source",
+    }
+    if not isinstance(document, dict) or set(document) != expected_fields:
+        raise ValueError("resident manual action deadzone fields are invalid")
+    if document["schema_version"] != "resident_manual_action_deadzone.v1":
+        raise ValueError("resident manual action deadzone schema is invalid")
+    if tuple(document["action_order"]) != POLICY_ACTION_NAMES:
+        raise ValueError("resident manual action deadzone action_order is invalid")
+    if not isinstance(document["source"], str) or not document["source"]:
+        raise ValueError("resident manual action deadzone source is invalid")
+    axes_by_name = document["axes"]
+    if not isinstance(axes_by_name, dict) or set(axes_by_name) != set(
+        POLICY_ACTION_NAMES
+    ):
+        raise ValueError("resident manual action deadzone axes are invalid")
+    axes = []
+    for axis_name in POLICY_ACTION_NAMES:
+        axis = axes_by_name[axis_name]
+        if not isinstance(axis, dict) or set(axis) != {
+            "positive_normalized",
+            "negative_normalized",
+        }:
+            raise ValueError(
+                f"resident manual action deadzone axis {axis_name} is invalid"
+            )
+        axes.append(
+            AxisManualActionDeadzone(
+                _resident_deadzone_component(
+                    axis["positive_normalized"],
+                    field_name=(
+                        "manual_action_deadzone."
+                        f"axes.{axis_name}.positive_normalized"
+                    ),
+                ),
+                _resident_deadzone_component(
+                    axis["negative_normalized"],
+                    field_name=(
+                        "manual_action_deadzone."
+                        f"axes.{axis_name}.negative_normalized"
+                    ),
+                ),
+            )
+        )
+    return ManualActionDeadzoneContract(tuple(axes))
+
+
+def _resident_deadzone_component(value: object, *, field_name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0.0 <= float(value) < 1.0
+    ):
+        raise ValueError(
+            f"{field_name} must be finite and in [0, 1)"
+        )
+    return float(value)
 
 STM32_FRAME_FORMAT = "<I15f"
 STM32_FRAME_SIZE = struct.calcsize(STM32_FRAME_FORMAT)
@@ -1302,6 +1392,13 @@ def validate_resident_motion_request(args: argparse.Namespace, edge_config: obje
         raise ValueError("resident motion core requires unified STM32 CSV telemetry")
     if not args.control_enabled:
         raise ValueError("resident motion core requires --control-enabled")
+    audit_path = getattr(
+        args,
+        "resident_action_audit_path",
+        DEFAULT_RESIDENT_ACTION_AUDIT_PATH,
+    )
+    if not isinstance(audit_path, Path) or not audit_path.is_absolute():
+        raise ValueError("resident action audit path must be absolute")
     if (
         getattr(edge_config, "action_transport", DEFAULT_EDGE_ACTION_TRANSPORT)
         != RESIDENT_EDGE_ACTION_TRANSPORT
@@ -1346,6 +1443,22 @@ def validate_resident_fixed_cycle_request(
         raise ValueError("resident fixed cycle requires action_transport=resident_sink")
     if not args.resident_fixed_cycle_control_socket.is_absolute():
         raise ValueError("resident fixed cycle control socket must be absolute")
+
+
+def validate_resident_fixed_cycle_catalog_digest(
+    plan: object,
+    expected_digest: str,
+) -> None:
+    """Reject a stale PC/Orin point catalog before hardware acquisition."""
+
+    if (
+        not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+        or any(character not in "0123456789abcdef" for character in expected_digest)
+    ):
+        raise RuntimeError("expected dig catalog must be a lowercase SHA-256")
+    if getattr(plan, "source_catalog_sha256", None) != expected_digest:
+        raise RuntimeError("PC dig catalog does not match the deployed Orin catalog")
 
 
 def edge_uses_resident_action_transport(edge_config: object | None) -> bool:
@@ -1533,12 +1646,28 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Absolute Unix socket for low-rate resident policy handoff commands.",
     )
     parser.add_argument(
+        "--resident-action-audit-path",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "RESIDENT_ACTION_AUDIT_PATH",
+                str(DEFAULT_RESIDENT_ACTION_AUDIT_PATH),
+            )
+        ),
+        help="Absolute JSONL path for non-blocking resident action evidence.",
+    )
+    parser.add_argument(
         "--resident-fixed-cycle-plan",
         type=Path,
         help=(
             "Enable V3-A Orin-local fixed-target cycling with this strict, "
             "field-validated resident_fixed_cycle_plan.v1 artifact."
         ),
+    )
+    parser.add_argument(
+        "--resident-fixed-cycle-expected-dig-catalog-sha256",
+        default="",
+        help="PC source Dig Point Catalog SHA-256 used for stale-deployment rejection.",
     )
     parser.add_argument(
         "--resident-fixed-cycle-control-socket",
@@ -1625,6 +1754,14 @@ def main() -> None:
             fixed_cycle_plan_path,
             allow_candidate=allow_candidate,
         )
+        expected_catalog_digest = (
+            args.resident_fixed_cycle_expected_dig_catalog_sha256
+        )
+        if expected_catalog_digest:
+            validate_resident_fixed_cycle_catalog_digest(
+                resident_fixed_cycle_plan,
+                expected_catalog_digest,
+            )
         resident_fixed_cycle_registry = load_fixed_cycle_registry(
             resident_fixed_cycle_plan,
             allow_candidate=allow_candidate,
@@ -1647,14 +1784,29 @@ def main() -> None:
         args.resident_motion_core
         and edge_uses_resident_action_transport(edge_config)
     )
+    resident_manual_action_deadzone_contract = None
     if resident_action_transport:
+        if edge_config is None:
+            raise RuntimeError("resident motion core requires an edge config")
+        resident_manual_action_deadzone_contract = (
+            load_resident_manual_action_deadzone_contract(
+                getattr(edge_config, "manual_action_deadzone_path", None)
+            )
+        )
+        if resident_manual_action_deadzone_contract is None:
+            LOGGER.warning(
+                "resident ACT deadzone contract unavailable in %s; early completion disabled",
+                getattr(edge_config, "manual_action_deadzone_path", None),
+            )
         LOGGER.info(
-            "opening serial %s @ %d, sending UDP JSON to %s:%d, using resident action sink for %s",
+            "opening serial %s @ %d, sending UDP JSON to %s:%d, "
+            "using resident action sink for %s; deadzone_contract_enabled=%s",
             args.serial_port,
             args.baudrate,
             args.pc_host,
             args.pc_port,
             edge_config.mode,
+            resident_manual_action_deadzone_contract is not None,
         )
     else:
         LOGGER.info(
@@ -1677,13 +1829,23 @@ def main() -> None:
     resident_control_server = None
     resident_fixed_cycle_runtime = None
     resident_fixed_cycle_control_server = None
+    resident_action_audit = None
     resident_initialized = False
     resident_hardware_ready_logged = False
     behavior_executor = None
     if resident_action_transport:
+        resident_action_audit = AsyncResidentActionAudit(
+            args.resident_action_audit_path
+        )
+        LOGGER.info(
+            "resident action audit enabled: path=%s",
+            args.resident_action_audit_path,
+        )
         resident_motion_core = ResidentMotionCore(
             ser,
             max_state_age_ms=DEFAULT_RESIDENT_STATE_AGE_MS,
+            manual_action_deadzone_contract=resident_manual_action_deadzone_contract,
+            action_audit=resident_action_audit,
         )
         resident_data_link = ResidentActDataLink(
             args.resident_act_socket,
@@ -2124,6 +2286,8 @@ def main() -> None:
                 resident_control_server.close()
             if resident_data_link is not None:
                 resident_data_link.close()
+            if resident_action_audit is not None:
+                resident_action_audit.close()
             if edge_action_sender is not None:
                 edge_action_sender.close()
             if action_sock is not None:

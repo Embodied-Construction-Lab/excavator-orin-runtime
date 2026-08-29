@@ -289,6 +289,7 @@ class EdgeFollowRuntimeFactory:
         mission_sha256: str,
         runtime_type: Callable[..., Any] = EdgeFollowRuntime,
         action_slew_rate_per_s: Optional[float] = None,
+        action_startup_slew_rate_per_s: Optional[float] = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(machine_profile, Mapping):
@@ -342,6 +343,9 @@ class EdgeFollowRuntimeFactory:
         self._controller_builder = controller_builder
         self._mission = mission
         self._action_slew_rate_per_s = action_slew_rate_per_s
+        self._action_startup_slew_rate_per_s = (
+            action_startup_slew_rate_per_s
+        )
         if not callable(monotonic_clock):
             raise ValueError("monotonic_clock must be callable")
         self._monotonic_clock = monotonic_clock
@@ -382,6 +386,13 @@ class EdgeFollowRuntimeFactory:
             mission=mission,
             mission_sha256=hashlib.sha256(mission_bytes).hexdigest(),
             action_slew_rate_per_s=config.follow_action_slew_rate_per_s,
+            action_startup_slew_rate_per_s=(
+                getattr(
+                    config,
+                    "follow_action_startup_slew_rate_per_s",
+                    None,
+                )
+            ),
         )
 
     def create(self, snapshot: FollowTrajectorySnapshot) -> EdgeFollowRuntime:
@@ -428,6 +439,9 @@ class EdgeFollowRuntimeFactory:
             trajectory=trajectory,
             mission=runtime_mission,
             action_slew_rate_per_s=self._action_slew_rate_per_s,
+            action_startup_slew_rate_per_s=(
+                self._action_startup_slew_rate_per_s
+            ),
             slew_started_monotonic_s=(
                 self._monotonic_clock()
                 if self._action_slew_rate_per_s is not None

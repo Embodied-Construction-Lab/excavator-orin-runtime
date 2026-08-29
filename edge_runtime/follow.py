@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Tuple
 
 from .actions import (
+    dual_rate_slew_limited_normalized_action,
     physical_velocity_from_normalized,
     slew_limited_normalized_action,
 )
@@ -103,6 +104,7 @@ class EdgeFollowRuntime:
         trajectory: Mapping[str, Any],
         mission: Mapping[str, Any],
         action_slew_rate_per_s: Optional[float] = None,
+        action_startup_slew_rate_per_s: Optional[float] = None,
         slew_started_monotonic_s: Optional[float] = None,
     ) -> None:
         if machine_profile.get("machine_id") != "scale_excavator_v1":
@@ -112,7 +114,9 @@ class EdgeFollowRuntime:
         self._machine_profile = machine_profile
         self._kinematics = kinematics
         if (policy is None) == (controller is None):
-            raise ValueError("exactly one trajectory controller or legacy policy is required")
+            raise ValueError(
+                "exactly one trajectory controller or legacy policy is required"
+            )
         self._controller = (
             controller
             if controller is not None
@@ -128,6 +132,21 @@ class EdgeFollowRuntime:
             self._action_slew_rate_per_s: Optional[float] = rate
         else:
             self._action_slew_rate_per_s = None
+        if action_startup_slew_rate_per_s is not None:
+            startup_rate = float(action_startup_slew_rate_per_s)
+            if not math.isfinite(startup_rate) or startup_rate <= 0.0:
+                raise ValueError(
+                    "action_startup_slew_rate_per_s must be finite and positive"
+                )
+            if self._action_slew_rate_per_s is None:
+                raise ValueError(
+                    "action_startup_slew_rate_per_s requires action_slew_rate_per_s"
+                )
+            self._action_startup_slew_rate_per_s: Optional[float] = (
+                startup_rate
+            )
+        else:
+            self._action_startup_slew_rate_per_s = None
         if slew_started_monotonic_s is not None:
             if isinstance(slew_started_monotonic_s, bool):
                 raise ValueError("slew_started_monotonic_s must be finite")
@@ -153,6 +172,7 @@ class EdgeFollowRuntime:
         self._previous_tip = None
         self._previous_action = (0.0, 0.0, 0.0, 0.0)
         self._previous_commanded_action = (0.0, 0.0, 0.0, 0.0)
+        self._startup_slew_pending = (True, True, True, True)
         self._last_source_seq = None
         self._follow_started_monotonic = None
         self._last_monotonic = slew_started
@@ -238,6 +258,7 @@ class EdgeFollowRuntime:
         if self._terminal_result is None:
             controller_output = self._controller.compute_action(observation)
             normalized = controller_output.normalized_action
+            startup_slew_pending = self._startup_slew_pending
             if self._action_slew_rate_per_s is None:
                 commanded_normalized = normalized
             else:
@@ -251,12 +272,27 @@ class EdgeFollowRuntime:
                         elapsed_since_command_s,
                         _INITIAL_SLEW_ELAPSED_CAP_S,
                     )
-                commanded_normalized = slew_limited_normalized_action(
-                    normalized,
-                    self._previous_commanded_action,
-                    elapsed_s=elapsed_since_command_s,
-                    max_rate_per_s=self._action_slew_rate_per_s,
-                )
+                if self._action_startup_slew_rate_per_s is None:
+                    commanded_normalized = slew_limited_normalized_action(
+                        normalized,
+                        self._previous_commanded_action,
+                        elapsed_s=elapsed_since_command_s,
+                        max_rate_per_s=self._action_slew_rate_per_s,
+                    )
+                else:
+                    (
+                        commanded_normalized,
+                        startup_slew_pending,
+                    ) = dual_rate_slew_limited_normalized_action(
+                        normalized,
+                        self._previous_commanded_action,
+                        startup_pending=self._startup_slew_pending,
+                        elapsed_s=elapsed_since_command_s,
+                        startup_rate_per_s=(
+                            self._action_startup_slew_rate_per_s
+                        ),
+                        steady_rate_per_s=self._action_slew_rate_per_s,
+                    )
             physical = physical_velocity_from_normalized(
                 commanded_normalized,
                 self._machine_profile,
@@ -305,6 +341,7 @@ class EdgeFollowRuntime:
             # raw policy action, not the actuator controller's ramped speed.
             self._previous_action = normalized
             self._previous_commanded_action = commanded_normalized
+            self._startup_slew_pending = startup_slew_pending
             self._has_commanded_action = True
         self._last_source_seq = source_seq
         self._last_monotonic = float(now_s)

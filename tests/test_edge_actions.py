@@ -1,9 +1,48 @@
 import unittest
 
-from edge_runtime.actions import slew_limited_normalized_action
+from edge_runtime.actions import (
+    dual_rate_slew_limited_normalized_action,
+    slew_limited_normalized_action,
+)
 
 
 class SlewLimitedNormalizedActionTest(unittest.TestCase):
+    def test_startup_uses_faster_rate_then_reversal_uses_steady_rate(self):
+        previous = (0.0, 0.0, 0.0, 0.0)
+        startup_pending = (True, True, True, True)
+
+        for expected in (0.2, 0.4, 0.6, 0.8, 1.0):
+            action, startup_pending = dual_rate_slew_limited_normalized_action(
+                (1.0, -1.0, 1.0, -1.0),
+                previous,
+                startup_pending=startup_pending,
+                elapsed_s=0.05,
+                startup_rate_per_s=4.0,
+                steady_rate_per_s=3.0,
+            )
+            for actual, target in zip(
+                action,
+                (expected, -expected, expected, -expected),
+            ):
+                self.assertAlmostEqual(actual, target)
+            previous = action
+
+        self.assertEqual(startup_pending, (False, False, False, False))
+
+        reversed_action, _ = dual_rate_slew_limited_normalized_action(
+            (-1.0, 1.0, -1.0, 1.0),
+            previous,
+            startup_pending=startup_pending,
+            elapsed_s=0.05,
+            startup_rate_per_s=4.0,
+            steady_rate_per_s=3.0,
+        )
+        for actual, expected in zip(
+            reversed_action,
+            (0.85, -0.85, 0.85, -0.85),
+        ):
+            self.assertAlmostEqual(actual, expected)
+
     def test_limits_each_axis_delta_without_changing_target_sign_or_steady_state(self):
         previous = (0.2, -0.2, 0.0, 0.8)
         target = (1.0, -1.0, -0.1, 0.5)

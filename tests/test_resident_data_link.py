@@ -336,6 +336,7 @@ class ResidentActDataLinkTest(unittest.TestCase):
         core = ResidentMotionCore(
             serial,
             max_state_age_ms=200.0,
+            manual_action_deadzone_contract=None,
             monotonic_ns=lambda: 1_080_000_000,
         )
         core.initialize(

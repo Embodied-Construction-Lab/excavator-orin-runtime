@@ -16,6 +16,10 @@ import threading
 from typing import Callable, Protocol
 import uuid
 
+from .resident_action_audit import (
+    ResidentActionAuditSink,
+    emit_action_audit,
+)
 from .resident_commands import Stm32ResidentCommandEncoder
 from .resident_motion import (
     ControlMode,
@@ -188,6 +192,7 @@ class ResidentCommandSink:
         max_future_skew_ms: float = 5.0,
         runtime_id: str | None = None,
         handoff_sample_sink: Callable[[ResidentHandoffSample], None] | None = None,
+        action_audit: ResidentActionAuditSink | None = None,
     ) -> None:
         if not math.isfinite(max_state_age_ms) or max_state_age_ms <= 0.0:
             raise ValueError("state age limit must be finite and positive")
@@ -201,12 +206,14 @@ class ResidentCommandSink:
             uuid.uuid4().hex if runtime_id is None else runtime_id
         )
         self._handoff_sample_sink = handoff_sample_sink or _log_handoff_sample
+        self._action_audit = action_audit
         self._latest_telemetry: ResidentTelemetry | None = None
         self._pending_ack: _PendingAck | None = None
         self._candidate_lease: _CandidateLease | None = None
         self._handoff_measurement: _HandoffMeasurement | None = None
         self._pending_first_nonzero_ack: _PendingFirstNonzeroAck | None = None
         self._last_command_write_ns: int | None = None
+        self._last_audited_ack_seq: int | None = None
         self._synchronized = False
         self._unsafe_zero_latched = False
         self._terminally_disarmed = False
@@ -227,6 +234,10 @@ class ResidentCommandSink:
 
     def snapshot(self) -> ResidentMotionSnapshot:
         return self._authority.snapshot()
+
+    @property
+    def runtime_id(self) -> str:
+        return self._runtime_id
 
     @property
     def is_operational(self) -> bool:
@@ -342,6 +353,26 @@ class ResidentCommandSink:
         ):
             return
         self._latest_telemetry = frame
+        if (
+            frame.command_valid
+            and not frame.command_timed_out
+            and frame.control_mode is not None
+            and frame.command_rx_seq != self._last_audited_ack_seq
+        ):
+            snapshot = self._authority.snapshot()
+            binding = _binding_for_mode(snapshot, frame.control_mode)
+            emit_action_audit(
+                self._action_audit,
+                "command_ack",
+                runtime_id=self._runtime_id,
+                monotonic_ns=frame.receive_monotonic_ns,
+                generation=snapshot.generation,
+                source=None if binding is None else binding.source,
+                mode=frame.control_mode.value,
+                command_seq=frame.command_rx_seq,
+                action=list(frame.command_action),
+            )
+            self._last_audited_ack_seq = frame.command_rx_seq
         if self._terminally_disarmed or self._terminal_error is not None:
             return
 
@@ -832,6 +863,12 @@ class ResidentCommandSink:
         accepted: bool,
     ) -> ResidentWriteResult:
         sequence = self._encoder.next_sequence
+        snapshot = self._authority.snapshot()
+        binding = (
+            snapshot.target_binding
+            if reason == "target_mode_claim"
+            else snapshot.active_binding
+        )
         try:
             payload = self._encoder.encode(
                 mode=mode,
@@ -848,6 +885,19 @@ class ResidentCommandSink:
             self._terminal_error = f"{type(exc).__name__}: {exc}"
             self._terminally_disarmed = True
             raise
+        emit_action_audit(
+            self._action_audit,
+            "command_write",
+            runtime_id=self._runtime_id,
+            monotonic_ns=monotonic_ns,
+            generation=snapshot.generation,
+            source=None if binding is None else binding.source,
+            mode=mode.value,
+            command_seq=sequence,
+            action=list(action),
+            reason=reason,
+            accepted=accepted,
+        )
         return ResidentWriteResult(
             accepted=accepted,
             write_performed=True,
@@ -872,6 +922,16 @@ def _action(
     if not all(math.isfinite(value) for value in action):
         raise ValueError("command_action must contain finite values")
     return action  # type: ignore[return-value]
+
+
+def _binding_for_mode(
+    snapshot: ResidentMotionSnapshot,
+    mode: ControlMode,
+) -> PolicyBinding | None:
+    for binding in (snapshot.active_binding, snapshot.target_binding):
+        if binding is not None and binding.mode is mode:
+            return binding
+    return None
 
 
 def _nonnegative_integer(name: str, value: int) -> int:

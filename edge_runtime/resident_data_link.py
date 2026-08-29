@@ -2,7 +2,7 @@
 
 The owner is the sole STM32 authority.  This module only transports strict
 ``resident_act_state.v1`` frames to a local policy worker and strict
-``resident_policy_candidate.v1`` frames back to an injected callback.  It has
+``resident_policy_candidate.v2`` frames back to an injected callback.  It has
 no serial dependency and a disconnect therefore cannot alter serial ownership.
 
 There may be only one active worker.  A second connection is accepted and

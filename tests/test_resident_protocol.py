@@ -21,6 +21,33 @@ class ResidentPolicyProtocolTest(unittest.TestCase):
             valid_until_monotonic_ns=20_000,
         )
 
+    def test_manual_candidate_round_trip_preserves_a_new_execution_chunk(self) -> None:
+        chunk = tuple(
+            (0.01 * index, -0.01 * index, 0.0, 0.0)
+            for index in range(10)
+        )
+        candidate = MotionCandidate(
+            **{**self.candidate().__dict__, "action": chunk[0], "action_chunk": chunk}
+        )
+
+        encoded = encode_motion_candidate(candidate)
+
+        self.assertEqual(decode_motion_candidate(encoded), candidate)
+        payload = json.loads(encoded)
+        self.assertEqual(payload["schema_version"], "resident_policy_candidate.v2")
+        self.assertEqual(payload["action_chunk"], [list(action) for action in chunk])
+
+    def test_action_chunk_is_exactly_ten_normalized_manual_actions(self) -> None:
+        base = self.candidate()
+        for chunk in (
+            ((0.0, 0.0, 0.0, 0.0),) * 9,
+            ((0.0, 0.0, 0.0, 0.0),) * 11,
+            ((0.0, 0.0, 0.0, 1.01),) * 10,
+        ):
+            with self.subTest(chunk=chunk):
+                with self.assertRaises(ValueError):
+                    MotionCandidate(**{**base.__dict__, "action_chunk": chunk})
+
     def test_round_trip_preserves_typed_action_without_scale_or_reorder(self) -> None:
         for mode in (ControlMode.MANUAL_ACTION, ControlMode.VELOCITY_REFERENCE):
             with self.subTest(mode=mode):

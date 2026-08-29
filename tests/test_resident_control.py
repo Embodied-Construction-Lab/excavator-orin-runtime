@@ -211,7 +211,11 @@ class ResidentMotionControlTest(unittest.TestCase):
             def flush(self):
                 return None
 
-        core = ResidentMotionCore(RecordingSerial(), max_state_age_ms=200.0)
+        core = ResidentMotionCore(
+            RecordingSerial(),
+            max_state_age_ms=200.0,
+            manual_action_deadzone_contract=None,
+        )
         server = ResidentMotionControlServer(core, socket_path=self.path)
         server.start()
         self.addCleanup(server.close)

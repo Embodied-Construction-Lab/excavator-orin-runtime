@@ -20,9 +20,13 @@ from .resident_control import (
     _receive_json,
     _send_json,
 )
+from .resident_fixed_cycle import (
+    ACT_FULL_CYCLE_PROFILE,
+    REGIME_FACTORIZED_PROFILE,
+)
 
 
-SCHEMA_VERSION = "resident_fixed_cycle_control.v2"
+SCHEMA_VERSION = "resident_fixed_cycle_control.v3"
 _COMMANDS = frozenset({"status", "start", "heartbeat", "cancel"})
 _REQUEST_FIELDS = frozenset({"schema_version", "command"})
 _START_FIELDS = frozenset(
@@ -32,15 +36,18 @@ _START_FIELDS = frozenset(
         "run_id",
         "requested_cycles",
         "first_dig_point_id",
+        "dig_group_id",
     }
 )
 _STATUS_FIELDS = frozenset(
     {
         "run_id",
+        "mission_profile",
         "stage",
         "requested_cycles",
         "completed_cycles",
         "current_dig_point_id",
+        "dig_group_id",
         "terminal",
         "outcome",
         "reason_code",
@@ -232,6 +239,7 @@ def request_resident_fixed_cycle_control(
     run_id: str | None = None,
     requested_cycles: int | None = None,
     first_dig_point_id: str | None = None,
+    dig_group_id: str | None = None,
     timeout_s: float = 2.0,
 ) -> dict[str, Any]:
     path = _absolute_socket_path(socket_path)
@@ -240,6 +248,7 @@ def request_resident_fixed_cycle_control(
         run_id=run_id,
         requested_cycles=requested_cycles,
         first_dig_point_id=first_dig_point_id,
+        dig_group_id=dig_group_id,
     )
     if (
         isinstance(timeout_s, bool)
@@ -268,6 +277,7 @@ def main(
     parser.add_argument("--run-id")
     parser.add_argument("--cycles", type=int, dest="requested_cycles")
     parser.add_argument("--first-dig-point-id")
+    parser.add_argument("--dig-group-id")
     arguments = parser.parse_args(argv)
     output = sys.stdout if stdout is None else stdout
     errors = sys.stderr if stderr is None else stderr
@@ -278,6 +288,7 @@ def main(
             run_id=arguments.run_id,
             requested_cycles=arguments.requested_cycles,
             first_dig_point_id=arguments.first_dig_point_id,
+            dig_group_id=arguments.dig_group_id,
         )
     except (OSError, ValueError):
         print("resident fixed cycle control request failed", file=errors)
@@ -307,12 +318,13 @@ def _request(
     run_id: Any,
     requested_cycles: Any,
     first_dig_point_id: Any,
+    dig_group_id: Any = None,
 ) -> dict[str, Any]:
     if command not in _COMMANDS:
         raise ValueError("unsupported resident fixed cycle command")
     supplied = any(
         value is not None
-        for value in (run_id, requested_cycles, first_dig_point_id)
+        for value in (run_id, requested_cycles, first_dig_point_id, dig_group_id)
     )
     if command != "start":
         if supplied:
@@ -328,6 +340,11 @@ def _request(
             if first_dig_point_id is None
             else _identifier("first_dig_point_id", first_dig_point_id)
         ),
+        "dig_group_id": (
+            None
+            if dig_group_id is None
+            else _identifier("dig_group_id", dig_group_id)
+        ),
     }
 
 
@@ -341,11 +358,15 @@ def _validate_request(value: Any) -> tuple[str, dict[str, Any]]:
     if command != "start":
         return command, {}
     first = value["first_dig_point_id"]
+    group = value["dig_group_id"]
     return command, {
         "run_id": _identifier("run_id", value["run_id"]),
         "requested_cycles": _cycles(value["requested_cycles"]),
         "first_dig_point_id": (
             None if first is None else _identifier("first_dig_point_id", first)
+        ),
+        "dig_group_id": (
+            None if group is None else _identifier("dig_group_id", group)
         ),
     }
 
@@ -364,13 +385,20 @@ def _status(
         raise ValueError("invalid fixed cycle status")
     for name in (
         "run_id",
+        "mission_profile",
         "stage",
         "current_dig_point_id",
+        "dig_group_id",
         "outcome",
         "reason_code",
     ):
         if not isinstance(value[name], str):
             raise ValueError(f"{name} must be a string")
+    if value["mission_profile"] not in {
+        REGIME_FACTORIZED_PROFILE,
+        ACT_FULL_CYCLE_PROFILE,
+    }:
+        raise ValueError("mission_profile is invalid")
     value["requested_cycles"] = _count(
         "requested_cycles", value["requested_cycles"], maximum=9
     )

@@ -55,7 +55,7 @@ class ResidentFixedCycleRuntime:
     ) -> None:
         if not isinstance(plan, FixedCyclePlan):
             raise ValueError("plan must be a FixedCyclePlan")
-        expected = (*plan.dig_sequence, "dump")
+        expected = plan.trajectory_target_ids
         if tuple(registry) != expected or any(
             not isinstance(registry[target], FixedTrajectoryTemplate)
             for target in expected
@@ -134,6 +134,7 @@ class ResidentFixedCycleRuntime:
         run_id: str,
         requested_cycles: int,
         first_dig_point_id: str | None = None,
+        dig_group_id: str | None = None,
     ) -> FixedCycleSnapshot:
         with self._lock:
             self._session_id = run_id
@@ -150,6 +151,7 @@ class ResidentFixedCycleRuntime:
                 run_id=run_id,
                 requested_cycles=requested_cycles,
                 first_dig_point_id=first_dig_point_id,
+                dig_group_id=dig_group_id,
             )
             return self._coordinator.snapshot
 
@@ -163,7 +165,7 @@ class ResidentFixedCycleRuntime:
             if not self._core.is_operational:
                 self._fail("RESIDENT_CORE_NOT_OPERATIONAL")
                 return self._coordinator.snapshot
-            if snapshot.stage == "ACT_DIG":
+            if snapshot.stage in {"ACT_DIG", "ACT_FULL_CYCLE"}:
                 self._advance_act()
             self._dispatch_pending_if_ready()
             return self._coordinator.snapshot
@@ -241,10 +243,17 @@ class ResidentFixedCycleRuntime:
         if segment.complete:
             self._active_act_generation = None
             self._act_activation_started_s = None
+            reason_code = {
+                "step_budget": "STEP_BUDGET_REACHED",
+                "deadzone_chunk": "DEADZONE_CHUNK_REACHED",
+            }.get(segment.completion_reason)
+            if reason_code is None:
+                self._fail("ACT_COMPLETION_REASON_INVALID")
+                return
             self._coordinator.record_child_result(
                 child="act",
                 outcome="SUCCEEDED",
-                reason_code="STEP_BUDGET_REACHED",
+                reason_code=reason_code,
                 quiescence_confirmed=True,
                 completed_steps=segment.completed_steps,
             )
