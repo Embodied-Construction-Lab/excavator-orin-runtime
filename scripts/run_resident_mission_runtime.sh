@@ -8,7 +8,11 @@ edge_config="${EDGE_CONFIG:-deploy/edge_runtime.resident.remote.json}"
 resident_runtime_root="${RESIDENT_RUNTIME_ROOT:-${HOME}/.local/run/excavator-resident}"
 resident_act_socket="${RESIDENT_ACT_SOCKET:-${resident_runtime_root}/act.sock}"
 resident_control_socket="${RESIDENT_CONTROL_SOCKET:-${resident_runtime_root}/control.sock}"
+resident_fixed_cycle_control_socket="${RESIDENT_FIXED_CYCLE_CONTROL_SOCKET:-${resident_runtime_root}/fixed-cycle.sock}"
 resident_python="${RESIDENT_PYTHON:-python3}"
+fixed_cycle_plan=""
+commissioning_authorization=""
+expected_dig_catalog_sha256=""
 authorization=""
 
 while [[ $# -gt 0 ]]; do
@@ -38,6 +42,21 @@ while [[ $# -gt 0 ]]; do
       print_every="$2"
       shift 2
       ;;
+    "--fixed-cycle-plan")
+      [[ $# -ge 2 ]] || { echo "--fixed-cycle-plan 缺少值" >&2; exit 2; }
+      fixed_cycle_plan="$2"
+      shift 2
+      ;;
+    "--commissioning-authorization")
+      [[ $# -ge 2 ]] || { echo "--commissioning-authorization 缺少值" >&2; exit 2; }
+      commissioning_authorization="$2"
+      shift 2
+      ;;
+    "--expected-dig-catalog-sha256")
+      [[ $# -ge 2 ]] || { echo "--expected-dig-catalog-sha256 缺少值" >&2; exit 2; }
+      expected_dig_catalog_sha256="$2"
+      shift 2
+      ;;
     *)
       echo "未知参数：$1" >&2
       exit 2
@@ -57,8 +76,25 @@ if [[ ! "${pc_host}" =~ ^[0-9A-Za-z._:-]+$ ]]; then
   echo "--pc-host 必须是安全的主机名或 IPv4 文本。" >&2
   exit 2
 fi
+if [[ -n "${commissioning_authorization}" && "${commissioning_authorization}" != "ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING" ]]; then
+  echo "V3-A 候选轨迹需要精确授权：ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING" >&2
+  exit 1
+fi
+if [[ -n "${commissioning_authorization}" && -z "${fixed_cycle_plan}" ]]; then
+  echo "候选轨迹授权只能与 --fixed-cycle-plan 一起使用。" >&2
+  exit 2
+fi
+if [[ -n "${expected_dig_catalog_sha256}" && ! "${expected_dig_catalog_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "--expected-dig-catalog-sha256 必须是小写 SHA-256。" >&2
+  exit 2
+fi
+if [[ -n "${expected_dig_catalog_sha256}" && -z "${fixed_cycle_plan}" ]]; then
+  echo "目录摘要只能与 --fixed-cycle-plan 一起使用。" >&2
+  exit 2
+fi
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+resident_action_audit_path="${RESIDENT_ACTION_AUDIT_PATH:-${repo_dir}/logs/resident_action_audit.jsonl}"
 example_edge_config="${repo_dir}/deploy/edge_runtime.resident.remote.example.json"
 resolved_edge_config="${edge_config}"
 if [[ "${resolved_edge_config}" != /* ]]; then
@@ -69,6 +105,16 @@ if [[ ! -f "${resolved_edge_config}" ]]; then
     cp "${example_edge_config}" "${resolved_edge_config}"
   else
     echo "edge config 不存在：${resolved_edge_config}" >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "${fixed_cycle_plan}" ]]; then
+  if [[ "${fixed_cycle_plan}" != /* ]]; then
+    fixed_cycle_plan="${repo_dir}/${fixed_cycle_plan}"
+  fi
+  if [[ ! -f "${fixed_cycle_plan}" ]]; then
+    echo "固定循环 plan 不存在：${fixed_cycle_plan}" >&2
     exit 1
   fi
 fi
@@ -100,6 +146,23 @@ if value.get("action_transport") != "resident_sink":
     raise SystemExit("resident owner requires action_transport=resident_sink")
 PY
 
+fixed_cycle_args=()
+if [[ -n "${fixed_cycle_plan}" ]]; then
+  fixed_cycle_args=(--resident-fixed-cycle-plan "${fixed_cycle_plan}")
+  if [[ -n "${expected_dig_catalog_sha256}" ]]; then
+    fixed_cycle_args+=(
+      --resident-fixed-cycle-expected-dig-catalog-sha256
+      "${expected_dig_catalog_sha256}"
+    )
+  fi
+  if [[ -n "${commissioning_authorization}" ]]; then
+    fixed_cycle_args+=(
+      --resident-fixed-cycle-commissioning-authorization
+      "${commissioning_authorization}"
+    )
+  fi
+fi
+
 echo "启动 resident Mission owner：${serial_port} 将保持为唯一 STM32 owner。"
 echo "ACT worker 通过 ${resident_act_socket} 发送候选动作；低频控制命令走 ${resident_control_socket}。"
 
@@ -113,4 +176,7 @@ exec "${resident_python}" -u "${repo_dir}/orin_state_sender.py" \
   --resident-motion-core \
   --resident-act-socket "${resident_act_socket}" \
   --resident-control-socket "${resident_control_socket}" \
+  --resident-action-audit-path "${resident_action_audit_path}" \
+  --resident-fixed-cycle-control-socket "${resident_fixed_cycle_control_socket}" \
+  "${fixed_cycle_args[@]}" \
   --print-every "${print_every}"

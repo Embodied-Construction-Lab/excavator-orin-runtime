@@ -1,7 +1,11 @@
 import json
 import unittest
 
-from edge_runtime.resident_core import ResidentMotionCore
+from edge_runtime.resident_core import (
+    AxisManualActionDeadzone,
+    ManualActionDeadzoneContract,
+    ResidentMotionCore,
+)
 from edge_runtime.resident_motion import ControlMode, MotionCandidate, ZERO_ACTION
 from edge_runtime.resident_protocol import encode_motion_candidate
 from edge_runtime.resident_sink import ResidentTelemetry
@@ -17,6 +21,22 @@ class RecordingSerial:
 
     def flush(self) -> None:
         return None
+
+
+class RecordingActionAudit:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def emit(self, event_type: str, **fields: object) -> bool:
+        self.events.append({"event_type": event_type, **fields})
+        return True
+
+
+def uniform_deadzone_contract(
+    value: float,
+) -> ManualActionDeadzoneContract:
+    axis = AxisManualActionDeadzone(value, value)
+    return ManualActionDeadzoneContract((axis, axis, axis, axis))
 
 
 def telemetry(
@@ -48,6 +68,7 @@ class ResidentMotionCoreTest(unittest.TestCase):
         self.core = ResidentMotionCore(
             self.serial,
             max_state_age_ms=200.0,
+            manual_action_deadzone_contract=uniform_deadzone_contract(0.15),
             wall_time_ms=lambda: 10_000,
             monotonic_ns=lambda: 1_090_000_000,
         )
@@ -243,6 +264,26 @@ class ResidentMotionCoreTest(unittest.TestCase):
         self.assertTrue(first.write_performed)
         self.assertEqual(repeated, first)
         self.assertEqual(len(self.serial.writes), writes_after_first)
+
+    def test_terminal_zero_ack_is_remembered_after_core_is_disarmed(self) -> None:
+        self.core.activate_rl(now_monotonic_ns=1_000_000_000)
+        self.acknowledge_latest_zero(
+            mode=ControlMode.VELOCITY_REFERENCE,
+            receive_ns=1_020_000_000,
+        )
+        terminal = self.core.terminal_disarm(now_monotonic_ns=1_040_000_000)
+
+        self.assertFalse(self.core.terminal_zero_acknowledged)
+        self.core.observe_telemetry(
+            telemetry(
+                receive_ns=1_060_000_000,
+                command_seq=terminal.command_seq,
+                valid=True,
+                mode=ControlMode.VELOCITY_REFERENCE,
+            )
+        )
+
+        self.assertTrue(self.core.terminal_zero_acknowledged)
 
     def test_act_candidate_lease_expiry_zeros_and_revokes_the_generation(self) -> None:
         generation = self.core.activate_act(now_monotonic_ns=1_000_000_000)
@@ -449,6 +490,386 @@ class ResidentMotionCoreTest(unittest.TestCase):
             receive_ns=1_090_000_000,
         )
         self.assertTrue(self.core.rl_is_active)
+
+    def test_act_segment_audit_exposes_the_deadzone_tail_at_the_step_budget(self) -> None:
+        serial = RecordingSerial()
+        audit = RecordingActionAudit()
+        core = ResidentMotionCore(
+            serial,
+            max_state_age_ms=200.0,
+            manual_action_deadzone_contract=uniform_deadzone_contract(0.15),
+            wall_time_ms=lambda: 10_000,
+            monotonic_ns=lambda: 1_090_000_000,
+            action_audit=audit,
+        )
+        core.initialize(
+            telemetry(receive_ns=990_000_000, command_seq=0, valid=False, mode=None)
+        )
+        generation = core.activate_act(
+            max_steps=2,
+            now_monotonic_ns=1_000_000_000,
+        )
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        core.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_seq=claim["command_seq"],
+                valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+            )
+        )
+        for created_ns, action in (
+            (1_025_000_000, (0.2, 0.0, 0.0, 0.0)),
+            (1_030_000_000, (0.1, -0.15, 0.0, 0.0)),
+        ):
+            result = core.submit_act(
+                encode_motion_candidate(
+                    MotionCandidate(
+                        source="act_dig",
+                        generation=generation,
+                        mode=ControlMode.MANUAL_ACTION,
+                        action=action,
+                        created_monotonic_ns=created_ns,
+                        valid_until_monotonic_ns=1_200_000_000,
+                    )
+                )
+            )
+            self.assertTrue(result.accepted)
+
+        steps = [
+            event for event in audit.events if event["event_type"] == "act_step"
+        ]
+        summaries = [
+            event
+            for event in audit.events
+            if event["event_type"] == "act_segment_summary"
+        ]
+        self.assertEqual(
+            [(step["completed_steps"], step["all_axes_in_deadzone"]) for step in steps],
+            [(1, False), (2, True)],
+        )
+        writes = [
+            event
+            for event in audit.events
+            if event["event_type"] == "command_write"
+        ]
+        self.assertEqual(steps[0]["runtime_id"], writes[-1]["runtime_id"])
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["last_effective_step"], 1)
+        self.assertEqual(summaries[0]["trailing_deadzone_steps"], 1)
+        self.assertEqual(summaries[0]["estimated_trailing_deadzone_ms"], 100.0)
+
+    def test_act_deadzone_uses_the_injected_directional_contract(self) -> None:
+        serial = RecordingSerial()
+        audit = RecordingActionAudit()
+        core = ResidentMotionCore(
+            serial,
+            max_state_age_ms=200.0,
+            wall_time_ms=lambda: 10_000,
+            monotonic_ns=lambda: 1_090_000_000,
+            action_audit=audit,
+            manual_action_deadzone_contract=ManualActionDeadzoneContract(
+                (
+                    AxisManualActionDeadzone(0.12, 0.08),
+                    AxisManualActionDeadzone(0.15, 0.15),
+                    AxisManualActionDeadzone(0.15, 0.15),
+                    AxisManualActionDeadzone(0.15, 0.15),
+                )
+            ),
+        )
+        core.initialize(
+            telemetry(receive_ns=990_000_000, command_seq=0, valid=False, mode=None)
+        )
+        generation = core.activate_act(
+            max_steps=2,
+            now_monotonic_ns=1_000_000_000,
+        )
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        core.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_seq=claim["command_seq"],
+                valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+            )
+        )
+        for created_ns, action in (
+            (1_025_000_000, (0.1201, 0.0, 0.0, 0.0)),
+            (1_030_000_000, (0.12, -0.08, 0.0, 0.0)),
+        ):
+            result = core.submit_act(
+                encode_motion_candidate(
+                    MotionCandidate(
+                        source="act_dig",
+                        generation=generation,
+                        mode=ControlMode.MANUAL_ACTION,
+                        action=action,
+                        created_monotonic_ns=created_ns,
+                        valid_until_monotonic_ns=1_200_000_000,
+                    )
+                )
+            )
+            self.assertTrue(result.accepted)
+
+        steps = [
+            event for event in audit.events if event["event_type"] == "act_step"
+        ]
+        self.assertEqual(
+            [step["all_axes_in_deadzone"] for step in steps],
+            [False, True],
+        )
+        self.assertEqual(
+            [step["manual_deadzone_contract_enabled"] for step in steps],
+            [True, True],
+        )
+
+    def test_act_early_completion_inspects_a_full_new_chunk_before_execution(self) -> None:
+        serial = RecordingSerial()
+        audit = RecordingActionAudit()
+        core = ResidentMotionCore(
+            serial,
+            max_state_age_ms=200.0,
+            wall_time_ms=lambda: 10_000,
+            monotonic_ns=lambda: 1_090_000_000,
+            action_audit=audit,
+            manual_action_deadzone_contract=uniform_deadzone_contract(0.15),
+            act_early_completion_chunk_steps=10,
+            act_early_completion_min_steps=10,
+        )
+        core.initialize(
+            telemetry(receive_ns=990_000_000, command_seq=0, valid=False, mode=None)
+        )
+        generation = core.activate_act(
+            max_steps=30,
+            now_monotonic_ns=1_000_000_000,
+        )
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        core.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_seq=claim["command_seq"],
+                valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+            )
+        )
+
+        results = []
+        for index in range(10):
+            pre_minimum_chunk = ((0.1, 0.0, 0.0, 0.0),) * 10
+            result = core.submit_act(
+                encode_motion_candidate(
+                    MotionCandidate(
+                        source="act_dig",
+                        generation=generation,
+                        mode=ControlMode.MANUAL_ACTION,
+                        action=(
+                            (0.1, 0.0, 0.0, 0.0)
+                            if index == 0
+                            else (0.2, 0.0, 0.0, 0.0)
+                        ),
+                        action_chunk=pre_minimum_chunk if index == 0 else None,
+                        created_monotonic_ns=1_025_000_000 + index,
+                        valid_until_monotonic_ns=1_200_000_000,
+                    )
+                )
+            )
+            self.assertTrue(result.accepted)
+            results.append(result)
+
+        mixed_chunk = (
+            *((0.1, 0.0, 0.0, 0.0),) * 9,
+            (0.1501, 0.0, 0.0, 0.0),
+        )
+        mixed = core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=mixed_chunk[0],
+                    action_chunk=mixed_chunk,
+                    created_monotonic_ns=1_030_000_000,
+                    valid_until_monotonic_ns=1_200_000_000,
+                )
+            )
+        )
+        self.assertTrue(mixed.accepted)
+        self.assertEqual(core.act_segment_snapshot().completed_steps, 11)
+
+        deadzone_chunk = ((0.15, -0.15, 0.0, 0.0),) * 10
+        final = core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=deadzone_chunk[0],
+                    action_chunk=deadzone_chunk,
+                    created_monotonic_ns=1_031_000_000,
+                    valid_until_monotonic_ns=1_200_000_000,
+                )
+            )
+        )
+        self.assertTrue(final.accepted)
+        self.assertEqual(core.act_segment_snapshot().completed_steps, 12)
+        self.assertFalse(core.act_segment_snapshot().complete)
+        rejected = core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=(0.8, 0.0, 0.0, 0.0),
+                    created_monotonic_ns=1_030_000_000,
+                    valid_until_monotonic_ns=1_200_000_000,
+                )
+            )
+        )
+        self.assertFalse(rejected.accepted)
+        self.assertEqual(rejected.reason, "act_segment_early_complete")
+
+        summaries = [
+            event
+            for event in audit.events
+            if event["event_type"] == "act_segment_summary"
+        ]
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["completion_reason"], "deadzone_chunk")
+        self.assertEqual(summaries[0]["deadzone_chunk_steps"], 10)
+        self.assertEqual(summaries[0]["skipped_budget_steps"], 18)
+
+        core.observe_telemetry(
+            telemetry(
+                receive_ns=1_040_000_000,
+                command_seq=final.command_seq,
+                valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+                action=final.effective_action,
+            )
+        )
+        self.assertTrue(core.act_segment_snapshot().complete)
+        self.assertEqual(core.act_segment_snapshot().completed_steps, 12)
+
+    def test_missing_deadzone_contract_disables_early_completion(self) -> None:
+        serial = RecordingSerial()
+        core = ResidentMotionCore(
+            serial,
+            max_state_age_ms=200.0,
+            wall_time_ms=lambda: 10_000,
+            monotonic_ns=lambda: 1_090_000_000,
+            manual_action_deadzone_contract=None,
+            act_early_completion_chunk_steps=10,
+            act_early_completion_min_steps=10,
+        )
+        core.initialize(
+            telemetry(receive_ns=990_000_000, command_seq=0, valid=False, mode=None)
+        )
+        generation = core.activate_act(
+            max_steps=30,
+            now_monotonic_ns=1_000_000_000,
+        )
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        core.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_seq=claim["command_seq"],
+                valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+            )
+        )
+        deadzone_chunk = ((0.0, 0.0, 0.0, 0.0),) * 10
+        final = core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=deadzone_chunk[0],
+                    action_chunk=deadzone_chunk,
+                    created_monotonic_ns=1_031_000_000,
+                    valid_until_monotonic_ns=1_200_000_000,
+                )
+            )
+        )
+        self.assertTrue(final.accepted)
+        self.assertEqual(core.act_segment_snapshot().completed_steps, 1)
+        self.assertFalse(core.act_segment_snapshot().complete)
+
+        still_running = core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=(0.8, 0.0, 0.0, 0.0),
+                    created_monotonic_ns=1_032_000_000,
+                    valid_until_monotonic_ns=1_200_000_000,
+                )
+            )
+        )
+        self.assertTrue(still_running.accepted)
+
+    def test_default_early_completion_starts_at_step_101_chunk_boundary(self) -> None:
+        generation = self.core.activate_act(
+            max_steps=130,
+            now_monotonic_ns=1_000_000_000,
+        )
+        self.acknowledge_latest_zero(
+            mode=ControlMode.MANUAL_ACTION,
+            receive_ns=1_020_000_000,
+        )
+        active_chunk = ((0.2, 0.0, 0.0, 0.0),) * 10
+        for step_index in range(100):
+            result = self.core.submit_act(
+                encode_motion_candidate(
+                    MotionCandidate(
+                        source="act_dig",
+                        generation=generation,
+                        mode=ControlMode.MANUAL_ACTION,
+                        action=active_chunk[step_index % 10],
+                        action_chunk=(
+                            active_chunk if step_index % 10 == 0 else None
+                        ),
+                        created_monotonic_ns=1_025_000_000 + step_index,
+                        valid_until_monotonic_ns=1_200_000_000,
+                    )
+                )
+            )
+            self.assertTrue(result.accepted)
+        self.assertEqual(self.core.act_segment_snapshot().completed_steps, 100)
+        self.assertFalse(self.core.act_segment_snapshot().complete)
+
+        deadzone_chunk = ((0.15, -0.15, 0.0, 0.0),) * 10
+        final = self.core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=deadzone_chunk[0],
+                    action_chunk=deadzone_chunk,
+                    created_monotonic_ns=1_026_000_000,
+                    valid_until_monotonic_ns=1_200_000_000,
+                )
+            )
+        )
+        self.assertTrue(final.accepted)
+        self.assertEqual(self.core.act_segment_snapshot().completed_steps, 101)
+        self.assertFalse(self.core.act_segment_snapshot().complete)
+        rejected = self.core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=(0.8, 0.0, 0.0, 0.0),
+                    created_monotonic_ns=1_027_000_000,
+                    valid_until_monotonic_ns=1_200_000_000,
+                )
+            )
+        )
+        self.assertFalse(rejected.accepted)
+        self.assertEqual(rejected.reason, "act_segment_early_complete")
 
     def test_repeated_act_activation_is_idempotent_but_cannot_change_budget(self) -> None:
         generation = self.core.activate_act(

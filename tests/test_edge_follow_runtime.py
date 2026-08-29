@@ -2,6 +2,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from edge_runtime.follow import EdgeFollowRuntime
 from edge_runtime.trajectory_controller import (
@@ -167,6 +168,219 @@ class AlternatingPolicy:
 
 
 class EdgeFollowRuntimeTest(unittest.TestCase):
+    def test_single_fixed_endpoint_uses_local_three_point_lookahead(self):
+        fixed_endpoint = {
+            **trajectory(),
+            "task_mode": "MoveToDig",
+            "waypoints_base": [[1.0, 0.26, 0.0]],
+            "waypoint_count": 1,
+        }
+        policy = RecordingPolicy([0.0, 0.0, 0.0, 0.0])
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=policy,
+            trajectory=fixed_endpoint,
+            mission=mission(),
+        )
+
+        step = runtime.step(
+            machine_state(sequence=1, stamp_ms=1_000),
+            now_s=1.0,
+        )
+
+        self.assertEqual(step.waypoint_index, 1)
+        self.assertFalse(step.completed)
+        current = step.bucket_tip_ros_m
+        target = (1.0, 0.26, 0.0)
+        start_radius = math.hypot(current[0], current[1])
+        target_radius = math.hypot(target[0], target[1])
+        start_angle = math.atan2(current[1], current[0])
+        target_angle = math.atan2(target[1], target[0])
+        angle_delta = math.atan2(
+            math.sin(target_angle - start_angle),
+            math.cos(target_angle - start_angle),
+        )
+        midpoint_angle = start_angle + angle_delta / 2.0
+        midpoint_radius = (start_radius + target_radius) / 2.0
+        midpoint = (
+            midpoint_radius * math.cos(midpoint_angle),
+            midpoint_radius * math.sin(midpoint_angle),
+            (current[2] + target[2]) / 2.0,
+        )
+        distance_scale = machine_profile()["observation_schema"]["normalizers"][
+            "distance_normalizer"
+        ]
+        expected_midpoint_delta = tuple(
+            (end - start) / distance_scale
+            for start, end in zip(current, midpoint)
+        )
+        # Waypoint observations are transformed ROS xyz -> Unity xyz as -y,z,x.
+        expected_unity_delta = (
+            -expected_midpoint_delta[1],
+            expected_midpoint_delta[2],
+            expected_midpoint_delta[0],
+        )
+        for actual, expected in zip(
+            step.observation[15:18], expected_unity_delta
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(len(step.trajectory_waypoints_ros_m), 3)
+        for actual, expected in zip(
+            step.trajectory_waypoints_ros_m,
+            (current, midpoint, target),
+        ):
+            for actual_axis, expected_axis in zip(actual, expected):
+                self.assertAlmostEqual(actual_axis, expected_axis)
+
+    def test_arc_lookahead_uses_shortest_swing_direction_across_pi(self):
+        start_angle = math.radians(170.0)
+        target_angle = math.radians(-170.0)
+        start = (math.cos(start_angle), math.sin(start_angle), 0.0)
+        target = (math.cos(target_angle), math.sin(target_angle), 0.4)
+
+        class FixedPoseKinematics:
+            root_link = "fk_root"
+
+            def evaluate(self, _joints):
+                return SimpleNamespace(
+                    position_m=start,
+                    orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                )
+
+        fixed_endpoint = {
+            **trajectory(),
+            "task_mode": "MoveToDig",
+            "waypoints_base": [list(target)],
+            "waypoint_count": 1,
+        }
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=FixedPoseKinematics(),
+            policy=RecordingPolicy([0.0, 0.0, 0.0, 0.0]),
+            trajectory=fixed_endpoint,
+            mission=mission(),
+        )
+
+        step = runtime.step(
+            machine_state(sequence=1, stamp_ms=1_000),
+            now_s=1.0,
+        )
+
+        expected_midpoint = (-1.0, 0.0, 0.2)
+        distance_scale = machine_profile()["observation_schema"]["normalizers"][
+            "distance_normalizer"
+        ]
+        expected_delta = tuple(
+            (end - begin) / distance_scale
+            for begin, end in zip(start, expected_midpoint)
+        )
+        expected_unity_delta = (
+            -expected_delta[1],
+            expected_delta[2],
+            expected_delta[0],
+        )
+        for actual, expected in zip(
+            step.observation[15:18], expected_unity_delta
+        ):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_carry_material_raises_only_low_arc_midpoint_without_gating_swing(
+        self,
+    ):
+        start = (0.8, 0.1, -0.7)
+        target = (-0.2, -0.9, 0.1)
+
+        class FixedPoseKinematics:
+            root_link = "fk_root"
+
+            def evaluate(self, _joints):
+                return SimpleNamespace(
+                    position_m=start,
+                    orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                )
+
+        fixed_endpoint = {
+            **trajectory(),
+            "task_mode": "CarryMaterial",
+            "waypoints_base": [list(target)],
+            "waypoint_count": 1,
+        }
+        policy = RecordingPolicy([0.0, 0.0, 0.0, 1.0])
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=FixedPoseKinematics(),
+            policy=policy,
+            trajectory=fixed_endpoint,
+            mission=mission(),
+        )
+
+        step = runtime.step(
+            machine_state(sequence=1, stamp_ms=1_000),
+            now_s=1.0,
+        )
+
+        first, midpoint, final = step.trajectory_waypoints_ros_m
+        self.assertEqual(step.waypoint_index, 1)
+        self.assertEqual(first, start)
+        self.assertAlmostEqual(midpoint[0], 0.5815223113)
+        self.assertAlmostEqual(midpoint[1], -0.6391271549)
+        self.assertAlmostEqual(midpoint[2], target[2])
+        self.assertEqual(final, target)
+        self.assertEqual(step.normalized_action[-1], 1.0)
+        self.assertEqual(step.commanded_normalized_action[-1], 1.0)
+        self.assertEqual(step.physical_action[-1], 0.6)
+
+    def test_fixed_endpoint_reports_relaxed_tolerance_only_at_local_midpoint(self):
+        fixed_endpoint = {
+            **trajectory(),
+            "task_mode": "MoveToDig",
+            "waypoints_base": [[1.0, 0.26, 0.0]],
+            "waypoint_count": 1,
+        }
+        two_level_mission = mission()
+        two_level_mission["limits"]["intermediate_waypoint_tolerance_m"] = 0.40
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=RecordingPolicy([0.0, 0.0, 0.0, 0.0]),
+            trajectory=fixed_endpoint,
+            mission=two_level_mission,
+        )
+
+        midpoint_step = runtime.step(
+            machine_state(sequence=1, stamp_ms=1_000),
+            now_s=1.0,
+        )
+
+        self.assertEqual(midpoint_step.waypoint_index, 1)
+        self.assertEqual(midpoint_step.waypoint_tolerance_m, 0.40)
+
+    def test_single_fixed_endpoint_in_tolerance_completes_immediately(self):
+        current = (0.767383087910776, -0.299489293005342, -0.301587096786684)
+        fixed_endpoint = {
+            **trajectory(),
+            "task_mode": "MoveToDig",
+            "waypoints_base": [list(current)],
+            "waypoint_count": 1,
+        }
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=RecordingPolicy([1.0, 1.0, 1.0, 1.0]),
+            trajectory=fixed_endpoint,
+            mission=mission(),
+        )
+
+        step = runtime.step(
+            machine_state(sequence=1, stamp_ms=1_000),
+            now_s=1.0,
+        )
+
+        self.assertTrue(step.completed)
+        self.assertEqual(step.result, "COMPLETED")
+        self.assertEqual(step.physical_action, (0.0, 0.0, 0.0, 0.0))
+
     def test_controller_seam_preserves_normalized_and_physical_axis_contracts(self):
         class Controller:
             descriptor = TrajectoryControllerDescriptor(
@@ -287,6 +501,25 @@ class EdgeFollowRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(second.physical_action[2], -0.012)
         self.assertAlmostEqual(second.physical_action[3], 0.12)
 
+    def test_follow_slew_uses_bounded_activation_elapsed_on_first_command(self):
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=RecordingPolicy([1.0, -1.0, 0.5, -0.5]),
+            trajectory=trajectory(),
+            mission=mission(),
+            action_slew_rate_per_s=2.0,
+            slew_started_monotonic_s=10.0,
+        )
+
+        first = runtime.step(machine_state(sequence=10), now_s=10.2)
+
+        for actual, expected in zip(
+            first.commanded_normalized_action,
+            (0.1, -0.1, 0.1, -0.1),
+        ):
+            self.assertAlmostEqual(actual, expected)
+
     def test_bucket_pitch_error_matches_unity_delta_angle_for_each_task_mode(self):
         observations = {}
         for task_mode in ("MoveToDig", "CarryMaterial"):
@@ -374,6 +607,29 @@ class EdgeFollowRuntimeTest(unittest.TestCase):
         self.assertEqual(snapshot.target_threshold_m, 0.03)
         self.assertEqual(within_mission_tolerance.current_index, 1)
         self.assertEqual(outside_mission_tolerance.current_index, 0)
+
+    def test_waypoint_tracker_uses_strict_endpoints_and_relaxed_intermediate(self):
+        snapshot = TrajectorySnapshot.from_mapping(trajectory())
+        first, middle, final = snapshot.waypoints
+        tracker = WaypointTracker(
+            snapshot,
+            waypoint_tolerance_m=0.25,
+            intermediate_waypoint_tolerance_m=0.40,
+        )
+
+        still_at_start = tracker.advance((first[0] + 0.30, first[1], first[2]))
+        at_middle = tracker.advance((first[0] + 0.20, first[1], first[2]))
+        at_final = at_middle.advance((middle[0] + 0.35, middle[1], middle[2]))
+        not_complete = at_final.advance((final[0] + 0.30, final[1], final[2]))
+        complete = at_final.advance((final[0] + 0.20, final[1], final[2]))
+
+        self.assertEqual(still_at_start.current_index, 0)
+        self.assertEqual(at_middle.current_index, 1)
+        self.assertEqual(at_middle.current_tolerance_m, 0.40)
+        self.assertEqual(at_final.current_index, 2)
+        self.assertEqual(at_final.current_tolerance_m, 0.25)
+        self.assertFalse(not_complete.completed)
+        self.assertTrue(complete.completed)
 
     def test_episode_progress_uses_follow_monotonic_start_and_clamps_at_timeout(self):
         policy = RecordingPolicy([0.5, -0.5, 0.1, -0.2])
@@ -488,6 +744,35 @@ class EdgeFollowRuntimeTest(unittest.TestCase):
         self.assertEqual(after_gap.result, "ACTIVE")
         self.assertEqual(after_gap.observation[29], 1.0 / 60.0)
         self.assertEqual(len(policy.observations), 2)
+
+    def test_active_follow_reports_structured_no_progress_diagnostics(self):
+        runtime = EdgeFollowRuntime(
+            machine_profile=machine_profile(),
+            kinematics=self.kinematics,
+            policy=RecordingPolicy([0.5, -0.5, 0.1, -0.2]),
+            trajectory=trajectory(),
+            mission=mission(),
+        )
+
+        with self.assertLogs("edge_runtime.follow", level="WARNING") as captured:
+            runtime.step(machine_state(sequence=80), now_s=100.0)
+            runtime.step(machine_state(sequence=81), now_s=101.0)
+            runtime.step(machine_state(sequence=82), now_s=102.0)
+
+        self.assertEqual(len(captured.output), 1)
+        message = captured.output[0]
+        self.assertIn("RL Follow no progress", message)
+        self.assertIn("waypoint=1/3", message)
+        self.assertIn("window_s=2.000", message)
+        self.assertIn("distance_start_m=", message)
+        self.assertIn("distance_now_m=", message)
+        self.assertIn("tolerance_m=0.2500", message)
+        self.assertIn("bucket_tip_ros_m=(", message)
+        self.assertIn("target_waypoint_ros_m=(1.2, -0.2, -0.2)", message)
+        self.assertIn("normalized_action=(0.5, -0.5, 0.1, -0.2)", message)
+        self.assertIn("commanded_action=(0.5, -0.5, 0.1, -0.2)", message)
+        self.assertIn("physical_action=(0.02, -0.025, 0.003, -0.12)", message)
+        self.assertIn("backend=onnx_rl", message)
 
     def test_invalid_first_state_does_not_start_follow_clock(self):
         policy = RecordingPolicy([0.5, -0.5, 0.1, -0.2])

@@ -40,6 +40,77 @@ def slew_limited_normalized_action(
     return result  # type: ignore[return-value]
 
 
+def dual_rate_slew_limited_normalized_action(
+    target: Sequence[float],
+    previous: Sequence[float],
+    *,
+    startup_pending: Sequence[bool],
+    elapsed_s: float,
+    startup_rate_per_s: float,
+    steady_rate_per_s: float,
+) -> tuple[
+    Tuple[float, float, float, float],
+    tuple[bool, bool, bool, bool],
+]:
+    """Use a faster first ramp while preserving steady/reversal smoothing.
+
+    Each axis remains in startup until it reaches its first non-zero target.
+    A reduction or reversal ends startup for that axis immediately, so later
+    changes always use the steady rate.
+    """
+    if len(startup_pending) != 4 or not all(
+        isinstance(value, bool) for value in startup_pending
+    ):
+        raise ValueError("startup_pending must contain four booleans")
+    steady = slew_limited_normalized_action(
+        target,
+        previous,
+        elapsed_s=elapsed_s,
+        max_rate_per_s=steady_rate_per_s,
+    )
+    startup = slew_limited_normalized_action(
+        target,
+        previous,
+        elapsed_s=elapsed_s,
+        max_rate_per_s=startup_rate_per_s,
+    )
+    target_values = tuple(float(value) for value in target)
+    previous_values = tuple(float(value) for value in previous)
+    action = []
+    pending_after = []
+    for desired, current, pending, startup_value, steady_value in zip(
+        target_values,
+        previous_values,
+        startup_pending,
+        startup,
+        steady,
+    ):
+        increasing_from_zero = (
+            desired != 0.0
+            and (
+                current == 0.0
+                or math.copysign(1.0, desired)
+                == math.copysign(1.0, current)
+            )
+            and abs(desired) >= abs(current)
+        )
+        use_startup = pending and increasing_from_zero
+        next_value = startup_value if use_startup else steady_value
+        action.append(next_value)
+        if not pending:
+            pending_after.append(False)
+        elif desired == 0.0:
+            pending_after.append(True)
+        elif not use_startup:
+            pending_after.append(False)
+        else:
+            pending_after.append(not math.isclose(next_value, desired, abs_tol=1e-12))
+    return (
+        tuple(action),
+        tuple(pending_after),
+    )  # type: ignore[return-value]
+
+
 def physical_velocity_from_normalized(
     action: Sequence[float],
     machine_profile: Mapping[str, Any],

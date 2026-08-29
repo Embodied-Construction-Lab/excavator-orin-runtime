@@ -31,6 +31,20 @@ class RecordingSerial:
         self.flush_count += 1
 
 
+class RecordingActionAudit:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def emit(self, event_type: str, **fields: object) -> bool:
+        self.events.append({"event_type": event_type, **fields})
+        return True
+
+
+class FailingActionAudit:
+    def emit(self, _event_type: str, **_fields: object) -> bool:
+        raise OSError("audit disk failed")
+
+
 def telemetry(
     *,
     receive_ns: int,
@@ -165,6 +179,92 @@ class ResidentCommandSinkTest(unittest.TestCase):
         self.assertTrue(accepted.accepted)
         self.assertEqual(self.packets()[-1]["X1"], -0.4)
         self.assertEqual(self.packets()[-1]["Y2"], 0.1)
+
+    def test_action_audit_observes_the_authoritative_write_and_stm32_ack(self) -> None:
+        serial = RecordingSerial()
+        audit = RecordingActionAudit()
+        sink = ResidentCommandSink(
+            serial,
+            max_state_age_ms=200.0,
+            runtime_id="runtime-audit-001",
+            action_audit=audit,
+        )
+        sink.initialize(telemetry(receive_ns=990_000_000))
+        binding = PolicyBinding("act_dig", ControlMode.MANUAL_ACTION)
+
+        generation = sink.request_handoff(
+            binding,
+            now_monotonic_ns=1_000_000_000,
+        )
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        sink.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_rx_seq=claim["command_seq"],
+                command_valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+            )
+        )
+        result = sink.submit_candidate(
+            candidate(
+                source="act_dig",
+                generation=generation,
+                mode=ControlMode.MANUAL_ACTION,
+                action=(0.1, -0.2, 0.3, 0.0),
+            ),
+            now_monotonic_ns=1_030_000_000,
+        )
+
+        writes = [
+            event for event in audit.events if event["event_type"] == "command_write"
+        ]
+        acknowledgements = [
+            event for event in audit.events if event["event_type"] == "command_ack"
+        ]
+        self.assertTrue(result.accepted)
+        self.assertEqual(writes[-1]["source"], "act_dig")
+        self.assertEqual(writes[-1]["generation"], generation)
+        self.assertEqual(writes[-1]["command_seq"], result.command_seq)
+        self.assertEqual(writes[-1]["action"], [0.1, -0.2, 0.3, 0.0])
+        self.assertEqual(acknowledgements[-1]["command_seq"], claim["command_seq"])
+        self.assertEqual(acknowledgements[-1]["mode"], "manual_action")
+
+    def test_action_audit_failure_does_not_change_serial_write_or_ack(self) -> None:
+        serial = RecordingSerial()
+        sink = ResidentCommandSink(
+            serial,
+            max_state_age_ms=200.0,
+            action_audit=FailingActionAudit(),
+        )
+        sink.initialize(telemetry(receive_ns=990_000_000))
+
+        generation = sink.request_handoff(
+            PolicyBinding("act_dig", ControlMode.MANUAL_ACTION),
+            now_monotonic_ns=1_000_000_000,
+        )
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        sink.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_rx_seq=claim["command_seq"],
+                command_valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+            )
+        )
+        result = sink.submit_candidate(
+            candidate(
+                source="act_dig",
+                generation=generation,
+                mode=ControlMode.MANUAL_ACTION,
+                action=(0.2, 0.0, 0.0, 0.0),
+            ),
+            now_monotonic_ns=1_030_000_000,
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertTrue(result.write_performed)
+        self.assertEqual(len(serial.writes), 2)
+        self.assertTrue(sink.is_operational)
 
     def test_active_policy_without_a_candidate_refreshes_the_safe_zero(self) -> None:
         generation = self.activate(self.rl)

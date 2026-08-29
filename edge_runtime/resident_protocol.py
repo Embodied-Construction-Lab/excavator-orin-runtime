@@ -9,7 +9,7 @@ from typing import Any, Mapping
 from .resident_motion import ACTION_ORDER, ControlMode, MotionCandidate
 
 
-CANDIDATE_SCHEMA_VERSION = "resident_policy_candidate.v1"
+CANDIDATE_SCHEMA_VERSION = "resident_policy_candidate.v2"
 MAX_CANDIDATE_BYTES = 4096
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 _FIELDS = {
@@ -19,6 +19,7 @@ _FIELDS = {
     "mode",
     "action_order",
     "action",
+    "action_chunk",
     "created_monotonic_ns",
     "valid_until_monotonic_ns",
 }
@@ -34,6 +35,11 @@ def encode_motion_candidate(candidate: MotionCandidate) -> bytes:
         "mode": candidate.mode.value,
         "action_order": list(ACTION_ORDER),
         "action": list(candidate.action),
+        "action_chunk": (
+            [list(action) for action in candidate.action_chunk]
+            if candidate.action_chunk is not None
+            else None
+        ),
         "created_monotonic_ns": candidate.created_monotonic_ns,
         "valid_until_monotonic_ns": candidate.valid_until_monotonic_ns,
     }
@@ -92,6 +98,21 @@ def decode_motion_candidate(payload: bytes) -> MotionCandidate:
     if not isinstance(action_value, list) or len(action_value) != len(ACTION_ORDER):
         raise ValueError("candidate action must contain four values")
     action = tuple(_finite_number(f"action[{index}]", item) for index, item in enumerate(action_value))
+    raw_chunk = value["action_chunk"]
+    if raw_chunk is None:
+        action_chunk = None
+    else:
+        if not isinstance(raw_chunk, list):
+            raise ValueError("candidate action_chunk must be a list or null")
+        action_chunk = tuple(
+            tuple(
+                _finite_number(f"action_chunk[{row}][{column}]", item)
+                for column, item in enumerate(chunk_action)
+            )
+            if isinstance(chunk_action, list)
+            else ()
+            for row, chunk_action in enumerate(raw_chunk)
+        )
     return MotionCandidate(
         source=source,
         generation=generation,
@@ -99,6 +120,7 @@ def decode_motion_candidate(payload: bytes) -> MotionCandidate:
         action=action,
         created_monotonic_ns=created,
         valid_until_monotonic_ns=valid_until,
+        action_chunk=action_chunk,
     )
 
 

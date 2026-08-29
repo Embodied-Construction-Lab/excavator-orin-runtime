@@ -17,6 +17,7 @@ import threading
 ACTION_ORDER = ("boom", "stick", "bucket", "swing")
 ZERO_ACTION = (0.0, 0.0, 0.0, 0.0)
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
+ACT_ACTION_CHUNK_STEPS = 10
 
 
 class ControlMode(str, Enum):
@@ -55,6 +56,7 @@ class MotionCandidate:
     action: tuple[float, float, float, float]
     created_monotonic_ns: int
     valid_until_monotonic_ns: int
+    action_chunk: tuple[tuple[float, float, float, float], ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, str) or not self.source.strip():
@@ -84,6 +86,24 @@ class MotionCandidate:
         object.__setattr__(self, "source", self.source.strip())
         object.__setattr__(self, "mode", ControlMode(self.mode))
         object.__setattr__(self, "action", tuple(float(value) for value in self.action))
+        if self.action_chunk is not None:
+            if self.mode is not ControlMode.MANUAL_ACTION:
+                raise ValueError("only manual-action candidates may carry an action chunk")
+            if len(self.action_chunk) != ACT_ACTION_CHUNK_STEPS:
+                raise ValueError("candidate action chunk must contain exactly ten actions")
+            chunk = tuple(_normalized_action(action) for action in self.action_chunk)
+            if chunk[0] != self.action:
+                raise ValueError("candidate action must match the first action chunk item")
+            object.__setattr__(self, "action_chunk", chunk)
+
+
+def _normalized_action(values: tuple[float, ...]) -> tuple[float, float, float, float]:
+    if not isinstance(values, tuple) or len(values) != len(ACTION_ORDER):
+        raise ValueError("candidate action chunk items must contain four named axes")
+    converted = tuple(float(value) for value in values)
+    if not all(math.isfinite(value) and -1.0 <= value <= 1.0 for value in converted):
+        raise ValueError("candidate action chunk items must be finite normalized actions")
+    return converted  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
