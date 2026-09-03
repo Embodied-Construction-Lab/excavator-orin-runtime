@@ -14,7 +14,11 @@ from edge_runtime.resident_data_link import (
 )
 from edge_runtime.resident_core import ResidentMotionCore
 from edge_runtime.resident_motion import ControlMode, MotionCandidate, ZERO_ACTION
-from edge_runtime.resident_protocol import encode_motion_candidate
+from edge_runtime.resident_protocol import (
+    ResidentActWorkerIdentity,
+    encode_act_worker_identity,
+    encode_motion_candidate,
+)
 from edge_runtime.resident_sink import ResidentTelemetry, ResidentWriteResult
 from edge_runtime.resident_state import (
     ResidentActState,
@@ -200,6 +204,39 @@ class ResidentActDataLinkTest(unittest.TestCase):
             worker.sendall(bytes((octet,)))
         self.assertTrue(self.received_event.wait(1.0))
         self.assertEqual(self.received, [inbound])
+
+    def test_fixed_mission_authenticates_exact_act_behavior_and_model(self) -> None:
+        expected = ResidentActWorkerIdentity("act_dig_lift", "a" * 64)
+        link = ResidentActDataLink(
+            Path(self.temporary_directory.name) / "runtime" / "identified.sock",
+            on_candidate=lambda payload: self.received.append(payload),
+            expected_worker_identity=expected,
+        )
+        link.start()
+        self.addCleanup(link.close)
+
+        wrong = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        wrong.settimeout(1.0)
+        wrong.connect(os.fspath(link.socket_path))
+        _send_frame(
+            wrong,
+            encode_act_worker_identity(
+                ResidentActWorkerIdentity("act_dig_transport_dump", "b" * 64)
+            ),
+        )
+        self.assertEqual(wrong.recv(1), b"")
+        self.assertFalse(link.connected)
+        wrong.close()
+
+        worker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        worker.connect(os.fspath(link.socket_path))
+        self.addCleanup(worker.close)
+        self.assertFalse(link.connected)
+        _send_frame(worker, encode_act_worker_identity(expected))
+        self.assertTrue(_wait_until(lambda: link.connected))
+        self.assertEqual(link.active_worker_identity, expected)
+        _send_frame(worker, _candidate())
+        self.assertTrue(_wait_until(lambda: len(self.received) == 1))
 
     def test_publish_is_latest_only_while_no_worker_is_connected(self) -> None:
         self.link.start()

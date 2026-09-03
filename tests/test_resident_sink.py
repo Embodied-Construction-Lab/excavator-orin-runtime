@@ -744,6 +744,53 @@ class ResidentCommandSinkTest(unittest.TestCase):
         self.assertEqual(packet["schema_version"], "stm32_manual_command.v1")
         self.assertEqual(packet["Y2"], 0.0)
 
+    def test_unsafe_telemetry_audit_identifies_the_failed_gate(self) -> None:
+        audit = RecordingActionAudit()
+        sink = ResidentCommandSink(
+            self.serial,
+            max_state_age_ms=200.0,
+            runtime_id="runtime-safety-detail",
+            action_audit=audit,
+        )
+        sink.initialize(telemetry(receive_ns=990_000_000))
+        sink.request_handoff(self.rl, now_monotonic_ns=1_000_000_000)
+        packet = self.packets()[-1]
+        sink.observe_telemetry(
+            telemetry(
+                receive_ns=1_010_000_000,
+                command_rx_seq=packet["command_seq"],
+                command_valid=True,
+                mode=ControlMode.VELOCITY_REFERENCE,
+                action=ZERO_ACTION,
+            )
+        )
+        sink.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_rx_seq=packet["command_seq"],
+                command_valid=True,
+                mode=ControlMode.VELOCITY_REFERENCE,
+                control_enabled=False,
+                fault_flags=4,
+            )
+        )
+
+        safety_events = [
+            event
+            for event in audit.events
+            if event["event_type"] == "safety_revoke"
+        ]
+        self.assertEqual(len(safety_events), 1)
+        self.assertEqual(
+            safety_events[0]["failed_gates"],
+            ["control_disabled", "fault_flags"],
+        )
+        self.assertEqual(safety_events[0]["fault_flags"], 4)
+        self.assertEqual(
+            safety_events[0]["expected_mode"],
+            ControlMode.VELOCITY_REFERENCE.value,
+        )
+
     def test_unsafe_telemetry_cancels_a_pending_act_to_rl_handoff(self) -> None:
         self.activate(self.act)
         handoff_generation = self.sink.request_handoff(

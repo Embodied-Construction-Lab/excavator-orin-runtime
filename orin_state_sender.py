@@ -46,6 +46,7 @@ from typing import Callable, Dict, List, Optional
 
 from edge_runtime.resident_action_audit import AsyncResidentActionAudit
 from edge_runtime.resident_motion import ControlMode, ZERO_ACTION
+from edge_runtime.resident_protocol import ResidentActWorkerIdentity
 from edge_runtime.resident_commands import (
     Stm32ResidentCommandEncoder,
     VELOCITY_COMMAND_SCHEMA_VERSION,
@@ -1381,6 +1382,49 @@ def validate_trajectory_controller_commissioning(
         )
 
 
+def format_resident_fixed_cycle_ready_line(
+    args: argparse.Namespace,
+    edge_config: object,
+    plan: object | None = None,
+) -> str:
+    backend = getattr(edge_config, "trajectory_controller_backend", None)
+    if backend not in {"onnx_rl", "cartesian_p"}:
+        raise ValueError("resident fixed cycle controller backend is invalid")
+    mission_fields = ""
+    if plan is not None:
+        mission = getattr(plan, "mission", None)
+        if mission is None:
+            raise ValueError("resident fixed cycle Mission is missing")
+        behavior_id = mission.act_worker_behavior_id or "none"
+        model_sha256 = mission.act_worker_model_sha256 or "none"
+        mission_fields = (
+            f" mission_id={mission.mission_id}"
+            f" mission_sha256={plan.mission_sha256}"
+            f" act_worker_required={str(mission.requires_act_worker).lower()}"
+            f" act_worker_behavior_id={behavior_id}"
+            f" act_worker_model_sha256={model_sha256}"
+        )
+    return (
+        "RESIDENT_FIXED_CYCLE_READY "
+        f"control_socket={args.resident_fixed_cycle_control_socket} "
+        f"act_socket={args.resident_act_socket} "
+        f"trajectory_controller_backend={backend}"
+        f"{mission_fields}"
+    )
+
+
+def validate_resident_fixed_cycle_backend(
+    plan: object,
+    edge_config: object,
+) -> None:
+    mission = getattr(plan, "mission", None)
+    configured = getattr(edge_config, "trajectory_controller_backend", None)
+    if mission is None or configured != mission.trajectory_controller_backend:
+        raise RuntimeError(
+            "resident Mission trajectory controller does not match edge config"
+        )
+
+
 def validate_resident_motion_request(args: argparse.Namespace, edge_config: object) -> None:
     if not args.resident_motion_core:
         return
@@ -1660,8 +1704,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--resident-fixed-cycle-plan",
         type=Path,
         help=(
-            "Enable V3-A Orin-local fixed-target cycling with this strict, "
-            "field-validated resident_fixed_cycle_plan.v1 artifact."
+            "Enable V3-B Orin-local declarative Mission execution with this "
+            "strict resident_fixed_cycle_plan.v5 artifact."
         ),
     )
     parser.add_argument(
@@ -1766,6 +1810,10 @@ def main() -> None:
             resident_fixed_cycle_plan,
             allow_candidate=allow_candidate,
         )
+        validate_resident_fixed_cycle_backend(
+            resident_fixed_cycle_plan,
+            edge_config,
+        )
         if resident_fixed_cycle_plan.validation_status == "candidate":
             LOGGER.warning(
                 "V3-A FIXED TRAJECTORY COMMISSIONING: candidate plan=%s",
@@ -1852,6 +1900,19 @@ def main() -> None:
             on_candidate=resident_motion_core.submit_act,
             on_connection_lost=(
                 resident_motion_core.notify_act_worker_disconnected
+            ),
+            expected_worker_identity=(
+                None
+                if resident_fixed_cycle_plan is None
+                or not resident_fixed_cycle_plan.mission.requires_act_worker
+                else ResidentActWorkerIdentity(
+                    behavior_id=(
+                        resident_fixed_cycle_plan.mission.act_worker_behavior_id
+                    ),
+                    checkpoint_model_sha256=(
+                        resident_fixed_cycle_plan.mission.act_worker_model_sha256
+                    ),
+                )
             ),
         )
         if resident_fixed_cycle_plan is None:
@@ -2053,9 +2114,12 @@ def main() -> None:
         if resident_action_transport:
             if resident_fixed_cycle_control_server is not None:
                 LOGGER.info(
-                    "RESIDENT_FIXED_CYCLE_READY control_socket=%s act_socket=%s",
-                    args.resident_fixed_cycle_control_socket,
-                    args.resident_act_socket,
+                    "%s",
+                    format_resident_fixed_cycle_ready_line(
+                        args,
+                        edge_config,
+                        resident_fixed_cycle_plan,
+                    ),
                 )
             else:
                 LOGGER.info(

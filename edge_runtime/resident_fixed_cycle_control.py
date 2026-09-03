@@ -20,13 +20,7 @@ from .resident_control import (
     _receive_json,
     _send_json,
 )
-from .resident_fixed_cycle import (
-    ACT_FULL_CYCLE_PROFILE,
-    REGIME_FACTORIZED_PROFILE,
-)
-
-
-SCHEMA_VERSION = "resident_fixed_cycle_control.v3"
+SCHEMA_VERSION = "resident_fixed_cycle_control.v4"
 _COMMANDS = frozenset({"status", "start", "heartbeat", "cancel"})
 _REQUEST_FIELDS = frozenset({"schema_version", "command"})
 _START_FIELDS = frozenset(
@@ -42,7 +36,8 @@ _START_FIELDS = frozenset(
 _STATUS_FIELDS = frozenset(
     {
         "run_id",
-        "mission_profile",
+        "mission_id",
+        "active_behavior_id",
         "stage",
         "requested_cycles",
         "completed_cycles",
@@ -385,7 +380,8 @@ def _status(
         raise ValueError("invalid fixed cycle status")
     for name in (
         "run_id",
-        "mission_profile",
+        "mission_id",
+        "active_behavior_id",
         "stage",
         "current_dig_point_id",
         "dig_group_id",
@@ -394,11 +390,6 @@ def _status(
     ):
         if not isinstance(value[name], str):
             raise ValueError(f"{name} must be a string")
-    if value["mission_profile"] not in {
-        REGIME_FACTORIZED_PROFILE,
-        ACT_FULL_CYCLE_PROFILE,
-    }:
-        raise ValueError("mission_profile is invalid")
     value["requested_cycles"] = _count(
         "requested_cycles", value["requested_cycles"], maximum=9
     )

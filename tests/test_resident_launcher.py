@@ -66,6 +66,9 @@ def test_resident_owner_launcher_owns_serial_and_wires_resident_motion_core():
     assert '"--commissioning-authorization"' in script
     assert "ALLOW_V3A_FIXED_TRAJECTORY_COMMISSIONING" in script
     assert "--resident-fixed-cycle-commissioning-authorization" in script
+    assert '"--trajectory-controller-commissioning-authorization"' in script
+    assert "ALLOW_CARTESIAN_P_MACHINE_MOTION" in script
+    assert "--trajectory-controller-commissioning-authorization" in script
     assert (
         'resident_fixed_cycle_control_socket="${RESIDENT_FIXED_CYCLE_CONTROL_SOCKET:-'
         '${resident_runtime_root}/fixed-cycle.sock}"'

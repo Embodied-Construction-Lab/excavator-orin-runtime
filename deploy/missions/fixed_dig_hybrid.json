@@ -1,0 +1,37 @@
+{
+  "schema_version": "resident_mission_definition.v1",
+  "mission_id": "fixed_dig_hybrid",
+  "act_policy_bindings": {},
+  "entry_behavior": {
+    "stage_id": "TRACK_DIG",
+    "behavior_id": "onnx_rl_tracking",
+    "target_role": "current_dig",
+    "max_steps": null
+  },
+  "cycle_behaviors": [
+    {
+      "stage_id": "FIXED_DIG",
+      "behavior_id": "fixed_dig",
+      "target_role": null,
+      "max_steps": null
+    },
+    {
+      "stage_id": "TRACK_DUMP",
+      "behavior_id": "onnx_rl_tracking",
+      "target_role": "dump",
+      "max_steps": null
+    },
+    {
+      "stage_id": "FIXED_DUMP",
+      "behavior_id": "fixed_dump",
+      "target_role": null,
+      "max_steps": null
+    },
+    {
+      "stage_id": "RETURN_DIG",
+      "behavior_id": "onnx_rl_tracking",
+      "target_role": "return_dig",
+      "max_steps": null
+    }
+  ]
+}

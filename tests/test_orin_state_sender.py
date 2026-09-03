@@ -737,6 +737,69 @@ class Stm32CsvSafetyFlagsTest(unittest.TestCase):
             orin.CARTESIAN_P_COMMISSIONING_AUTHORIZATION,
         )
 
+    def test_fixed_cycle_readiness_reports_the_actual_controller_backend(self):
+        args = orin.parse_args(
+            [
+                "--resident-fixed-cycle-control-socket",
+                "/tmp/fixed-cycle.sock",
+                "--resident-act-socket",
+                "/tmp/act.sock",
+            ]
+        )
+
+        line = orin.format_resident_fixed_cycle_ready_line(
+            args,
+            SimpleNamespace(trajectory_controller_backend="cartesian_p"),
+        )
+
+        self.assertEqual(
+            line,
+            "RESIDENT_FIXED_CYCLE_READY "
+            "control_socket=/tmp/fixed-cycle.sock "
+            "act_socket=/tmp/act.sock "
+            "trajectory_controller_backend=cartesian_p",
+        )
+
+    def test_fixed_cycle_readiness_reports_declarative_mission_requirements(self):
+        args = orin.parse_args(
+            [
+                "--resident-fixed-cycle-control-socket",
+                "/tmp/fixed-cycle.sock",
+                "--resident-act-socket",
+                "/tmp/act.sock",
+            ]
+        )
+        mission = SimpleNamespace(
+            mission_id="fixed_target_hybrid",
+            requires_act_worker=True,
+            act_worker_behavior_id="act_dig_lift",
+            act_worker_model_sha256="a" * 64,
+            trajectory_controller_backend="onnx_rl",
+        )
+        plan = SimpleNamespace(mission=mission, mission_sha256="b" * 64)
+
+        line = orin.format_resident_fixed_cycle_ready_line(
+            args,
+            SimpleNamespace(trajectory_controller_backend="onnx_rl"),
+            plan,
+        )
+
+        self.assertIn("mission_id=fixed_target_hybrid", line)
+        self.assertIn(f"mission_sha256={'b' * 64}", line)
+        self.assertIn("act_worker_required=true", line)
+        self.assertIn("act_worker_behavior_id=act_dig_lift", line)
+        self.assertIn(f"act_worker_model_sha256={'a' * 64}", line)
+
+    def test_fixed_cycle_backend_mismatch_is_rejected_before_hardware(self):
+        mission = SimpleNamespace(trajectory_controller_backend="cartesian_p")
+        plan = SimpleNamespace(mission=mission)
+
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            orin.validate_resident_fixed_cycle_backend(
+                plan,
+                SimpleNamespace(trajectory_controller_backend="onnx_rl"),
+            )
+
     def test_commissioning_authorization_does_not_change_shadow_or_onnx_rl(self):
         for config in (
             SimpleNamespace(

@@ -8,10 +8,10 @@
   "onnx_path": "assets/policy.onnx",
   "trajectory_controller_backend": "onnx_rl",
   "mission_path": "assets/excavation_cycle.json",
-  "fixed_action_profile_path": "assets/fixed_actions.json",
-  "audit_path": "logs/edge_runtime.jsonl",
+  "fixed_action_profile_path": "fixed_actions.icra2027_fixed_dig.commissioning.json",
+  "audit_path": "logs/edge_runtime.fixed_dig.jsonl",
   "action_valid_for_ms": 300,
-  "follow_action_startup_slew_rate_per_s": 6.0,
+  "follow_action_startup_slew_rate_per_s": 20.0,
   "follow_action_slew_rate_per_s": 3.0,
   "remote_behavior": {
     "bind_host": "0.0.0.0",

@@ -24,6 +24,7 @@ from .resident_fixed_cycle import (
     FixedTrajectoryTemplate,
     ResidentFixedCycleCoordinator,
 )
+from ._resident_mission_definition import behavior_contract
 
 
 LOGGER = logging.getLogger("edge_runtime.resident_fixed_cycle")
@@ -165,7 +166,10 @@ class ResidentFixedCycleRuntime:
             if not self._core.is_operational:
                 self._fail("RESIDENT_CORE_NOT_OPERATIONAL")
                 return self._coordinator.snapshot
-            if snapshot.stage in {"ACT_DIG", "ACT_FULL_CYCLE"}:
+            if (
+                snapshot.active_behavior_id
+                and behavior_contract(snapshot.active_behavior_id).adapter == "act"
+            ):
                 self._advance_act()
             self._dispatch_pending_if_ready()
             return self._coordinator.snapshot
@@ -202,9 +206,16 @@ class ResidentFixedCycleRuntime:
     def activate_act(self, *, max_steps: int) -> None:
         if self._act_worker_ready() is not True:
             raise RuntimeError("resident ACT worker is not ready")
+        behavior_id = self._coordinator.snapshot.active_behavior_id
+        completion_contract = behavior_contract(behavior_id)
 
         def claim_act() -> int:
-            return self._core.activate_act(max_steps=max_steps)
+            return self._core.activate_act(
+                max_steps=max_steps,
+                allow_deadzone_early_completion=(
+                    completion_contract.allow_deadzone_early_completion
+                ),
+            )
 
         self._active_act_generation = self._behavior_executor.run_when_idle(
             claim_act
@@ -215,8 +226,8 @@ class ResidentFixedCycleRuntime:
         self._act_was_active = bool(self._core.act_is_active)
 
     def start_fixed_action(self, behavior: str) -> None:
-        if behavior != "ExecuteDump":
-            raise ValueError("V3-A fixed cycle only permits ExecuteDump")
+        if behavior not in {"ExecuteDig", "ExecuteDump"}:
+            raise ValueError("resident fixed cycle only permits ExecuteDig/ExecuteDump")
         self._queue_behavior("fixed_action", behavior)
         self._active_follow_target_id = ""
         self._visualization = None
@@ -324,9 +335,7 @@ class ResidentFixedCycleRuntime:
             snapshot = self._coordinator.snapshot
             if snapshot.terminal:
                 return
-            child = (
-                "fixed_action" if snapshot.stage == "EXECUTE_DUMP" else "follow"
-            )
+            child = behavior_contract(snapshot.active_behavior_id).adapter
             if event_type == "result":
                 self._active_follow_target_id = ""
                 self._visualization = None

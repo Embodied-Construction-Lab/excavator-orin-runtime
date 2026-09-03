@@ -25,7 +25,12 @@ import stat
 import threading
 from typing import Callable
 
-from .resident_protocol import MAX_CANDIDATE_BYTES, decode_motion_candidate
+from .resident_protocol import (
+    MAX_CANDIDATE_BYTES,
+    ResidentActWorkerIdentity,
+    decode_act_worker_identity,
+    decode_motion_candidate,
+)
 from .resident_state import MAX_RESIDENT_STATE_BYTES, decode_resident_state
 
 
@@ -44,6 +49,7 @@ class ResidentActDataLink:
         *,
         on_candidate: Callable[[bytes], object],
         on_connection_lost: Callable[[], object] | None = None,
+        expected_worker_identity: ResidentActWorkerIdentity | None = None,
     ) -> None:
         path = Path(socket_path)
         if not path.is_absolute():
@@ -54,6 +60,10 @@ class ResidentActDataLink:
             raise ValueError("on_candidate must be a callback")
         if on_connection_lost is not None and not callable(on_connection_lost):
             raise ValueError("on_connection_lost must be a callback")
+        if expected_worker_identity is not None and not isinstance(
+            expected_worker_identity, ResidentActWorkerIdentity
+        ):
+            raise ValueError("expected_worker_identity is invalid")
         if MAX_RESIDENT_STATE_BYTES != MAX_FRAME_BYTES:
             raise RuntimeError("resident state and data-link frame limits disagree")
         if MAX_CANDIDATE_BYTES != MAX_FRAME_BYTES:
@@ -62,10 +72,12 @@ class ResidentActDataLink:
         self._path = path
         self._on_candidate = on_candidate
         self._on_connection_lost = on_connection_lost
+        self._expected_worker_identity = expected_worker_identity
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._listener: socket.socket | None = None
         self._active_connection: socket.socket | None = None
+        self._active_worker_identity: ResidentActWorkerIdentity | None = None
         self._accept_thread: threading.Thread | None = None
         self._connection_threads: set[threading.Thread] = set()
         self._ready = False
@@ -88,7 +100,15 @@ class ResidentActDataLink:
     @property
     def connected(self) -> bool:
         with self._lock:
-            return self._active_connection is not None
+            return self._active_connection is not None and (
+                self._expected_worker_identity is None
+                or self._active_worker_identity == self._expected_worker_identity
+            )
+
+    @property
+    def active_worker_identity(self) -> ResidentActWorkerIdentity | None:
+        with self._lock:
+            return self._active_worker_identity
 
     @property
     def rejected_connection_count(self) -> int:
@@ -152,6 +172,7 @@ class ResidentActDataLink:
             self._listener = None
             active = self._active_connection
             self._active_connection = None
+            self._active_worker_identity = None
             accept_thread = self._accept_thread
             connection_threads = tuple(self._connection_threads)
 
@@ -245,9 +266,10 @@ class ResidentActDataLink:
         outbound_offset = 0
         outbound_revision = 0
         last_sent_revision = 0
+        authenticated = self._expected_worker_identity is None
         try:
             while not self._stop.is_set():
-                if not outbound:
+                if authenticated and not outbound:
                     outbound, outbound_revision = self._next_state_frame(
                         last_sent_revision
                     )
@@ -271,9 +293,10 @@ class ResidentActDataLink:
                     if not chunk:
                         break
                     receive_buffer.extend(chunk)
-                    expected_payload_bytes = self._consume_inbound_frames(
+                    expected_payload_bytes, authenticated = self._consume_inbound_frames(
                         receive_buffer,
                         expected_payload_bytes,
+                        authenticated=authenticated,
                     )
                 if writable and outbound:
                     sent = connection.send(outbound[outbound_offset:])
@@ -293,9 +316,11 @@ class ResidentActDataLink:
                 notify_connection_lost = (
                     self._active_connection is connection
                     and not self._stop.is_set()
+                    and authenticated
                 )
                 if self._active_connection is connection:
                     self._active_connection = None
+                    self._active_worker_identity = None
                 self._connection_threads.discard(threading.current_thread())
             if notify_connection_lost and self._on_connection_lost is not None:
                 try:
@@ -321,11 +346,13 @@ class ResidentActDataLink:
         self,
         receive_buffer: bytearray,
         expected_payload_bytes: int | None,
-    ) -> int | None:
+        *,
+        authenticated: bool,
+    ) -> tuple[int | None, bool]:
         while True:
             if expected_payload_bytes is None:
                 if len(receive_buffer) < _HEADER_BYTES:
-                    return None
+                    return None, authenticated
                 expected_payload_bytes = int.from_bytes(
                     receive_buffer[:_HEADER_BYTES],
                     "big",
@@ -334,10 +361,18 @@ class ResidentActDataLink:
                 if not 0 < expected_payload_bytes <= MAX_FRAME_BYTES:
                     raise ValueError("ACT worker frame length is invalid")
             if len(receive_buffer) < expected_payload_bytes:
-                return expected_payload_bytes
+                return expected_payload_bytes, authenticated
             payload = bytes(receive_buffer[:expected_payload_bytes])
             del receive_buffer[:expected_payload_bytes]
             expected_payload_bytes = None
+            if not authenticated:
+                identity = decode_act_worker_identity(payload)
+                if identity != self._expected_worker_identity:
+                    raise ValueError("ACT worker identity does not match Mission")
+                with self._lock:
+                    self._active_worker_identity = identity
+                authenticated = True
+                continue
             decode_motion_candidate(payload)
             try:
                 self._on_candidate(payload)

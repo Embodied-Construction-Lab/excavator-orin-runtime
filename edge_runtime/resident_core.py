@@ -105,6 +105,7 @@ class ResidentControlSnapshot:
 class _ActSegmentTracker:
     generation: int | None = None
     max_steps: int | None = None
+    allow_deadzone_early_completion: bool = False
     completed_steps: int = 0
     complete: bool = False
     final_command_seq: int | None = None
@@ -326,23 +327,34 @@ class ResidentMotionCore:
         self,
         *,
         max_steps: int | None = None,
+        allow_deadzone_early_completion: bool = False,
         now_monotonic_ns: int | None = None,
     ) -> int:
         validated_steps = _optional_act_step_budget(max_steps)
+        if not isinstance(allow_deadzone_early_completion, bool):
+            raise ValueError("allow_deadzone_early_completion must be boolean")
         with self._control_lock:
             generation = self._act.begin_activation(
                 now_monotonic_ns=now_monotonic_ns
             )
             current = self._act_segment
             if current.generation == generation:
-                if current.max_steps != validated_steps:
+                if (
+                    current.max_steps != validated_steps
+                    or current.allow_deadzone_early_completion
+                    is not allow_deadzone_early_completion
+                ):
                     raise ValueError(
-                        "the active ACT segment budget cannot be changed"
+                        "the active ACT segment budget or completion contract "
+                        "cannot be changed"
                     )
                 return generation
             self._act_segment = _ActSegmentTracker(
                 generation=generation,
                 max_steps=validated_steps,
+                allow_deadzone_early_completion=(
+                    allow_deadzone_early_completion
+                ),
             )
             return generation
 
@@ -378,6 +390,9 @@ class ResidentMotionCore:
                 early_completion_min_steps=(
                     self._act_early_completion_min_steps
                 ),
+                allow_deadzone_early_completion=(
+                    segment.allow_deadzone_early_completion
+                ),
             )
             self._act_segment = update.tracker
             self._audit_act_step(update, result)
@@ -396,6 +411,9 @@ class ResidentMotionCore:
             "max_steps": segment.max_steps,
             "manual_deadzone_contract_enabled": (
                 self._manual_action_deadzone_contract is not None
+            ),
+            "deadzone_early_completion_enabled": (
+                segment.allow_deadzone_early_completion
             ),
         }
         emit_action_audit(
@@ -561,6 +579,7 @@ def _advance_act_segment(
     manual_action_deadzone_contract: ManualActionDeadzoneContract | None,
     early_completion_chunk_steps: int,
     early_completion_min_steps: int,
+    allow_deadzone_early_completion: bool,
 ) -> _ActStepUpdate:
     completed_steps = segment.completed_steps + 1
     all_axes_in_deadzone = _action_within_manual_deadzone_contract(
@@ -574,7 +593,8 @@ def _advance_act_segment(
         segment.max_steps is not None and completed_steps >= segment.max_steps
     )
     deadzone_chunk_due = (
-        manual_action_deadzone_contract is not None
+        allow_deadzone_early_completion
+        and manual_action_deadzone_contract is not None
         and segment.max_steps is not None
         and completed_steps < segment.max_steps
         and segment.completed_steps >= early_completion_min_steps

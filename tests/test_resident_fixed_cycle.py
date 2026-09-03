@@ -1,80 +1,45 @@
-import hashlib
-import json
-from pathlib import Path
-
 import pytest
 
+from fixed_cycle_v5_support import plan_document
 from edge_runtime.resident_fixed_cycle import (
     FixedCyclePlan,
-    FixedTrajectoryTemplate,
     ResidentFixedCycle,
     ResidentFixedCycleCoordinator,
-    load_fixed_cycle_plan,
-    load_fixed_cycle_registry,
-    verify_fixed_cycle_artifacts,
 )
 
 
-def _artifact(target_id: str, phase: str) -> dict[str, object]:
-    return {
-        "trajectory_id": f"field-{target_id}-v1",
-        "phase": phase,
-        "path": f"/opt/excavator-trajectories/{target_id}.json",
-        "sha256": ("a" if phase == "dig" else "b") * 64,
-    }
-
-
 def _plan_document() -> dict[str, object]:
-    return {
-        "schema_version": "resident_fixed_cycle_plan.v1",
-        "plan_id": "field-cycle-v3a",
-        "validation_status": "field_validated",
-        "dig_sequence": ["dig_01", "dig_02", "dig_03"],
-        "act_max_steps": 130,
-        "trajectories": {
-            "dig_01": _artifact("dig_01", "dig"),
-            "dig_02": _artifact("dig_02", "dig"),
-            "dig_03": _artifact("dig_03", "dig"),
-            "dump": _artifact("dump", "dump"),
-        },
-    }
+    return plan_document()
 
 
 def _plan() -> FixedCyclePlan:
     return FixedCyclePlan.from_mapping(_plan_document())
 
 
-def _act_full_cycle_plan() -> FixedCyclePlan:
-    document = _plan_document()
-    document["schema_version"] = "resident_fixed_cycle_plan.v2"
-    document["mission_profile"] = "act_full_cycle"
-    del document["trajectories"]["dump"]
-    document["act_max_steps"] = 240
-    return FixedCyclePlan.from_mapping(document)
+def _act_dig_transport_dump_reference_plan() -> FixedCyclePlan:
+    return FixedCyclePlan.from_mapping(
+        plan_document(mission_id="engineering_act_transport_reference")
+    )
+
+
+def _fixed_dig_plan() -> FixedCyclePlan:
+    return FixedCyclePlan.from_mapping(
+        plan_document(mission_id="fixed_dig_hybrid")
+    )
 
 
 def _eight_point_plan() -> FixedCyclePlan:
-    document = _plan_document()
     point_ids = [
         *(f"dig_near_{index:02d}" for index in range(1, 5)),
         *(f"dig_far_{index:02d}" for index in range(1, 5)),
     ]
-    document.update(
-        {
-            "schema_version": "resident_fixed_cycle_plan.v3",
-            "mission_profile": "regime_factorized",
-            "dig_sequence": point_ids,
-            "default_dig_group": "all",
-            "dig_groups": {
-                "all": point_ids,
-                "near": point_ids[:4],
-                "far": point_ids[4:],
-            },
-            "trajectories": {
-                **{target_id: _artifact(target_id, "dig") for target_id in point_ids},
-                "dump": _artifact("dump", "dump"),
-            },
-        }
+    document = plan_document(
+        point_ids=tuple(point_ids),
+        dig_groups={
+            "all": point_ids,
+            "near": point_ids[:4],
+            "far": point_ids[4:],
+        },
     )
     return FixedCyclePlan.from_mapping(document)
 
@@ -114,17 +79,17 @@ def test_selected_dig_group_is_frozen_for_the_complete_cycle() -> None:
     assert cycle.snapshot.dig_group_id == "near"
 
 
-def test_act_full_cycle_is_parallel_to_regime_factorized_mission() -> None:
-    cycle = ResidentFixedCycle(_act_full_cycle_plan())
+def test_act_transport_reference_is_parallel_to_regime_factorized_mission() -> None:
+    cycle = ResidentFixedCycle(_act_dig_transport_dump_reference_plan())
 
     directive = cycle.start(
-        run_id="run-act-full-cycle",
+        run_id="run-act-dig-transport-dump-reference",
         requested_cycles=1,
         first_dig_point_id="dig_01",
     )
-    assert directive.stage == "FOLLOW_DIG"
+    assert directive.stage == "TRACK_DIG"
     assert directive.target_id == "dig_01"
-    assert cycle.snapshot.mission_profile == "act_full_cycle"
+    assert cycle.snapshot.mission_id == "engineering_act_transport_reference"
 
     directive = cycle.record_child_result(
         child="follow",
@@ -132,18 +97,18 @@ def test_act_full_cycle_is_parallel_to_regime_factorized_mission() -> None:
         reason_code="SUCCEEDED",
         quiescence_confirmed=True,
     )
-    assert directive.stage == "ACT_FULL_CYCLE"
+    assert directive.stage == "ACT_DIG_TRANSPORT_DUMP"
     assert directive.child == "act"
-    assert directive.max_steps == 240
+    assert directive.max_steps == 260
 
     directive = cycle.record_child_result(
         child="act",
         outcome="SUCCEEDED",
         reason_code="STEP_BUDGET_REACHED",
         quiescence_confirmed=True,
-        completed_steps=240,
+        completed_steps=260,
     )
-    assert directive.stage == "FOLLOW_DIG"
+    assert directive.stage == "RETURN_DIG"
     assert directive.target_id == "dig_01"
 
     terminal = cycle.record_child_result(
@@ -167,171 +132,50 @@ def test_act_full_cycle_is_parallel_to_regime_factorized_mission() -> None:
     assert primary_act.stage == "ACT_DIG"
 
 
-def test_plan_loader_is_strict_and_requires_field_validated_artifacts(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "resident-cycle.json"
-    path.write_text(json.dumps(_plan_document()), encoding="utf-8")
+def test_fixed_dig_profile_uses_execute_dig_before_follow_dump() -> None:
+    cycle = ResidentFixedCycle(_fixed_dig_plan())
 
-    plan = load_fixed_cycle_plan(path)
-
-    assert plan.plan_id == "field-cycle-v3a"
-    assert plan.dig_sequence == ("dig_01", "dig_02", "dig_03")
-    assert plan.act_max_steps == 130
-    assert plan.trajectories["dump"].phase == "dump"
-
-    invalid = _plan_document()
-    invalid["unexpected"] = True
-    with pytest.raises(ValueError, match="fields"):
-        FixedCyclePlan.from_mapping(invalid)
-
-    unvalidated = _plan_document()
-    unvalidated["validation_status"] = "uncommissioned"
-    with pytest.raises(ValueError, match="field_validated"):
-        FixedCyclePlan.from_mapping(unvalidated)
-
-
-def test_plan_rejects_missing_target_hash_drift_and_non_absolute_paths() -> None:
-    missing = _plan_document()
-    del missing["trajectories"]["dig_03"]
-    with pytest.raises(ValueError, match="exactly match"):
-        FixedCyclePlan.from_mapping(missing)
-
-    bad_hash = _plan_document()
-    bad_hash["trajectories"]["dump"]["sha256"] = "not-a-digest"
-    with pytest.raises(ValueError, match="sha256"):
-        FixedCyclePlan.from_mapping(bad_hash)
-
-    relative = _plan_document()
-    relative["trajectories"]["dig_01"]["path"] = "dig_01.json"
-    with pytest.raises(ValueError, match="absolute"):
-        FixedCyclePlan.from_mapping(relative)
-
-
-def test_artifact_preflight_hashes_every_trajectory_before_motion(tmp_path: Path) -> None:
-    document = _plan_document()
-    for target_id, artifact in document["trajectories"].items():
-        path = tmp_path / f"{target_id}.json"
-        payload = json.dumps({"target_id": target_id}).encode("utf-8")
-        path.write_bytes(payload)
-        artifact["path"] = str(path)
-        artifact["sha256"] = hashlib.sha256(payload).hexdigest()
-    plan = FixedCyclePlan.from_mapping(document)
-
-    verify_fixed_cycle_artifacts(plan)
-
-    Path(plan.trajectories["dump"].path).write_text("changed", encoding="utf-8")
-    with pytest.raises(ValueError, match="sha256 mismatch"):
-        verify_fixed_cycle_artifacts(plan)
-
-
-def test_artifact_preflight_rejects_symbolic_links(tmp_path: Path) -> None:
-    document = _plan_document()
-    for target_id, artifact in document["trajectories"].items():
-        path = tmp_path / f"{target_id}.json"
-        path.write_text(target_id, encoding="utf-8")
-        artifact["path"] = str(path)
-        artifact["sha256"] = hashlib.sha256(target_id.encode()).hexdigest()
-    real = tmp_path / "dig_01.json"
-    link = tmp_path / "dig_01-link.json"
-    link.symlink_to(real)
-    document["trajectories"]["dig_01"]["path"] = str(link)
-    plan = FixedCyclePlan.from_mapping(document)
-
-    with pytest.raises(ValueError, match="regular non-symbolic-link"):
-        verify_fixed_cycle_artifacts(plan)
-
-
-def test_registry_loads_strict_field_validated_trajectory_templates(
-    tmp_path: Path,
-) -> None:
-    document = _plan_document()
-    for target_id, artifact in document["trajectories"].items():
-        phase = "dump" if target_id == "dump" else "dig"
-        template = {
-            "schema_version": "resident_fixed_trajectory.v1",
-            "trajectory_id": artifact["trajectory_id"],
-            "validation_status": "field_validated",
-            "phase": phase,
-            "frame_id": "machine_root_ros",
-            "mission_id": "field_cycle_001",
-            "mission_sha256": "c" * 64,
-            "task_mode": "CarryMaterial" if phase == "dump" else "MoveToDig",
-            "control_stage": "commissioning",
-            "workspace_constraint": "field_validated",
-            "waypoints": [[0.2, 0.0, 0.1], [1.0, 0.0, 0.0]],
-            "waypoint_tolerance_m": 0.25,
-            "waypoint_dwell_s": 0.0,
-            "tracking_timeout_s": 60.0,
-        }
-        payload = json.dumps(template, sort_keys=True).encode("utf-8")
-        path = tmp_path / f"{target_id}.json"
-        path.write_bytes(payload)
-        artifact["path"] = str(path)
-        artifact["sha256"] = hashlib.sha256(payload).hexdigest()
-
-    registry = load_fixed_cycle_registry(FixedCyclePlan.from_mapping(document))
-
-    assert tuple(registry) == ("dig_01", "dig_02", "dig_03", "dump")
-    assert isinstance(registry["dig_01"], FixedTrajectoryTemplate)
-    assert registry["dig_01"].waypoints[-1] == (1.0, 0.0, 0.0)
-    assert registry["dig_01"].intermediate_waypoint_tolerance_m == 0.25
-    assert registry["dump"].task_mode == "CarryMaterial"
-
-    invalid = json.loads(
-        Path(document["trajectories"]["dig_02"]["path"]).read_text()
+    directive = cycle.start(
+        run_id="run-fixed-dig",
+        requested_cycles=1,
+        first_dig_point_id="dig_01",
     )
-    invalid["validation_status"] = "uncommissioned"
-    invalid_payload = json.dumps(invalid, sort_keys=True).encode("utf-8")
-    invalid_path = Path(document["trajectories"]["dig_02"]["path"])
-    invalid_path.write_bytes(invalid_payload)
-    document["trajectories"]["dig_02"]["sha256"] = hashlib.sha256(
-        invalid_payload
-    ).hexdigest()
+    assert directive.stage == "TRACK_DIG"
+    assert directive.target_id == "dig_01"
+    assert cycle.snapshot.mission_id == "fixed_dig_hybrid"
 
-    with pytest.raises(ValueError, match="field_validated"):
-        load_fixed_cycle_registry(FixedCyclePlan.from_mapping(document))
+    directive = cycle.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+    assert directive.stage == "FIXED_DIG"
+    assert directive.child == "fixed_action"
+    assert directive.behavior == "ExecuteDig"
+
+    directive = cycle.record_child_result(
+        child="fixed_action",
+        outcome="SUCCEEDED",
+        reason_code="SEQUENCE_COMPLETED",
+        quiescence_confirmed=True,
+    )
+    assert directive.stage == "TRACK_DUMP"
+    assert directive.child == "follow"
+    assert directive.target_id == "dump"
 
 
-def test_candidate_plan_requires_explicit_commissioning_loader(
-    tmp_path: Path,
-) -> None:
-    document = _plan_document()
-    document["validation_status"] = "candidate"
-    for target_id, artifact in document["trajectories"].items():
-        phase = "dump" if target_id == "dump" else "dig"
-        template = {
-            "schema_version": "resident_fixed_trajectory.v1",
-            "trajectory_id": artifact["trajectory_id"],
-            "validation_status": "candidate",
-            "phase": phase,
-            "frame_id": "machine_root_ros",
-            "mission_id": "field_cycle_001",
-            "mission_sha256": "c" * 64,
-            "task_mode": "CarryMaterial" if phase == "dump" else "MoveToDig",
-            "control_stage": "commissioning",
-            "workspace_constraint": "disabled_by_operator",
-            "waypoints": [[1.0, 0.0, 0.0]],
-            "waypoint_tolerance_m": 0.25,
-            "waypoint_dwell_s": 0.0,
-            "tracking_timeout_s": 60.0,
-        }
-        payload = json.dumps(template, sort_keys=True).encode("utf-8")
-        path = tmp_path / f"{target_id}.json"
-        path.write_bytes(payload)
-        artifact["path"] = str(path)
-        artifact["sha256"] = hashlib.sha256(payload).hexdigest()
-    plan_path = tmp_path / "candidate-plan.json"
-    plan_path.write_text(json.dumps(document), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="field_validated"):
-        load_fixed_cycle_plan(plan_path)
-
-    plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
-    registry = load_fixed_cycle_registry(plan, allow_candidate=True)
-
-    assert plan.validation_status == "candidate"
-    assert all(item.validation_status == "candidate" for item in registry.values())
+def test_legacy_profile_plans_are_not_executable() -> None:
+    for legacy_schema in (
+        "resident_fixed_cycle_plan.v1",
+        "resident_fixed_cycle_plan.v2",
+        "resident_fixed_cycle_plan.v3",
+        "resident_fixed_cycle_plan.v4",
+    ):
+        document = _plan_document()
+        document["schema_version"] = legacy_schema
+        with pytest.raises(ValueError, match="unsupported.*schema"):
+            FixedCyclePlan.from_mapping(document)
 
 
 def test_three_cycles_advance_locally_without_per_stage_external_commands() -> None:
@@ -345,7 +189,7 @@ def test_three_cycles_advance_locally_without_per_stage_external_commands() -> N
     observed = [(directive.stage, directive.target_id)]
 
     for expected_dig in ("dig_01", "dig_02", "dig_03"):
-        assert directive.stage == "FOLLOW_DIG"
+        assert directive.stage in {"TRACK_DIG", "RETURN_DIG"}
         assert directive.target_id == expected_dig
         directive = cycle.record_child_result(
             child="follow",
@@ -365,7 +209,7 @@ def test_three_cycles_advance_locally_without_per_stage_external_commands() -> N
             completed_steps=130,
         )
         observed.append((directive.stage, directive.target_id))
-        assert directive.stage == "FOLLOW_DUMP"
+        assert directive.stage == "TRACK_DUMP"
         assert directive.target_id == "dump"
 
         directive = cycle.record_child_result(
@@ -375,7 +219,7 @@ def test_three_cycles_advance_locally_without_per_stage_external_commands() -> N
             quiescence_confirmed=True,
         )
         observed.append((directive.stage, directive.behavior))
-        assert directive.stage == "EXECUTE_DUMP"
+        assert directive.stage == "FIXED_DUMP"
         assert directive.behavior == "ExecuteDump"
 
         directive = cycle.record_child_result(
@@ -388,7 +232,7 @@ def test_three_cycles_advance_locally_without_per_stage_external_commands() -> N
             observed.append((directive.stage, directive.target_id))
 
     assert directive is not None
-    assert directive.stage == "FOLLOW_DIG"
+    assert directive.stage == "RETURN_DIG"
     assert directive.target_id == "dig_03"
     directive = cycle.record_child_result(
         child="follow",
@@ -401,11 +245,11 @@ def test_three_cycles_advance_locally_without_per_stage_external_commands() -> N
     assert cycle.snapshot.stage == "COMPLETED"
     assert cycle.snapshot.completed_cycles == 3
     assert cycle.snapshot.outcome == "SUCCEEDED"
-    assert [item for item in observed if item[0] == "FOLLOW_DIG"] == [
-        ("FOLLOW_DIG", "dig_01"),
-        ("FOLLOW_DIG", "dig_02"),
-        ("FOLLOW_DIG", "dig_03"),
-        ("FOLLOW_DIG", "dig_03"),
+    assert [item for item in observed if item[0] in {"TRACK_DIG", "RETURN_DIG"}] == [
+        ("TRACK_DIG", "dig_01"),
+        ("RETURN_DIG", "dig_02"),
+        ("RETURN_DIG", "dig_03"),
+        ("RETURN_DIG", "dig_03"),
     ]
 
 
@@ -432,7 +276,7 @@ def test_requested_cycle_count_wraps_the_fixed_dig_sequence() -> None:
             completed_steps=steps,
         )
 
-    assert directive.stage == "FOLLOW_DIG"
+    assert directive.stage == "RETURN_DIG"
     assert directive.target_id == "dig_01"
 
 
@@ -459,7 +303,7 @@ def test_final_cycle_returns_to_its_dig_point_before_completion() -> None:
         )
 
     assert directive is not None
-    assert directive.stage == "FOLLOW_DIG"
+    assert directive.stage == "RETURN_DIG"
     assert directive.target_id == "dig_02"
     assert cycle.snapshot.completed_cycles == 1
     assert cycle.snapshot.terminal is False
@@ -549,8 +393,31 @@ def test_act_accepts_a_confirmed_deadzone_chunk_before_the_step_budget() -> None
     )
 
     assert directive is not None
-    assert directive.stage == "FOLLOW_DUMP"
-    assert cycle.snapshot.stage == "FOLLOW_DUMP"
+    assert directive.stage == "TRACK_DUMP"
+    assert cycle.snapshot.stage == "TRACK_DUMP"
+
+
+def test_act_transport_reference_rejects_deadzone_completion_before_budget() -> None:
+    cycle = ResidentFixedCycle(_act_dig_transport_dump_reference_plan())
+    cycle.start(run_id="run-long-act", requested_cycles=1)
+    cycle.record_child_result(
+        child="follow",
+        outcome="SUCCEEDED",
+        reason_code="SUCCEEDED",
+        quiescence_confirmed=True,
+    )
+
+    directive = cycle.record_child_result(
+        child="act",
+        outcome="SUCCEEDED",
+        reason_code="DEADZONE_CHUNK_REACHED",
+        quiescence_confirmed=True,
+        completed_steps=101,
+    )
+
+    assert directive is None
+    assert cycle.snapshot.stage == "FAILED"
+    assert cycle.snapshot.reason_code == "ACT_STEP_BUDGET_MISMATCH"
 
 
 def test_coordinator_dispatches_the_whole_local_cycle_from_one_start() -> None:
@@ -605,11 +472,11 @@ def test_coordinator_dispatches_the_whole_local_cycle_from_one_start() -> None:
     )
 
     assert calls == [
-        ("follow", "field-dig_01-v1"),
+        ("follow", "fixed_target_hybrid-test-catalog:dig_01"),
         ("act", 130),
-        ("follow", "field-dump-v1"),
+        ("follow", "fixed_target_hybrid-test-catalog:dump"),
         ("fixed", "ExecuteDump"),
-        ("follow", "field-dig_01-v1"),
+        ("follow", "fixed_target_hybrid-test-catalog:dig_01"),
         ("disarm",),
     ]
     assert coordinator.snapshot.stage == "COMPLETED"
@@ -638,6 +505,7 @@ def test_cancel_disarms_before_publishing_terminal_state() -> None:
 
     assert events == ["follow", "disarm"]
     assert coordinator.snapshot.stage == "CANCELLED"
+    assert coordinator.snapshot.active_behavior_id == ""
     assert coordinator.snapshot.terminal is True
 
 
@@ -666,5 +534,6 @@ def test_local_dispatch_failure_fails_cycle_and_requests_terminal_disarm() -> No
     assert "driver detail" not in str(raised.value)
     assert events == ["follow", "disarm"]
     assert coordinator.snapshot.stage == "FAILED"
+    assert coordinator.snapshot.active_behavior_id == ""
     assert coordinator.snapshot.reason_code == "LOCAL_DISPATCH_FAILED"
     assert coordinator.snapshot.terminal is True

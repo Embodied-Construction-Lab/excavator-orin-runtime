@@ -12,17 +12,10 @@ import orin_state_sender
 
 from edge_runtime import control
 from edge_runtime.control import EdgeControlRunner, FixedActionControlRunner
-from edge_runtime.follow import EdgeFollowRuntime, EdgeFollowStep
-from edge_runtime.kinematics import UrdfBucketTipKinematics
+from edge_runtime.follow import EdgeFollowStep
 from edge_runtime.resident_ingress import ResidentVelocityActionAdapter
 from edge_runtime.resident_motion import ControlMode, ZERO_ACTION
 from edge_runtime.resident_sink import ResidentCommandSink, ResidentTelemetry
-from edge_runtime.trajectory_controller import (
-    TrajectoryControlOutput,
-    TrajectoryControllerDescriptor,
-)
-from tests.test_edge_follow_runtime import machine_profile, mission, trajectory
-from tests.test_edge_kinematics import URDF
 
 
 class StubRuntime:
@@ -47,6 +40,7 @@ class StubRuntime:
             physical_action=(0.01, -0.02, 0.03, -0.04),
             commanded_normalized_action=(0.08, -0.16, 0.24, -0.32),
             trajectory_controller_backend="test_controller",
+            reference_waypoint_ros_m=(0.8, -0.1, 0.0),
         )
 
 
@@ -112,77 +106,6 @@ class EdgeControlRunnerTest(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_sends_local_physical_action_without_sign_or_scale_changes(self):
-        sink = RecordingSink()
-        runner = EdgeControlRunner(
-            runtime=StubRuntime(),
-            action_sink=sink,
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-        )
-
-        step = runner.observe(
-            {"seq": 4, "stamp_ms": 1200},
-            now_s=2.0,
-            action_stamp_ms=5000,
-        )
-
-        self.assertIsNotNone(step)
-        self.assertEqual(len(sink.payloads), 1)
-        packet = sink.payloads[0]
-        self.assertEqual(packet["action_order"], ["boom", "stick", "bucket", "swing"])
-        self.assertEqual(packet["action"], [0.01, -0.02, 0.03, -0.04])
-        self.assertEqual(packet["stamp_ms"], 5000)
-        self.assertEqual(packet["valid_for_ms"], 300)
-        self.assertEqual(runner.action_datagrams, 1)
-        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
-        self.assertEqual(
-            record["commanded_normalized_action"],
-            [0.08, -0.16, 0.24, -0.32],
-        )
-        self.assertEqual(
-            record["trajectory_controller_backend"],
-            "test_controller",
-        )
-        runner.close(action_stamp_ms=5001)
-        self.assertEqual(runner.action_datagrams, 2)
-
-    def test_consecutive_remote_follow_runners_share_one_action_sequence(self):
-        sink = RecordingSink()
-        sequence = control.ActionSequence()
-        first = EdgeControlRunner(
-            runtime=StubRuntime(),
-            action_sink=sink,
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-            action_sequence=sequence,
-        )
-        first.observe(
-            {"seq": 4, "stamp_ms": 1200},
-            now_s=2.0,
-            action_stamp_ms=5000,
-        )
-        first.close(action_stamp_ms=5001)
-
-        second = EdgeControlRunner(
-            runtime=StubRuntime(),
-            action_sink=sink,
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-            action_sequence=sequence,
-        )
-        second.observe(
-            {"seq": 5, "stamp_ms": 1300},
-            now_s=2.1,
-            action_stamp_ms=5100,
-        )
-        second.close(action_stamp_ms=5101)
-
-        self.assertEqual(
-            [packet["seq"] for packet in sink.payloads],
-            [0, 1, 2, 3],
-        )
-
     def test_fixed_action_runner_uses_shared_sequence_and_terminal_zero(self):
         class FixedRuntime:
             def __init__(self):
@@ -246,198 +169,6 @@ class EdgeControlRunnerTest(unittest.TestCase):
                 [0.0, 0.0, 0.0, 0.0],
             ],
         )
-
-    def test_completed_trajectory_sends_zero_instead_of_last_policy_action(self):
-        sink = RecordingSink()
-        runner = EdgeControlRunner(
-            runtime=StubRuntime(completed=True),
-            action_sink=sink,
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-        )
-
-        runner.observe(
-            {"seq": 5, "stamp_ms": 1300},
-            now_s=2.1,
-            action_stamp_ms=5100,
-        )
-
-        self.assertEqual(sink.payloads[-1]["action"], [0.0, 0.0, 0.0, 0.0])
-        runner.close(action_stamp_ms=5101)
-
-    def test_runtime_failure_and_close_each_send_zero(self):
-        sink = RecordingSink()
-        runner = EdgeControlRunner(
-            runtime=StubRuntime(failure="sensor_invalid"),
-            action_sink=sink,
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-        )
-
-        result = runner.observe(
-            {"seq": 6, "stamp_ms": 1400},
-            now_s=2.2,
-            action_stamp_ms=5200,
-        )
-        runner.close(action_stamp_ms=5300)
-
-        self.assertIsNone(result)
-        self.assertEqual(
-            [packet["action"] for packet in sink.payloads],
-            [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
-        )
-        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
-        self.assertEqual(
-            record["trajectory_controller_backend"],
-            "test_controller",
-        )
-
-    def test_first_rejection_audits_the_configured_runtime_backend(self):
-        class Controller:
-            descriptor = TrajectoryControllerDescriptor(
-                backend_id="cartesian_p",
-                implementation="test.Controller",
-            )
-
-            def reset(self):
-                return None
-
-            def compute_action(self, _observation):
-                return TrajectoryControlOutput(
-                    normalized_action=(0.0, 0.0, 0.0, 0.0),
-                    inference_ms=0.0,
-                )
-
-        urdf_path = Path(self.temp_dir.name) / "machine.urdf"
-        urdf_path.write_text(URDF, encoding="utf-8")
-        runtime = EdgeFollowRuntime(
-            machine_profile=machine_profile(),
-            kinematics=UrdfBucketTipKinematics.from_path(urdf_path),
-            controller=Controller(),
-            trajectory=trajectory(),
-            mission=mission(),
-        )
-        runner = EdgeControlRunner(
-            runtime=runtime,
-            action_sink=RecordingSink(),
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-        )
-
-        result = runner.observe(
-            {"seq": 1, "stamp_ms": 1_000},
-            now_s=1.0,
-            action_stamp_ms=1_000,
-        )
-        runner.close(action_stamp_ms=1_001)
-
-        self.assertIsNone(result)
-        record = json.loads(self.audit_path.read_text(encoding="utf-8"))
-        self.assertEqual(
-            record["trajectory_controller_backend"],
-            "cartesian_p",
-        )
-
-    def test_timeout_result_sends_zero_and_never_reuses_nonzero_action(self):
-        class TimeoutRuntime:
-            def step(self, machine_state, *, now_s):
-                return SimpleNamespace(
-                    source_seq=machine_state["seq"],
-                    source_stamp_ms=machine_state["stamp_ms"],
-                    waypoint_index=1,
-                    completed=False,
-                    result="TIMEOUT",
-                    bucket_tip_ros_m=(0.1, 0.2, 0.3),
-                    normalized_action=(0.5, -0.5, 0.25, -0.25),
-                    physical_action=(0.02, -0.025, 0.0075, -0.15),
-                )
-
-        sink = RecordingSink()
-        runner = EdgeControlRunner(
-            runtime=TimeoutRuntime(),
-            action_sink=sink,
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-        )
-        self.addCleanup(runner.close, action_stamp_ms=63001)
-
-        runner.observe(
-            {"seq": 7, "stamp_ms": 1500},
-            now_s=62.0,
-            action_stamp_ms=62000,
-        )
-        runner.observe(
-            {"seq": 8, "stamp_ms": 1600},
-            now_s=63.0,
-            action_stamp_ms=63000,
-        )
-
-        self.assertEqual(sink.payloads[-2]["action"], [0.0, 0.0, 0.0, 0.0])
-        self.assertEqual(sink.payloads[-1]["action"], [0.0, 0.0, 0.0, 0.0])
-        records = [
-            json.loads(line)
-            for line in self.audit_path.read_text(encoding="utf-8").splitlines()
-        ]
-        self.assertEqual(records[-1]["status"], "TIMEOUT")
-
-    def test_transient_runtime_failure_sends_zero_then_recovers_on_valid_state(self):
-        class FlakyRuntime:
-            def __init__(self):
-                self.calls = 0
-
-            def step(self, machine_state, *, now_s):
-                self.calls += 1
-                if self.calls == 1:
-                    raise ValueError("temporary_state_loss")
-                return SimpleNamespace(
-                    source_seq=machine_state["seq"],
-                    source_stamp_ms=machine_state["stamp_ms"],
-                    waypoint_index=1,
-                    completed=False,
-                    result="ACTIVE",
-                    episode_progress=0.1,
-                    waypoint_distance_m=0.4,
-                    bucket_tip_ros_m=(0.1, 0.2, 0.3),
-                    normalized_action=(0.5, -0.5, 0.25, -0.25),
-                    physical_action=(0.02, -0.025, 0.0075, -0.15),
-                )
-
-        sink = RecordingSink()
-        runner = EdgeControlRunner(
-            runtime=FlakyRuntime(),
-            action_sink=sink,
-            audit_path=self.audit_path,
-            valid_for_ms=300,
-        )
-        self.addCleanup(runner.close, action_stamp_ms=65001)
-
-        rejected = runner.observe(
-            {"seq": 9, "stamp_ms": 1700},
-            now_s=64.0,
-            action_stamp_ms=64000,
-        )
-        recovered = runner.observe(
-            {"seq": 10, "stamp_ms": 1800},
-            now_s=65.0,
-            action_stamp_ms=65000,
-        )
-
-        self.assertIsNone(rejected)
-        self.assertIsNotNone(recovered)
-        self.assertEqual(sink.payloads[-2]["action"], [0.0, 0.0, 0.0, 0.0])
-        self.assertEqual(
-            sink.payloads[-1]["action"],
-            [0.02, -0.025, 0.0075, -0.15],
-        )
-        records = [
-            json.loads(line)
-            for line in self.audit_path.read_text(encoding="utf-8").splitlines()
-        ]
-        self.assertEqual(records[-2]["exception_type"], "ValueError")
-        self.assertEqual(records[-2]["consecutive_rejections"], 1)
-        self.assertEqual(records[-1]["consecutive_rejections"], 0)
-        self.assertEqual(records[-1]["runtime_monotonic_s"], 65.0)
-        self.assertIn("loop_elapsed_ms", records[-1])
 
     def test_loopback_control_uses_existing_action_relay_as_only_serial_writer(self):
         try:

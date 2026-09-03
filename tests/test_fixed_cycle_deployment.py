@@ -79,26 +79,154 @@ def _write_eight_point_catalog(root: Path) -> Path:
     return path
 
 
+def _write_mission_definition(
+    root: Path,
+    mission_id: str = "fixed_target_hybrid",
+) -> Path:
+    tracking = "onnx_rl_tracking"
+    if mission_id == "engineering_act_transport_reference":
+        cycle = [
+            {
+                "stage_id": "DIG_TRANSPORT_DUMP",
+                "behavior_id": "act_dig_transport_dump",
+                "target_role": None,
+                "max_steps": 260,
+            },
+            {
+                "stage_id": "RETURN_DIG",
+                "behavior_id": tracking,
+                "target_role": "return_dig",
+                "max_steps": None,
+            },
+        ]
+    elif mission_id == "fixed_dig_hybrid":
+        cycle = [
+            {
+                "stage_id": "FIXED_DIG",
+                "behavior_id": "fixed_dig",
+                "target_role": None,
+                "max_steps": None,
+            },
+            {
+                "stage_id": "TRACK_DUMP",
+                "behavior_id": tracking,
+                "target_role": "dump",
+                "max_steps": None,
+            },
+            {
+                "stage_id": "FIXED_DUMP",
+                "behavior_id": "fixed_dump",
+                "target_role": None,
+                "max_steps": None,
+            },
+            {
+                "stage_id": "RETURN_DIG",
+                "behavior_id": tracking,
+                "target_role": "return_dig",
+                "max_steps": None,
+            },
+        ]
+    else:
+        cycle = [
+            {
+                "stage_id": "ACT_DIG",
+                "behavior_id": "act_dig_lift",
+                "target_role": None,
+                "max_steps": 130,
+            },
+            {
+                "stage_id": "TRACK_DUMP",
+                "behavior_id": tracking,
+                "target_role": "dump",
+                "max_steps": None,
+            },
+            {
+                "stage_id": "FIXED_DUMP",
+                "behavior_id": "fixed_dump",
+                "target_role": None,
+                "max_steps": None,
+            },
+            {
+                "stage_id": "RETURN_DIG",
+                "behavior_id": tracking,
+                "target_role": "return_dig",
+                "max_steps": None,
+            },
+        ]
+    act_policy_bindings = {}
+    if mission_id == "engineering_act_transport_reference":
+        act_policy_bindings["act_dig_transport_dump"] = "b" * 64
+    elif mission_id != "fixed_dig_hybrid":
+        act_policy_bindings["act_dig_lift"] = "a" * 64
+    path = root / f"{mission_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "resident_mission_definition.v1",
+                "mission_id": mission_id,
+                "entry_behavior": {
+                    "stage_id": "TRACK_DIG",
+                    "behavior_id": tracking,
+                    "target_role": "current_dig",
+                    "max_steps": None,
+                },
+                "cycle_behaviors": cycle,
+                "act_policy_bindings": act_policy_bindings,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_build_candidate_uses_one_catalog_for_points_and_groups(tmp_path: Path) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(tmp_path)
     catalog_path = _write_eight_point_catalog(tmp_path)
     output = tmp_path / "candidate"
 
     plan_path = build_candidate_deployment(
         mission_path=mission_path,
-        demo_path=demo_path,
+        mission_definition_path=definition_path,
         dig_point_catalog_path=catalog_path,
         output_dir=output,
         deployed_root=output,
-        act_max_steps=130,
     )
 
     plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
     registry = load_fixed_cycle_registry(plan, allow_candidate=True)
+    plan_document = json.loads(plan_path.read_text(encoding="utf-8"))
+    catalog_document = json.loads(
+        (output / "target_catalog.candidate.json").read_text(encoding="utf-8")
+    )
+    assert plan_document["mission_sha256"] == plan.mission.sha256
+    assert catalog_document["mission_id"] == plan.mission.mission_id
+    assert catalog_document["mission_sha256"] == plan.mission.sha256
     assert plan.default_dig_group == "all"
     assert plan.dig_groups["near"] == tuple(list(plan.dig_sequence)[:4])
     assert plan.dig_groups["far"] == tuple(list(plan.dig_sequence)[4:])
     assert registry["dig_far_04"].waypoints == ((1.3, -0.35, 0.0),)
+
+
+def test_plan_rejects_mission_content_drift_under_same_mission_id(
+    tmp_path: Path,
+) -> None:
+    mission_path, _demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(tmp_path)
+    output = tmp_path / "candidate"
+    plan_path = build_candidate_deployment(
+        mission_path=mission_path,
+        mission_definition_path=definition_path,
+        dig_point_catalog_path=_write_eight_point_catalog(tmp_path),
+        output_dir=output,
+        deployed_root=output,
+    )
+    document = json.loads(plan_path.read_text(encoding="utf-8"))
+    document["mission"]["cycle_behaviors"][0]["max_steps"] = 2000
+    plan_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Mission sha256"):
+        load_fixed_cycle_plan(plan_path, allow_candidate=True)
 
 
 @pytest.mark.parametrize("point_count", [4, 5, 8])
@@ -107,6 +235,7 @@ def test_candidate_deployment_uses_one_catalog_snapshot_for_any_point_count(
     point_count: int,
 ) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(tmp_path)
     point_ids = [f"dig_dynamic_{index:02d}" for index in range(1, point_count + 1)]
     catalog_path = tmp_path / "dynamic-catalog.json"
     catalog_path.write_text(
@@ -128,7 +257,7 @@ def test_candidate_deployment_uses_one_catalog_snapshot_for_any_point_count(
 
     plan_path = build_candidate_deployment(
         mission_path=mission_path,
-        demo_path=demo_path,
+        mission_definition_path=definition_path,
         dig_point_catalog_path=catalog_path,
         output_dir=output,
         deployed_root=output,
@@ -151,16 +280,16 @@ def test_build_candidate_uses_fixed_endpoints_and_stays_uncommissioned(
     tmp_path: Path,
 ) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(tmp_path)
     catalog_path = _write_eight_point_catalog(tmp_path)
     output = tmp_path / "candidate"
 
     plan_path = build_candidate_deployment(
         mission_path=mission_path,
-        demo_path=demo_path,
+        mission_definition_path=definition_path,
         dig_point_catalog_path=catalog_path,
         output_dir=output,
         deployed_root=output,
-        act_max_steps=130,
     )
 
     with pytest.raises(ValueError, match="field_validated"):
@@ -176,54 +305,86 @@ def test_build_candidate_uses_fixed_endpoints_and_stays_uncommissioned(
     assert registry["dig_near_01"].intermediate_waypoint_tolerance_m == 0.40
 
 
-def test_build_act_full_cycle_candidate_omits_dump_trajectory(tmp_path: Path) -> None:
+def test_build_act_dig_transport_dump_reference_candidate_omits_dump_trajectory(tmp_path: Path) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(
+        tmp_path, "engineering_act_transport_reference"
+    )
     catalog_path = _write_eight_point_catalog(tmp_path)
     output = tmp_path / "candidate"
 
     plan_path = build_candidate_deployment(
         mission_path=mission_path,
-        demo_path=demo_path,
+        mission_definition_path=definition_path,
         dig_point_catalog_path=catalog_path,
         output_dir=output,
         deployed_root=output,
-        act_max_steps=260,
-        mission_profile="act_full_cycle",
     )
 
     plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
     registry = load_fixed_cycle_registry(plan, allow_candidate=True)
     document = json.loads(plan_path.read_text(encoding="utf-8"))
-    assert document["schema_version"] == "resident_fixed_cycle_plan.v4"
+    assert document["schema_version"] == "resident_fixed_cycle_plan.v5"
     assert document["source_catalog_sha256"] == hashlib.sha256(
         catalog_path.read_bytes()
     ).hexdigest()
-    assert plan.mission_profile == "act_full_cycle"
-    assert plan.act_max_steps == 260
+    assert plan.mission.mission_id == "engineering_act_transport_reference"
+    assert next(
+        behavior.max_steps
+        for behavior in plan.mission.behaviors
+        if behavior.behavior_id == "act_dig_transport_dump"
+    ) == 260
     assert tuple(registry) == tuple(plan.dig_sequence)
     assert len(registry) == 8
     assert not (output / "trajectory.dump.candidate.json").exists()
 
 
-def test_promote_act_full_cycle_requires_only_dig_targets(tmp_path: Path) -> None:
+def test_build_fixed_dig_candidate_keeps_dump_target_and_profile(tmp_path: Path) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(tmp_path, "fixed_dig_hybrid")
+    catalog_path = _write_eight_point_catalog(tmp_path)
+    output = tmp_path / "candidate"
+
+    plan_path = build_candidate_deployment(
+        mission_path=mission_path,
+        mission_definition_path=definition_path,
+        dig_point_catalog_path=catalog_path,
+        output_dir=output,
+        deployed_root=output,
+    )
+
+    plan = load_fixed_cycle_plan(plan_path, allow_candidate=True)
+    registry = load_fixed_cycle_registry(plan, allow_candidate=True)
+
+    assert plan.mission.mission_id == "fixed_dig_hybrid"
+    assert plan.trajectory_target_ids[-1] == "dump"
+    assert "dump" in registry
+    assert plan.plan_id.startswith("fixed_dig_hybrid-fixed-cycle-candidate")
+    assert json.loads(plan_path.read_text(encoding="utf-8"))["target_catalog"][
+        "catalog_id"
+    ].startswith("fixed_dig_hybrid-targets-candidate")
+
+
+def test_promote_act_dig_transport_dump_reference_requires_only_dig_targets(tmp_path: Path) -> None:
+    mission_path, demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(
+        tmp_path, "engineering_act_transport_reference"
+    )
     catalog_path = _write_eight_point_catalog(tmp_path)
     candidate = tmp_path / "candidate"
     candidate_plan = build_candidate_deployment(
         mission_path=mission_path,
-        demo_path=demo_path,
+        mission_definition_path=definition_path,
         dig_point_catalog_path=catalog_path,
         output_dir=candidate,
         deployed_root=candidate,
-        act_max_steps=260,
-        mission_profile="act_full_cycle",
     )
     record = tmp_path / "validation.json"
     record.write_text(
         json.dumps(
             {
                 "schema_version": "v3a_fixed_cycle_validation.v1",
-                "run_id": "engine-off-full-cycle-001",
+                "run_id": "engine-off-act-reference-001",
                 "operator_id": "zhaoshuai",
                 "tested_at": "2026-08-28T10:00:00+08:00",
                 "result": "passed",
@@ -246,7 +407,7 @@ def test_promote_act_full_cycle_requires_only_dig_targets(tmp_path: Path) -> Non
     )
 
     promoted = load_fixed_cycle_plan(plan_path)
-    assert promoted.mission_profile == "act_full_cycle"
+    assert promoted.mission.mission_id == "engineering_act_transport_reference"
     assert not (tmp_path / "field" / "trajectory.dump.field.json").exists()
 
 
@@ -254,15 +415,15 @@ def test_promotion_requires_passed_record_and_rewrites_all_hashes(
     tmp_path: Path,
 ) -> None:
     mission_path, demo_path = _write_sources(tmp_path)
+    definition_path = _write_mission_definition(tmp_path)
     catalog_path = _write_eight_point_catalog(tmp_path)
     candidate = tmp_path / "candidate"
     candidate_plan = build_candidate_deployment(
         mission_path=mission_path,
-        demo_path=demo_path,
+        mission_definition_path=definition_path,
         dig_point_catalog_path=catalog_path,
         output_dir=candidate,
         deployed_root=candidate,
-        act_max_steps=130,
     )
     record = tmp_path / "validation.json"
     record.write_text(
@@ -335,3 +496,23 @@ def test_deployment_cli_is_runnable_outside_the_repository(
 
     assert result.returncode == 0, result.stderr
     assert "usage:" in result.stdout
+
+
+def test_candidate_builder_cli_requires_a_mission_definition(tmp_path: Path) -> None:
+    script = (
+        Path(__file__).parents[1]
+        / "scripts"
+        / "build_v3a_fixed_cycle_candidate.py"
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--mission-definition" in result.stdout
+    assert "--mission-profile" not in result.stdout

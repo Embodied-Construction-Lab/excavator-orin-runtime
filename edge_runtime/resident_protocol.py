@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .resident_motion import ACTION_ORDER, ControlMode, MotionCandidate
 
 
 CANDIDATE_SCHEMA_VERSION = "resident_policy_candidate.v2"
+ACT_WORKER_IDENTITY_SCHEMA_VERSION = "resident_act_worker_identity.v1"
 MAX_CANDIDATE_BYTES = 4096
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 _FIELDS = {
@@ -23,6 +26,60 @@ _FIELDS = {
     "created_monotonic_ns",
     "valid_until_monotonic_ns",
 }
+_IDENTITY_FIELDS = {"schema_version", "behavior_id", "checkpoint_model_sha256"}
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class ResidentActWorkerIdentity:
+    behavior_id: str
+    checkpoint_model_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.behavior_id, str) or _SAFE_ID.fullmatch(self.behavior_id) is None:
+            raise ValueError("ACT worker behavior_id is invalid")
+        if (
+            not isinstance(self.checkpoint_model_sha256, str)
+            or _SHA256.fullmatch(self.checkpoint_model_sha256) is None
+        ):
+            raise ValueError("ACT worker checkpoint_model_sha256 is invalid")
+
+
+def encode_act_worker_identity(identity: ResidentActWorkerIdentity) -> bytes:
+    if not isinstance(identity, ResidentActWorkerIdentity):
+        raise ValueError("identity must be a ResidentActWorkerIdentity")
+    return json.dumps(
+        {
+            "schema_version": ACT_WORKER_IDENTITY_SCHEMA_VERSION,
+            "behavior_id": identity.behavior_id,
+            "checkpoint_model_sha256": identity.checkpoint_model_sha256,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def decode_act_worker_identity(payload: bytes) -> ResidentActWorkerIdentity:
+    if not isinstance(payload, bytes) or not payload or len(payload) > MAX_CANDIDATE_BYTES:
+        raise ValueError("ACT worker identity payload size is invalid")
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("ACT worker identity is not strict JSON") from exc
+    if not isinstance(value, Mapping) or set(value) != _IDENTITY_FIELDS:
+        raise ValueError("ACT worker identity fields are invalid")
+    if value["schema_version"] != ACT_WORKER_IDENTITY_SCHEMA_VERSION:
+        raise ValueError("ACT worker identity schema is unsupported")
+    return ResidentActWorkerIdentity(
+        behavior_id=value["behavior_id"],
+        checkpoint_model_sha256=value["checkpoint_model_sha256"],
+    )
 
 
 def encode_motion_candidate(candidate: MotionCandidate) -> bytes:

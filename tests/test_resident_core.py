@@ -641,6 +641,7 @@ class ResidentMotionCoreTest(unittest.TestCase):
         )
         generation = core.activate_act(
             max_steps=30,
+            allow_deadzone_early_completion=True,
             now_monotonic_ns=1_000_000_000,
         )
         claim = json.loads(serial.writes[-1].decode("ascii"))
@@ -750,6 +751,56 @@ class ResidentMotionCoreTest(unittest.TestCase):
         self.assertTrue(core.act_segment_snapshot().complete)
         self.assertEqual(core.act_segment_snapshot().completed_steps, 12)
 
+    def test_act_can_disable_deadzone_completion_for_a_long_horizon_policy(self) -> None:
+        serial = RecordingSerial()
+        core = ResidentMotionCore(
+            serial,
+            max_state_age_ms=200.0,
+            wall_time_ms=lambda: 10_000,
+            monotonic_ns=lambda: 1_090_000_000,
+            manual_action_deadzone_contract=uniform_deadzone_contract(0.15),
+            act_early_completion_chunk_steps=10,
+            act_early_completion_min_steps=1,
+        )
+        core.initialize(
+            telemetry(receive_ns=990_000_000, command_seq=0, valid=False, mode=None)
+        )
+        generation = core.activate_act(
+            max_steps=3,
+            allow_deadzone_early_completion=False,
+            now_monotonic_ns=1_000_000_000,
+        )
+        claim = json.loads(serial.writes[-1].decode("ascii"))
+        core.observe_telemetry(
+            telemetry(
+                receive_ns=1_020_000_000,
+                command_seq=claim["command_seq"],
+                valid=True,
+                mode=ControlMode.MANUAL_ACTION,
+            )
+        )
+        deadzone_chunk = ((0.0, 0.0, 0.0, 0.0),) * 10
+
+        for index in range(2):
+            result = core.submit_act(
+                encode_motion_candidate(
+                    MotionCandidate(
+                        source="act_dig",
+                        generation=generation,
+                        mode=ControlMode.MANUAL_ACTION,
+                        action=deadzone_chunk[0],
+                        action_chunk=deadzone_chunk,
+                        created_monotonic_ns=1_030_000_000 + index,
+                        valid_until_monotonic_ns=1_200_000_000,
+                    )
+                )
+            )
+            self.assertTrue(result.accepted)
+
+        snapshot = core.act_segment_snapshot()
+        self.assertEqual(snapshot.completed_steps, 2)
+        self.assertIsNone(snapshot.completion_reason)
+
     def test_missing_deadzone_contract_disables_early_completion(self) -> None:
         serial = RecordingSerial()
         core = ResidentMotionCore(
@@ -766,6 +817,7 @@ class ResidentMotionCoreTest(unittest.TestCase):
         )
         generation = core.activate_act(
             max_steps=30,
+            allow_deadzone_early_completion=True,
             now_monotonic_ns=1_000_000_000,
         )
         claim = json.loads(serial.writes[-1].decode("ascii"))
@@ -809,9 +861,10 @@ class ResidentMotionCoreTest(unittest.TestCase):
         )
         self.assertTrue(still_running.accepted)
 
-    def test_default_early_completion_starts_at_step_101_chunk_boundary(self) -> None:
+    def test_enabled_early_completion_starts_at_step_101_chunk_boundary(self) -> None:
         generation = self.core.activate_act(
             max_steps=130,
+            allow_deadzone_early_completion=True,
             now_monotonic_ns=1_000_000_000,
         )
         self.acknowledge_latest_zero(

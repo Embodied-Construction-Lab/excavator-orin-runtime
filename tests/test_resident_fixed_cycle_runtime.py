@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from edge_runtime.resident_fixed_cycle import (
-    FixedCyclePlan,
-    load_fixed_cycle_registry,
-)
+from fixed_cycle_v5_support import write_deployment
+from edge_runtime.resident_fixed_cycle import FixedCyclePlan
 from edge_runtime.resident_fixed_cycle_runtime import ResidentFixedCycleRuntime
 from edge_runtime.remote import EdgeBehaviorExecutor
 
@@ -19,51 +15,9 @@ from edge_runtime.remote import EdgeBehaviorExecutor
 def _deployment(
     tmp_path: Path,
     *,
-    mission_profile: str = "regime_factorized",
+    mission_id: str = "fixed_target_hybrid",
 ) -> tuple[FixedCyclePlan, object]:
-    trajectories = {}
-    for target_id in ("dig_01", "dig_02", "dig_03", "dump"):
-        phase = "dump" if target_id == "dump" else "dig"
-        template = {
-            "schema_version": "resident_fixed_trajectory.v1",
-            "trajectory_id": f"field-{target_id}-v1",
-            "validation_status": "field_validated",
-            "phase": phase,
-            "frame_id": "machine_root_ros",
-            "mission_id": "field_cycle_001",
-            "mission_sha256": "c" * 64,
-            "task_mode": "CarryMaterial" if phase == "dump" else "MoveToDig",
-            "control_stage": "commissioning",
-            "workspace_constraint": "field_validated",
-            "waypoints": [[0.2, 0.0, 0.1], [1.0, 0.0, 0.0]],
-            "waypoint_tolerance_m": 0.25,
-            "intermediate_waypoint_tolerance_m": 0.40,
-            "waypoint_dwell_s": 0.0,
-            "tracking_timeout_s": 60.0,
-        }
-        payload = json.dumps(template, sort_keys=True).encode("utf-8")
-        path = tmp_path / f"{target_id}.json"
-        path.write_bytes(payload)
-        trajectories[target_id] = {
-            "trajectory_id": template["trajectory_id"],
-            "phase": phase,
-            "path": str(path),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
-    if mission_profile == "act_full_cycle":
-        del trajectories["dump"]
-    plan = FixedCyclePlan.from_mapping(
-        {
-            "schema_version": "resident_fixed_cycle_plan.v2",
-            "plan_id": "field-cycle-v3a",
-            "validation_status": "field_validated",
-            "mission_profile": mission_profile,
-            "dig_sequence": ["dig_01", "dig_02", "dig_03"],
-            "act_max_steps": 130,
-            "trajectories": trajectories,
-        }
-    )
-    return plan, load_fixed_cycle_registry(plan)
+    return write_deployment(tmp_path, mission_id=mission_id)
 
 
 @dataclass
@@ -91,9 +45,20 @@ class _Core:
     def renew_mission_lease(self, *, lease_ms: int) -> None:
         self.calls.append(("renew_mission_lease", lease_ms))
 
-    def activate_act(self, *, max_steps: int) -> int:
+    def activate_act(
+        self,
+        *,
+        max_steps: int,
+        allow_deadzone_early_completion: bool,
+    ) -> int:
         self._generation += 1
-        self.calls.append(("activate_act", max_steps))
+        self.calls.append(
+            (
+                "activate_act",
+                max_steps,
+                allow_deadzone_early_completion,
+            )
+        )
         self.rl_is_active = False
         self.act_is_active = True
         self.segment = _ActSegment(self._generation, max_steps)
@@ -268,7 +233,7 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     )
 
     behaviors.succeed(reason_code="SUCCEEDED")
-    assert core.calls[-1] == ("activate_act", 130)
+    assert core.calls[-1] == ("activate_act", 130, True)
 
     core.complete_act()
     runtime.tick()
@@ -276,15 +241,19 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     behaviors.succeed(reason_code="SUCCEEDED")
     assert behaviors.requests[-1]["type"] == "start_fixed_action"
     behaviors.succeed(reason_code="SEQUENCE_COMPLETED")
-    assert behaviors.requests[-1]["trajectory"]["trajectory_id"] == "field-dig_02-v1"
+    assert behaviors.requests[-1]["trajectory"]["trajectory_id"] == (
+        "fixed_target_hybrid-test-catalog:dig_02"
+    )
 
     behaviors.succeed(reason_code="SUCCEEDED")
     core.complete_act()
     runtime.tick()
     behaviors.succeed(reason_code="SUCCEEDED")
     behaviors.succeed(reason_code="SEQUENCE_COMPLETED")
-    assert behaviors.requests[-1]["trajectory"]["trajectory_id"] == "field-dig_02-v1"
-    assert runtime.snapshot.stage == "FOLLOW_DIG"
+    assert behaviors.requests[-1]["trajectory"]["trajectory_id"] == (
+        "fixed_target_hybrid-test-catalog:dig_02"
+    )
+    assert runtime.snapshot.stage == "RETURN_DIG"
     assert runtime.snapshot.completed_cycles == 2
 
     behaviors.succeed(reason_code="SUCCEEDED")
@@ -293,8 +262,8 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     assert runtime.snapshot.completed_cycles == 2
     assert core.calls[-1] == ("terminal_disarm",)
     assert [call for call in core.calls if call[0] == "activate_act"] == [
-        ("activate_act", 130),
-        ("activate_act", 130),
+        ("activate_act", 130, True),
+        ("activate_act", 130, True),
     ]
 
 
@@ -320,14 +289,16 @@ def test_deadzone_chunk_completion_advances_to_dump_before_budget(
 
     runtime.tick()
 
-    assert runtime.snapshot.stage == "FOLLOW_DUMP"
+    assert runtime.snapshot.stage == "TRACK_DUMP"
     assert behaviors.requests[-1]["trajectory"]["mission_phase"] == "dump"
 
 
-def test_act_full_cycle_runtime_skips_dump_follow_and_fixed_action(
+def test_act_dig_transport_dump_reference_runtime_skips_dump_follow_and_fixed_action(
     tmp_path: Path,
 ) -> None:
-    plan, registry = _deployment(tmp_path, mission_profile="act_full_cycle")
+    plan, registry = _deployment(
+        tmp_path, mission_id="engineering_act_transport_reference"
+    )
     core = _Core()
     behaviors = _BehaviorExecutor()
     runtime = ResidentFixedCycleRuntime(
@@ -342,16 +313,51 @@ def test_act_full_cycle_runtime_skips_dump_follow_and_fixed_action(
 
     runtime.start(run_id="run-full-policy", requested_cycles=1)
     behaviors.succeed(reason_code="SUCCEEDED")
-    assert runtime.snapshot.stage == "ACT_FULL_CYCLE"
-    assert core.calls[-1] == ("activate_act", 130)
+    assert runtime.snapshot.stage == "ACT_DIG_TRANSPORT_DUMP"
+    assert core.calls[-1] == ("activate_act", 260, False)
 
     core.complete_act()
     runtime.tick()
 
-    assert runtime.snapshot.stage == "FOLLOW_DIG"
+    assert runtime.snapshot.stage == "RETURN_DIG"
     assert behaviors.requests[-1]["type"] == "start_follow"
     assert behaviors.requests[-1]["trajectory"]["mission_phase"] == "dig"
-    assert all(request["type"] != "start_fixed_action" for request in behaviors.requests)
+    assert all(
+        request["type"] != "start_fixed_action"
+        for request in behaviors.requests
+    )
+
+
+def test_fixed_dig_runtime_dispatches_execute_dig_before_dump_follow(
+    tmp_path: Path,
+) -> None:
+    plan, registry = _deployment(tmp_path, mission_id="fixed_dig_hybrid")
+    core = _Core()
+    behaviors = _BehaviorExecutor()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=core,
+        behavior_executor=behaviors,
+        act_worker_ready=lambda: True,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    runtime.start(run_id="run-fixed-dig-runtime", requested_cycles=1)
+    assert behaviors.requests[-1]["type"] == "start_follow"
+    assert behaviors.requests[-1]["trajectory"]["mission_phase"] == "dig"
+
+    behaviors.succeed(reason_code="SUCCEEDED")
+    assert runtime.snapshot.stage == "FIXED_DIG"
+    assert behaviors.requests[-1]["type"] == "start_fixed_action"
+    assert behaviors.requests[-1]["behavior"] == "ExecuteDig"
+    assert all(call[0] != "activate_act" for call in core.calls)
+
+    behaviors.succeed(reason_code="SEQUENCE_COMPLETED")
+    assert runtime.snapshot.stage == "TRACK_DUMP"
+    assert behaviors.requests[-1]["type"] == "start_follow"
+    assert behaviors.requests[-1]["trajectory"]["mission_phase"] == "dump"
 
 
 def test_fixed_action_feedback_does_not_require_follow_visualization(
@@ -379,7 +385,7 @@ def test_fixed_action_feedback_does_not_require_follow_visualization(
 
     behaviors.fixed_action_feedback()
 
-    assert runtime.snapshot.stage == "EXECUTE_DUMP"
+    assert runtime.snapshot.stage == "FIXED_DUMP"
     assert runtime.visualization_snapshot is None
     behaviors.succeed(reason_code="SEQUENCE_COMPLETED")
     assert behaviors.requests[-1]["type"] == "start_follow"
@@ -403,7 +409,7 @@ def test_malformed_read_only_visualization_does_not_abort_follow(
 
     behaviors.malformed_follow_feedback()
 
-    assert runtime.snapshot.stage == "FOLLOW_DIG"
+    assert runtime.snapshot.stage == "TRACK_DIG"
     assert runtime.visualization_snapshot is None
 
 
@@ -582,7 +588,7 @@ def test_materialized_fixed_template_passes_the_real_behavior_boundary(
     runtime.start(run_id="run-real-boundary", requested_cycles=1)
 
     assert executor.busy
-    assert created[0].trajectory_id == "field-dig_01-v1"
+    assert created[0].trajectory_id == "fixed_target_hybrid-test-catalog:dig_01"
     assert created[0].computed_sha256() == created[0].trajectory_sha256
 
 

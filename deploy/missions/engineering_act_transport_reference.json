@@ -1,0 +1,27 @@
+{
+  "schema_version": "resident_mission_definition.v1",
+  "mission_id": "engineering_act_transport_reference",
+  "act_policy_bindings": {
+    "act_dig_transport_dump": "54a3ba90e6c2186787b8b7eb1b9e5211e2bcf81e41551e866283ace41ed04f4a"
+  },
+  "entry_behavior": {
+    "stage_id": "TRACK_DIG",
+    "behavior_id": "onnx_rl_tracking",
+    "target_role": "current_dig",
+    "max_steps": null
+  },
+  "cycle_behaviors": [
+    {
+      "stage_id": "ACT_DIG_TRANSPORT_DUMP",
+      "behavior_id": "act_dig_transport_dump",
+      "target_role": null,
+      "max_steps": 260
+    },
+    {
+      "stage_id": "RETURN_DIG",
+      "behavior_id": "onnx_rl_tracking",
+      "target_role": "return_dig",
+      "max_steps": null
+    }
+  ]
+}

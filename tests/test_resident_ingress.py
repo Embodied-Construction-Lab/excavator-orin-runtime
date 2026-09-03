@@ -44,6 +44,10 @@ class StubFollowRuntime:
             normalized_action=(0.1, -0.2, 0.3, -0.4),
             physical_action=(0.025, -0.03, 0.04, -0.5),
             commanded_normalized_action=(0.1, -0.2, 0.3, -0.4),
+            episode_progress=0.1,
+            waypoint_distance_m=0.4,
+            trajectory_controller_backend="onnx_rl",
+            reference_waypoint_ros_m=(0.8, -0.1, 0.0),
         )
 
 

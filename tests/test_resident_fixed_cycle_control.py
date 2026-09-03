@@ -15,7 +15,8 @@ from edge_runtime.resident_fixed_cycle_control import (
 @dataclass(frozen=True)
 class _Snapshot:
     run_id: str = ""
-    mission_profile: str = "act_full_cycle"
+    mission_id: str = "engineering_act_transport_reference"
+    active_behavior_id: str = ""
     stage: str = "IDLE"
     requested_cycles: int = 0
     completed_cycles: int = 0
@@ -45,6 +46,7 @@ class _Runtime:
         self.snapshot = _Snapshot(
             run_id=run_id,
             stage="FOLLOW_DIG",
+            active_behavior_id="onnx_rl_tracking",
             requested_cycles=requested_cycles,
             current_dig_point_id=first_dig_point_id or "dig_01",
             dig_group_id=dig_group_id or "all",
@@ -102,7 +104,8 @@ def test_start_status_and_cancel_use_one_strict_local_control_socket(tmp_path) -
 
     assert started["ok"] is True
     assert started["status"]["stage"] == "FOLLOW_DIG"
-    assert started["status"]["mission_profile"] == "act_full_cycle"
+    assert started["status"]["mission_id"] == "engineering_act_transport_reference"
+    assert started["status"]["active_behavior_id"] == "onnx_rl_tracking"
     assert started["status"]["active_trajectory"] == {
         "frame_id": "machine_root_ros",
         "target_id": "dig_02",

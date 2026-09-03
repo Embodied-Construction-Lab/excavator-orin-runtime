@@ -12,6 +12,7 @@ resident_fixed_cycle_control_socket="${RESIDENT_FIXED_CYCLE_CONTROL_SOCKET:-${re
 resident_python="${RESIDENT_PYTHON:-python3}"
 fixed_cycle_plan=""
 commissioning_authorization=""
+trajectory_controller_commissioning_authorization=""
 expected_dig_catalog_sha256=""
 authorization=""
 
@@ -52,6 +53,11 @@ while [[ $# -gt 0 ]]; do
       commissioning_authorization="$2"
       shift 2
       ;;
+    "--trajectory-controller-commissioning-authorization")
+      [[ $# -ge 2 ]] || { echo "--trajectory-controller-commissioning-authorization 缺少值" >&2; exit 2; }
+      trajectory_controller_commissioning_authorization="$2"
+      shift 2
+      ;;
     "--expected-dig-catalog-sha256")
       [[ $# -ge 2 ]] || { echo "--expected-dig-catalog-sha256 缺少值" >&2; exit 2; }
       expected_dig_catalog_sha256="$2"
@@ -83,6 +89,11 @@ fi
 if [[ -n "${commissioning_authorization}" && -z "${fixed_cycle_plan}" ]]; then
   echo "候选轨迹授权只能与 --fixed-cycle-plan 一起使用。" >&2
   exit 2
+fi
+if [[ -n "${trajectory_controller_commissioning_authorization}" ]] \
+  && [[ "${trajectory_controller_commissioning_authorization}" != "ALLOW_CARTESIAN_P_MACHINE_MOTION" ]]; then
+  echo "Cartesian-P 真机调试需要精确授权：ALLOW_CARTESIAN_P_MACHINE_MOTION" >&2
+  exit 1
 fi
 if [[ -n "${expected_dig_catalog_sha256}" && ! "${expected_dig_catalog_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "--expected-dig-catalog-sha256 必须是小写 SHA-256。" >&2
@@ -163,6 +174,14 @@ if [[ -n "${fixed_cycle_plan}" ]]; then
   fi
 fi
 
+trajectory_controller_args=()
+if [[ -n "${trajectory_controller_commissioning_authorization}" ]]; then
+  trajectory_controller_args=(
+    --trajectory-controller-commissioning-authorization
+    "${trajectory_controller_commissioning_authorization}"
+  )
+fi
+
 echo "启动 resident Mission owner：${serial_port} 将保持为唯一 STM32 owner。"
 echo "ACT worker 通过 ${resident_act_socket} 发送候选动作；低频控制命令走 ${resident_control_socket}。"
 
@@ -173,6 +192,7 @@ exec "${resident_python}" -u "${repo_dir}/orin_state_sender.py" \
   --pc-host "${pc_host}" \
   --edge-config "${resolved_edge_config}" \
   --edge-motion-authorization ALLOW_EDGE_MACHINE_MOTION \
+  "${trajectory_controller_args[@]}" \
   --resident-motion-core \
   --resident-act-socket "${resident_act_socket}" \
   --resident-control-socket "${resident_control_socket}" \

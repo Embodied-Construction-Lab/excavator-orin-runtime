@@ -89,6 +89,7 @@ class EdgeFollowStep:
     ] = (0.0, 0.0, 0.0, 0.0)
     trajectory_controller_backend: str = "unknown"
     trajectory_waypoints_ros_m: Tuple[Tuple[float, float, float], ...] = ()
+    reference_waypoint_ros_m: Optional[Tuple[float, float, float]] = None
 
 
 class EdgeFollowRuntime:
@@ -334,6 +335,9 @@ class EdgeFollowRuntime:
             commanded_normalized_action=commanded_normalized,
             trajectory_controller_backend=self._controller.descriptor.backend_id,
             trajectory_waypoints_ros_m=self._tracker.snapshot.waypoints,
+            reference_waypoint_ros_m=(
+                self._tracker.snapshot.waypoints[self._tracker.current_index]
+            ),
         )
         self._previous_tip = tip
         if result_status == "ACTIVE":

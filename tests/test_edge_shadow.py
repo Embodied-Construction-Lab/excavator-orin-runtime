@@ -263,6 +263,22 @@ class EdgeShadowObserverTest(unittest.TestCase):
         self.assertEqual(config.trajectory_controller_backend, "cartesian_p")
         self.assertIsNone(config.onnx_path)
 
+    def test_repository_classical_commissioning_config_is_resident_cartesian_p(self):
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "edge_runtime.resident.cartesian_p.commissioning.json"
+        )
+
+        config = load_edge_runtime_config(config_path)
+
+        self.assertEqual(config.mode, "remote_control")
+        self.assertEqual(config.action_transport, "resident_sink")
+        self.assertEqual(config.trajectory_controller_backend, "cartesian_p")
+        self.assertIsNone(config.onnx_path)
+        self.assertEqual(config.follow_action_startup_slew_rate_per_s, 20.0)
+        self.assertEqual(config.follow_action_slew_rate_per_s, 3.0)
+
     def test_cartesian_p_shadow_builds_and_runs_without_an_onnx_artifact(self):
         mission_value = mission()
         mission_bytes = json.dumps(

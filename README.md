@@ -336,16 +336,24 @@ environment-dependent planning on PC while removing the network round trip
 between Follow and its fixed action. An active-leg connection loss remains
 fail-closed and stops that local behavior.
 
-### V3-B catalog-driven resident fixed cycle
+### V3-B catalog-driven declarative Resident Mission
 
 V3-A 从标签 `icra2027-v2-freeze-20260824` 分支。当前 V3-B 的
 `edge_runtime.resident_fixed_cycle` 接受经过哈希绑定的非空 Dig Point Catalog，并将其组织为严格的
-`resident_fixed_cycle_plan.v4`。点数不是代码常量；4、5、8 点使用同一纯 Orin 状态机自动
-推进：
+`resident_fixed_cycle_plan.v5`。v5 内嵌严格的
+`resident_mission_definition.v1`；点数和行为顺序都不是状态机代码常量。4、5、8 点使用同一
+Orin Scheduler，而具体任务由 Mission 中的 Behavior 列表组合：
 
 ```text
-FollowDig → ACT Dig → FollowDump → ExecuteDump → next FollowDig
+FollowTarget(current_dig) → ACT Dig-and-lift → FollowTarget(dump)
+→ Fixed Dump → FollowTarget(next_dig)
 ```
+
+Plan、Dig Point Catalog 与嵌入 Mission 必须具有相同 `mission_id` 和 canonical Mission SHA-256。
+修改 Behavior 顺序、ACT step budget 或 ACT policy binding 会改变摘要，使旧 Catalog、PC runtime、
+Profile 和 evidence 立即失效。需要 ACT 的 Mission 还把 ACT Behavior ID 绑定到 checkpoint model
+SHA-256；worker 建立 data link 后必须先通过 `resident_act_worker_identity.v1` 握手，错误策略在候选
+动作进入 Motion Core 前即被拒绝。
 
 状态机通过现有 Resident Motion Core、generation、唯一 STM32 Command Sink 和本地
 `EdgeBehaviorExecutor` 闭环。PC 只发送一次 start/cancel，并以 400 ms 周期续 supervisory lease；
@@ -366,7 +374,7 @@ F407 `MANUAL_ACTION_DEAD_ZONE` 杆量语义；不得复用 RL normalized-velocit
 # PC 生成候选；输出文件可提交，但 validation_status 仍是 candidate。
 PYTHONPATH=. python3 scripts/build_v3a_fixed_cycle_candidate.py \
   --mission-config ../AiryLidar/mission/config/excavation_cycle.json \
-  --demo-config ../AiryLidar/mission/config/excavation_demo.json \
+  --mission-definition deploy/missions/fixed_target_hybrid.json \
   --dig-point-catalog ../AiryLidar/mission/config/excavation_dig_point_catalog.v1.json \
   --output-dir deploy/v3b/catalog/candidate \
   --deployed-root /home/jetson16/workspace_excavator/excavator-orin-runtime/deploy/v3b/catalog/candidate \

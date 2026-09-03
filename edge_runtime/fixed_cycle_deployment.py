@@ -8,12 +8,8 @@ import math
 from pathlib import Path
 from typing import Any, Mapping
 
-from .resident_fixed_cycle import (
-    ACT_FULL_CYCLE_PROFILE,
-    REGIME_FACTORIZED_PROFILE,
-    load_fixed_cycle_plan,
-    load_fixed_cycle_registry,
-)
+from ._resident_mission_definition import ResidentMissionDefinition
+from .resident_fixed_cycle import load_fixed_cycle_plan, load_fixed_cycle_registry
 
 
 PROMOTION_AUTHORIZATION = "PROMOTE_V3A_FIELD_VALIDATED_TRAJECTORIES"
@@ -32,41 +28,35 @@ _VALIDATION_FIELDS = frozenset(
 def build_candidate_deployment(
     *,
     mission_path: str | Path,
-    demo_path: str | Path,
+    mission_definition_path: str | Path,
     dig_point_catalog_path: str | Path,
     output_dir: str | Path,
     deployed_root: str | Path,
-    act_max_steps: int = 130,
     intermediate_waypoint_tolerance_m: float = 0.40,
-    mission_profile: str = REGIME_FACTORIZED_PROFILE,
 ) -> Path:
     """Create one candidate target catalog from authoritative Airy configs."""
 
     mission_source = Path(mission_path)
-    demo_source = Path(demo_path)
     mission = _load_object(mission_source)
-    demo = _load_object(demo_source)
+    definition_source = Path(mission_definition_path)
+    definition = ResidentMissionDefinition.from_mapping(
+        _load_object(definition_source)
+    )
     if mission.get("schema_version") != "excavation_mission.v1":
         raise ValueError("unsupported excavation mission schema")
-    if demo.get("schema_version") != "excavation_demo.v1":
-        raise ValueError("unsupported excavation demo schema")
-    if mission.get("frame_id") != "machine_root_ros" or demo.get("frame_id") != "machine_root_ros":
+    if mission.get("frame_id") != "machine_root_ros":
         raise ValueError("fixed cycle source frame must be machine_root_ros")
-    if isinstance(act_max_steps, bool) or not isinstance(act_max_steps, int) or not 1 <= act_max_steps <= 2000:
-        raise ValueError("act_max_steps must be within [1, 2000]")
-    if mission_profile not in {REGIME_FACTORIZED_PROFILE, ACT_FULL_CYCLE_PROFILE}:
-        raise ValueError("unsupported fixed cycle mission_profile")
 
     catalog_source = Path(dig_point_catalog_path)
     catalog_source_bytes = catalog_source.read_bytes()
     points, default_dig_group, dig_groups = _dig_point_catalog(
         _load_object(catalog_source)
     )
-    dump = _position("dump target", demo.get("dump_target"))
-    mission_dump = _position("mission dump target", _object(mission.get("targets"), "mission targets").get("dump"))
-    if dump != mission_dump:
-        raise ValueError("mission and demo dump targets do not match")
-    limits = _limits(mission.get("limits"), demo.get("limits"))
+    dump = _position(
+        "mission dump target",
+        _object(mission.get("targets"), "mission targets").get("dump"),
+    )
+    limits = _limits(mission.get("limits"))
     intermediate_tolerance = _positive(
         "intermediate_waypoint_tolerance_m",
         intermediate_waypoint_tolerance_m,
@@ -81,23 +71,15 @@ def build_candidate_deployment(
     deployed = Path(deployed_root)
     if not deployed.is_absolute():
         raise ValueError("deployed_root must be absolute")
-    mission_bytes = mission_source.read_bytes()
-    demo_bytes = demo_source.read_bytes()
-    source_payload = mission_bytes + b"\0" + demo_bytes
-    source_payload += b"\0" + catalog_source_bytes
-    source_sha = hashlib.sha256(source_payload).hexdigest()
-    mission_id = _text("mission_id", mission.get("mission_id"))
-    deployment_prefix = (
-        "v3a" if mission_profile == REGIME_FACTORIZED_PROFILE else "v3b-full-cycle"
-    )
+    deployment_prefix = definition.mission_id
 
     catalog_filename = "target_catalog.candidate.json"
     catalog_id = f"{deployment_prefix}-targets-candidate"
     target_catalog = _target_catalog_document(
         catalog_id=catalog_id,
         status="candidate",
-        mission_id=mission_id,
-        mission_sha256=source_sha,
+        mission_id=definition.mission_id,
+        mission_sha256=definition.sha256,
         points=points,
         dump=dump,
         limits=limits,
@@ -105,11 +87,10 @@ def build_candidate_deployment(
     catalog_payload = _canonical_bytes(target_catalog)
     (output / catalog_filename).write_bytes(catalog_payload)
     plan = {
-        "schema_version": "resident_fixed_cycle_plan.v4",
+        "schema_version": "resident_fixed_cycle_plan.v5",
         "plan_id": f"{deployment_prefix}-fixed-cycle-candidate",
         "validation_status": "candidate",
         "dig_sequence": list(points),
-        "act_max_steps": act_max_steps,
         "source_catalog_sha256": hashlib.sha256(
             catalog_source_bytes
         ).hexdigest(),
@@ -118,8 +99,9 @@ def build_candidate_deployment(
             "path": str(deployed / catalog_filename),
             "sha256": hashlib.sha256(catalog_payload).hexdigest(),
         },
+        "mission_sha256": definition.sha256,
     }
-    plan["mission_profile"] = mission_profile
+    plan["mission"] = definition.to_mapping()
     plan["default_dig_group"] = default_dig_group
     plan["dig_groups"] = dig_groups
     plan_path = output / "fixed_cycle.candidate.json"
@@ -152,11 +134,7 @@ def promote_candidate_deployment(
     (output / "commissioning_record.json").write_bytes(record_payload)
     record_sha = hashlib.sha256(record_payload).hexdigest()
 
-    deployment_prefix = (
-        "v3a"
-        if candidate.mission_profile == REGIME_FACTORIZED_PROFILE
-        else "v3b-full-cycle"
-    )
+    deployment_prefix = candidate.mission.mission_id
     candidate_catalog = candidate.target_catalog
     if candidate_catalog is None:
         raise ValueError("promotion requires a catalog-driven candidate plan")
@@ -174,13 +152,13 @@ def promote_candidate_deployment(
     catalog_payload = _canonical_bytes(field_catalog)
     (output / catalog_filename).write_bytes(catalog_payload)
     plan = {
-        "schema_version": "resident_fixed_cycle_plan.v4",
+        "schema_version": "resident_fixed_cycle_plan.v5",
         "plan_id": f"{deployment_prefix}-fixed-cycle-field-{record_sha}",
         "validation_status": "field_validated",
         "dig_sequence": list(candidate.dig_sequence),
-        "act_max_steps": candidate.act_max_steps,
         "source_catalog_sha256": candidate.source_catalog_sha256,
-        "mission_profile": candidate.mission_profile,
+        "mission": candidate.mission.to_mapping(),
+        "mission_sha256": candidate.mission_sha256,
         "default_dig_group": candidate.default_dig_group,
         "dig_groups": {
             group_id: list(point_ids)
@@ -290,17 +268,13 @@ def _dig_point_catalog(
     return points, default_group, groups
 
 
-def _limits(mission: Any, demo: Any) -> dict[str, float]:
+def _limits(mission: Any) -> dict[str, float]:
     mission_limits = _object(mission, "mission limits")
-    demo_limits = _object(demo, "demo limits")
-    result = {
+    return {
         "waypoint_tolerance_m": _positive("waypoint_tolerance_m", mission_limits.get("waypoint_tolerance_m")),
         "waypoint_dwell_s": _nonnegative("waypoint_dwell_s", mission_limits.get("waypoint_dwell_s")),
         "tracking_timeout_s": _positive("tracking_timeout_s", mission_limits.get("tracking_timeout_s")),
     }
-    if any(demo_limits.get(key) != value for key, value in result.items()):
-        raise ValueError("mission and demo trajectory limits do not match")
-    return result
 
 
 def _position(name: str, value: Any) -> tuple[float, float, float]:

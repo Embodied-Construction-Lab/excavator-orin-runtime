@@ -742,6 +742,50 @@ class ResidentCommandSink:
     ) -> ResidentWriteResult:
         """Revoke the generation before issuing a safety-triggered zero."""
 
+        snapshot = self._authority.snapshot()
+        expected_mode = (
+            None
+            if snapshot.active_binding is None
+            else snapshot.active_binding.mode
+        )
+        frame = self._latest_telemetry
+        failed_gates = self._failed_safety_gates_locked(
+            now_monotonic_ns=monotonic_ns,
+            expected_mode=expected_mode,
+        )
+        emit_action_audit(
+            self._action_audit,
+            "safety_revoke",
+            runtime_id=self._runtime_id,
+            monotonic_ns=monotonic_ns,
+            generation=snapshot.generation,
+            source=(
+                None
+                if snapshot.active_binding is None
+                else snapshot.active_binding.source
+            ),
+            expected_mode=(None if expected_mode is None else expected_mode.value),
+            trigger_reason=reason,
+            failed_gates=list(failed_gates),
+            telemetry_age_ms=(
+                None
+                if frame is None
+                else (monotonic_ns - frame.receive_monotonic_ns) / 1_000_000.0
+            ),
+            command_rx_seq=None if frame is None else frame.command_rx_seq,
+            command_valid=None if frame is None else frame.command_valid,
+            command_timed_out=None if frame is None else frame.command_timed_out,
+            control_mode=(
+                None
+                if frame is None or frame.control_mode is None
+                else frame.control_mode.value
+            ),
+            control_enabled=None if frame is None else frame.control_enabled,
+            estop=None if frame is None else frame.estop,
+            sensor_valid=None if frame is None else frame.sensor_valid,
+            stm32_alive=None if frame is None else frame.stm32_alive,
+            fault_flags=None if frame is None else frame.fault_flags,
+        )
         self._authority.request_stop(now_monotonic_ns=monotonic_ns)
         self._candidate_lease = None
         self._cancel_handoff_measurement_locked()
@@ -754,6 +798,40 @@ class ResidentCommandSink:
         if result is None:
             raise RuntimeError("safety revocation did not produce a zero command")
         return result
+
+    def _failed_safety_gates_locked(
+        self,
+        *,
+        now_monotonic_ns: int,
+        expected_mode: ControlMode | None,
+    ) -> tuple[str, ...]:
+        frame = self._latest_telemetry
+        if frame is None:
+            return ("telemetry_unavailable",)
+        failed = []
+        if now_monotonic_ns < frame.receive_monotonic_ns:
+            failed.append("telemetry_from_future")
+        elif now_monotonic_ns - frame.receive_monotonic_ns > self._max_state_age_ns:
+            failed.append("telemetry_stale")
+        if not frame.control_enabled:
+            failed.append("control_disabled")
+        if frame.estop:
+            failed.append("estop")
+        if not frame.sensor_valid:
+            failed.append("sensor_invalid")
+        if not frame.stm32_alive:
+            failed.append("stm32_timeout")
+        if frame.fault_flags != 0:
+            failed.append("fault_flags")
+        if not frame.command_valid:
+            failed.append("command_invalid")
+        if frame.command_timed_out:
+            failed.append("command_timed_out")
+        if expected_mode is None:
+            failed.append("expected_mode_unavailable")
+        elif frame.control_mode is not expected_mode:
+            failed.append("control_mode_mismatch")
+        return tuple(failed)
 
     def _ack_matches_locked(self, frame: ResidentTelemetry) -> bool:
         pending = self._pending_ack
