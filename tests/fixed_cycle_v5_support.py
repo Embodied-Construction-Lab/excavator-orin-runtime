@@ -18,6 +18,9 @@ MISSION_FILES = {
     "engineering_act_transport_reference": (
         "engineering_act_transport_reference.json"
     ),
+    "engineering_act_transport_three_phase_reference": (
+        "engineering_act_transport_three_phase_reference.json"
+    ),
 }
 
 

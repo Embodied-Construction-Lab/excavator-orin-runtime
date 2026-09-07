@@ -35,6 +35,7 @@ class BehaviorContract:
     trajectory_controller_backend: str | None = None
     fixed_action: str | None = None
     allow_deadzone_early_completion: bool = False
+    deadzone_early_completion_min_steps: int | None = None
 
 
 _BEHAVIOR_CONTRACTS = MappingProxyType(
@@ -62,7 +63,8 @@ _BEHAVIOR_CONTRACTS = MappingProxyType(
         "act_dig_transport_dump_three_phase": BehaviorContract(
             behavior_id="act_dig_transport_dump_three_phase",
             adapter="act",
-            allow_deadzone_early_completion=False,
+            allow_deadzone_early_completion=True,
+            deadzone_early_completion_min_steps=200,
         ),
         "fixed_dig": BehaviorContract(
             behavior_id="fixed_dig",

@@ -215,6 +215,9 @@ class ResidentFixedCycleRuntime:
                 allow_deadzone_early_completion=(
                     completion_contract.allow_deadzone_early_completion
                 ),
+                deadzone_early_completion_min_steps=(
+                    completion_contract.deadzone_early_completion_min_steps
+                ),
             )
 
         self._active_act_generation = self._behavior_executor.run_when_idle(

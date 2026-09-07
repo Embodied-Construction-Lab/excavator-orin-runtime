@@ -106,6 +106,7 @@ class _ActSegmentTracker:
     generation: int | None = None
     max_steps: int | None = None
     allow_deadzone_early_completion: bool = False
+    deadzone_early_completion_min_steps: int | None = None
     completed_steps: int = 0
     complete: bool = False
     final_command_seq: int | None = None
@@ -328,11 +329,36 @@ class ResidentMotionCore:
         *,
         max_steps: int | None = None,
         allow_deadzone_early_completion: bool = False,
+        deadzone_early_completion_min_steps: int | None = None,
         now_monotonic_ns: int | None = None,
     ) -> int:
         validated_steps = _optional_act_step_budget(max_steps)
         if not isinstance(allow_deadzone_early_completion, bool):
             raise ValueError("allow_deadzone_early_completion must be boolean")
+        if (
+            deadzone_early_completion_min_steps is not None
+            and not allow_deadzone_early_completion
+        ):
+            raise ValueError(
+                "deadzone_early_completion_min_steps requires enabled completion"
+            )
+        validated_completion_min_steps = None
+        if allow_deadzone_early_completion:
+            validated_completion_min_steps = _positive_integer(
+                "deadzone_early_completion_min_steps",
+                (
+                    self._act_early_completion_min_steps
+                    if deadzone_early_completion_min_steps is None
+                    else deadzone_early_completion_min_steps
+                ),
+            )
+            if (
+                validated_steps is not None
+                and validated_completion_min_steps >= validated_steps
+            ):
+                raise ValueError(
+                    "deadzone_early_completion_min_steps must be less than max_steps"
+                )
         with self._control_lock:
             generation = self._act.begin_activation(
                 now_monotonic_ns=now_monotonic_ns
@@ -343,6 +369,8 @@ class ResidentMotionCore:
                     current.max_steps != validated_steps
                     or current.allow_deadzone_early_completion
                     is not allow_deadzone_early_completion
+                    or current.deadzone_early_completion_min_steps
+                    != validated_completion_min_steps
                 ):
                     raise ValueError(
                         "the active ACT segment budget or completion contract "
@@ -354,6 +382,9 @@ class ResidentMotionCore:
                 max_steps=validated_steps,
                 allow_deadzone_early_completion=(
                     allow_deadzone_early_completion
+                ),
+                deadzone_early_completion_min_steps=(
+                    validated_completion_min_steps
                 ),
             )
             return generation
@@ -388,7 +419,8 @@ class ResidentMotionCore:
                     self._act_early_completion_chunk_steps
                 ),
                 early_completion_min_steps=(
-                    self._act_early_completion_min_steps
+                    segment.deadzone_early_completion_min_steps
+                    or self._act_early_completion_min_steps
                 ),
                 allow_deadzone_early_completion=(
                     segment.allow_deadzone_early_completion
@@ -414,6 +446,9 @@ class ResidentMotionCore:
             ),
             "deadzone_early_completion_enabled": (
                 segment.allow_deadzone_early_completion
+            ),
+            "deadzone_early_completion_min_steps": (
+                segment.deadzone_early_completion_min_steps
             ),
         }
         emit_action_audit(

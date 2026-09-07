@@ -50,6 +50,7 @@ class _Core:
         *,
         max_steps: int,
         allow_deadzone_early_completion: bool,
+        deadzone_early_completion_min_steps: int | None = None,
     ) -> int:
         self._generation += 1
         self.calls.append(
@@ -57,6 +58,7 @@ class _Core:
                 "activate_act",
                 max_steps,
                 allow_deadzone_early_completion,
+                deadzone_early_completion_min_steps,
             )
         )
         self.rl_is_active = False
@@ -233,7 +235,7 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     )
 
     behaviors.succeed(reason_code="SUCCEEDED")
-    assert core.calls[-1] == ("activate_act", 130, True)
+    assert core.calls[-1] == ("activate_act", 130, True, None)
 
     core.complete_act()
     runtime.tick()
@@ -262,8 +264,8 @@ def test_two_cycles_advance_on_orin_without_external_stage_commands(
     assert runtime.snapshot.completed_cycles == 2
     assert core.calls[-1] == ("terminal_disarm",)
     assert [call for call in core.calls if call[0] == "activate_act"] == [
-        ("activate_act", 130, True),
-        ("activate_act", 130, True),
+        ("activate_act", 130, True, None),
+        ("activate_act", 130, True, None),
     ]
 
 
@@ -314,7 +316,7 @@ def test_act_dig_transport_dump_reference_runtime_skips_dump_follow_and_fixed_ac
     runtime.start(run_id="run-full-policy", requested_cycles=1)
     behaviors.succeed(reason_code="SUCCEEDED")
     assert runtime.snapshot.stage == "ACT_DIG_TRANSPORT_DUMP"
-    assert core.calls[-1] == ("activate_act", 260, False)
+    assert core.calls[-1] == ("activate_act", 260, False, None)
 
     core.complete_act()
     runtime.tick()
@@ -326,6 +328,32 @@ def test_act_dig_transport_dump_reference_runtime_skips_dump_follow_and_fixed_ac
         request["type"] != "start_fixed_action"
         for request in behaviors.requests
     )
+
+
+def test_three_phase_act_enables_deadzone_completion_only_after_dump(
+    tmp_path: Path,
+) -> None:
+    plan, registry = _deployment(
+        tmp_path,
+        mission_id="engineering_act_transport_three_phase_reference",
+    )
+    core = _Core()
+    behaviors = _BehaviorExecutor()
+    runtime = ResidentFixedCycleRuntime(
+        plan=plan,
+        registry=registry,
+        core=core,
+        behavior_executor=behaviors,
+        act_worker_ready=lambda: True,
+        wall_clock=lambda: 100.0,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    runtime.start(run_id="run-three-phase-tail", requested_cycles=1)
+    behaviors.succeed(reason_code="SUCCEEDED")
+
+    assert runtime.snapshot.stage == "ACT_DIG_TRANSPORT_DUMP_THREE_PHASE"
+    assert core.calls[-1] == ("activate_act", 241, True, 200)
 
 
 def test_fixed_dig_runtime_dispatches_execute_dig_before_dump_follow(

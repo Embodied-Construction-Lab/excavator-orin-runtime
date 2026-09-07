@@ -924,6 +924,107 @@ class ResidentMotionCoreTest(unittest.TestCase):
         self.assertFalse(rejected.accepted)
         self.assertEqual(rejected.reason, "act_segment_early_complete")
 
+    def test_act_activation_can_defer_deadzone_completion_until_step_201(self) -> None:
+        generation = self.core.activate_act(
+            max_steps=241,
+            allow_deadzone_early_completion=True,
+            deadzone_early_completion_min_steps=200,
+            now_monotonic_ns=1_000_000_000,
+        )
+        self.acknowledge_latest_zero(
+            mode=ControlMode.MANUAL_ACTION,
+            receive_ns=1_020_000_000,
+        )
+        active_chunk = ((0.2, 0.0, 0.0, 0.0),) * 10
+        for step_index in range(100):
+            result = self.core.submit_act(
+                encode_motion_candidate(
+                    MotionCandidate(
+                        source="act_dig",
+                        generation=generation,
+                        mode=ControlMode.MANUAL_ACTION,
+                        action=active_chunk[step_index % 10],
+                        action_chunk=(
+                            active_chunk if step_index % 10 == 0 else None
+                        ),
+                        created_monotonic_ns=1_025_000_000 + step_index,
+                        valid_until_monotonic_ns=1_500_000_000,
+                    )
+                )
+            )
+            self.assertTrue(result.accepted)
+
+        deadzone_chunk = ((0.0, 0.0, 0.0, 0.0),) * 10
+        before_dump_end = self.core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=deadzone_chunk[0],
+                    action_chunk=deadzone_chunk,
+                    created_monotonic_ns=1_026_000_000,
+                    valid_until_monotonic_ns=1_500_000_000,
+                )
+            )
+        )
+        self.assertTrue(before_dump_end.accepted)
+        self.assertEqual(self.core.act_segment_snapshot().completed_steps, 101)
+        self.assertIsNone(self.core.act_segment_snapshot().completion_reason)
+
+        for step_index in range(99):
+            result = self.core.submit_act(
+                encode_motion_candidate(
+                    MotionCandidate(
+                        source="act_dig",
+                        generation=generation,
+                        mode=ControlMode.MANUAL_ACTION,
+                        action=active_chunk[step_index % 10],
+                        action_chunk=(
+                            active_chunk if step_index % 10 == 0 else None
+                        ),
+                        created_monotonic_ns=1_027_000_000 + step_index,
+                        valid_until_monotonic_ns=1_500_000_000,
+                    )
+                )
+            )
+            self.assertTrue(result.accepted)
+
+        final = self.core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=deadzone_chunk[0],
+                    action_chunk=deadzone_chunk,
+                    created_monotonic_ns=1_028_000_000,
+                    valid_until_monotonic_ns=1_500_000_000,
+                )
+            )
+        )
+        self.assertTrue(final.accepted)
+        self.assertEqual(self.core.act_segment_snapshot().completed_steps, 201)
+        self.assertEqual(
+            self.core.act_segment_snapshot().completion_reason,
+            "deadzone_chunk",
+        )
+
+        rejected = self.core.submit_act(
+            encode_motion_candidate(
+                MotionCandidate(
+                    source="act_dig",
+                    generation=generation,
+                    mode=ControlMode.MANUAL_ACTION,
+                    action=(0.8, 0.0, 0.0, 0.0),
+                    created_monotonic_ns=1_029_000_000,
+                    valid_until_monotonic_ns=1_500_000_000,
+                )
+            )
+        )
+        self.assertFalse(rejected.accepted)
+        self.assertEqual(rejected.reason, "act_segment_early_complete")
+
     def test_repeated_act_activation_is_idempotent_but_cannot_change_budget(self) -> None:
         generation = self.core.activate_act(
             max_steps=130,
