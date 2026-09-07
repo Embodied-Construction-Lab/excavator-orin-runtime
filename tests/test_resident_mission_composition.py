@@ -200,6 +200,16 @@ def test_changing_only_phases_builds_the_engineering_reference() -> None:
                 "onnx_rl_tracking",
             ],
         ),
+        (
+            "deploy/v3b/act-dig-transport-dump-three-phase-reference/catalog/"
+            "candidate/fixed_cycle.candidate.json",
+            "engineering_act_transport_three_phase_reference",
+            [
+                "onnx_rl_tracking",
+                "act_dig_transport_dump_three_phase",
+                "onnx_rl_tracking",
+            ],
+        ),
     ],
 )
 def test_checked_in_missions_are_only_behavior_compositions(

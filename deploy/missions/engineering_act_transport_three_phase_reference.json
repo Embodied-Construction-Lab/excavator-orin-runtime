@@ -1,0 +1,27 @@
+{
+  "schema_version": "resident_mission_definition.v1",
+  "mission_id": "engineering_act_transport_three_phase_reference",
+  "act_policy_bindings": {
+    "act_dig_transport_dump_three_phase": "8faf364022695312714ccbac3299635e8fc8ee30b1935b0f3122b1c1fdedd637"
+  },
+  "entry_behavior": {
+    "stage_id": "TRACK_DIG",
+    "behavior_id": "onnx_rl_tracking",
+    "target_role": "current_dig",
+    "max_steps": null
+  },
+  "cycle_behaviors": [
+    {
+      "stage_id": "ACT_DIG_TRANSPORT_DUMP_THREE_PHASE",
+      "behavior_id": "act_dig_transport_dump_three_phase",
+      "target_role": null,
+      "max_steps": 241
+    },
+    {
+      "stage_id": "RETURN_DIG",
+      "behavior_id": "onnx_rl_tracking",
+      "target_role": "return_dig",
+      "max_steps": null
+    }
+  ]
+}

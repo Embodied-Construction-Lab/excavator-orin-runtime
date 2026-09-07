@@ -59,6 +59,11 @@ _BEHAVIOR_CONTRACTS = MappingProxyType(
             adapter="act",
             allow_deadzone_early_completion=False,
         ),
+        "act_dig_transport_dump_three_phase": BehaviorContract(
+            behavior_id="act_dig_transport_dump_three_phase",
+            adapter="act",
+            allow_deadzone_early_completion=False,
+        ),
         "fixed_dig": BehaviorContract(
             behavior_id="fixed_dig",
             adapter="fixed_action",
